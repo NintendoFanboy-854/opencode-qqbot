@@ -61,7 +61,7 @@ export async function ensureConfig(): Promise<void> {
     throw new Error("App ID 和 App Secret 不能为空")
   }
 
-  mkdirSync(CONFIG_DIR, { recursive: true })
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 }) // POSIX 凭据目录仅本人可入
   const envContent = [
     `QQ_APP_ID=${appId}`,
     `QQ_APP_SECRET=${appSecret}`,
@@ -71,7 +71,7 @@ export async function ensureConfig(): Promise<void> {
     `MAX_REPLY_LENGTH=3000`,
   ].join("\n") + "\n"
 
-  writeFileSync(ENV_FILE, envContent)
+  writeFileSync(ENV_FILE, envContent, { mode: 0o600 }) // POSIX 凭据文件仅本人可读
   console.log(`\n配置已保存到 ${ENV_FILE}`)
 
   process.env.QQ_APP_ID = appId

@@ -44,7 +44,7 @@ const merged = lines.map((line) => {
 if (!seen.has("QQ_APP_ID")) merged.push(`QQ_APP_ID=${creds.appId}`)
 if (!seen.has("QQ_APP_SECRET")) merged.push(`QQ_APP_SECRET=${creds.appSecret}`)
 
-fs.mkdirSync(CONFIG_DIR, { recursive: true })
-fs.writeFileSync(ENV_FILE, merged.join("\n"))
+fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 })
+fs.writeFileSync(ENV_FILE, merged.join("\n"), { mode: 0o600 })
 console.log(`凭据已写入 ${ENV_FILE}`)
 console.log("现在可以运行 openqq 启动 bot 了。")

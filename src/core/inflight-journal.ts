@@ -64,7 +64,7 @@ function save(): void {
     mkdirSync(join(path, ".."), { recursive: true })
     // 原子写：先写临时文件再改名，防写一半被杀留坏账
     const tmp = `${path}.tmp`
-    writeFileSync(tmp, JSON.stringify(cache, null, 2))
+    writeFileSync(tmp, JSON.stringify(cache, null, 2), { mode: 0o600 }) // 台账含用户消息，POSIX 仅本人可读
     renameSync(tmp, path)
   } catch (error) {
     console.warn("[inflight] 台账落盘失败:", error instanceof Error ? error.message : error)

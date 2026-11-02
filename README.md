@@ -71,6 +71,59 @@ MAX_REPLY_LENGTH=3000
 - **插件形态**：无需手动启动——装好插件 + 配好凭据后，插件巡检自动拉起 bot；opencode 服务重启也会自动恢复。
 - **独立部署形态**：`openqq` 前台运行；常驻按 OS 自选（Windows 用 `deploy/` 任务计划脚本；Linux `systemd --user`；macOS launchd 或 `nohup`）。
 
+<details>
+<summary>Linux：systemd --user 单元（复制即用）</summary>
+
+`~/.config/systemd/user/openqq.service`：
+
+```ini
+[Unit]
+Description=OpenCode QQ Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=openqq
+Restart=on-failure
+RestartSec=30
+# 凭据与数据目录（.env 写入后权限自动 0600）
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now openqq
+# 登录外也常驻：loginctl enable-linger $USER
+```
+</details>
+
+<details>
+<summary>macOS：launchd plist（复制即用）</summary>
+
+`~/Library/LaunchAgents/net.opencode-qqbot.plist`：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>net.opencode-qqbot</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/local/bin/openqq</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/openqq.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/openqq.err.log</string>
+</dict></plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/net.opencode-qqbot.plist
+```
+</details>
+
 > **单实例**：bot 启动时持文件锁（`~/.openqq/openqq-<appId>.lock`，10s 心跳、30s 僵尸判定）——双开时后到实例待命，宿主退出后自动接管，避免同 bot 多实例被 QQ 网关互踢。`QQ_INSTANCE_LOCK=false` 可关闭。
 
 > **跨平台**：bot 本体零 OS 分支（纯 TS，与 QQ 官方 SDK 同形态）；运行时 bun 优先、node ≥20 自动兜底（跑内置运行包）。Linux/macOS 常驻用 `systemd --user` 或 `nohup` 即可；端口自动发现在三个系统都可用（Linux 走 `ss -tln`，macOS 走 `netstat -an -p tcp`，Windows 走 `netstat -ano -p tcp`）。

@@ -24,7 +24,7 @@ export function installFileLog(logPath: string): () => void {
         renameSync(logPath, `${logPath}.1`)
       }
       const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")
-      appendFileSync(logPath, `${new Date().toISOString()} [${level}] ${line}\n`)
+      appendFileSync(logPath, `${new Date().toISOString()} [${level}] ${line}\n`, { mode: 0o600 })
     } catch {
       // 日志绝不阻断主流程
     }
