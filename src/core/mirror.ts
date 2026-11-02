@@ -8,7 +8,7 @@ import { homedir } from "os"
 import type { MessageContext } from "../qq/types.js"
 import type { OpencodeClient } from "../opencode/client.js"
 import { createEventStream } from "../opencode/eventstream.js"
-import { buildDigest } from "../opencode/mirror.js"
+import { buildDigest, digestTurnKey } from "../opencode/mirror.js"
 import type { SessionManager } from "../opencode/sessions.js"
 import type { MirrorApi } from "../commands.js"
 
@@ -71,6 +71,7 @@ export function createMirror(deps: MirrorDeps): Mirror {
   const { sessions, eventStream, client, lastCtx, safeDeliver, bgWaits, busyUsers } = deps
   const mirrorUnsubs = new Map<string, () => void>() // 摘要镜像订阅（独立于 /watch）
   const qqTurnActive = new Set<string>() // QQ 发起的轮次在途（镜像跳过防重复）
+  const mirroredTurns = new Map<string, string>() // 逻辑回合幂等：多 location/重复完成事件只投一次
   const mirrorState = { enabled: loadMirrorEnabled() }
 
   // ===== 摘要镜像（E 阶段 A 方案）：桌面会话轮次完成 → QQ 摘要卡 =====
@@ -121,11 +122,19 @@ export function createMirror(deps: MirrorDeps): Mirror {
         return
       }
       const listJson = await client.session.messages({ path: { id: sessionID } })
-      const digest = buildDigest(listJson?.data ?? [])
+      const messages = listJson?.data ?? []
+      const turnKey = digestTurnKey(messages)
+      if (turnKey && mirroredTurns.get(sessionID) === turnKey) {
+        console.log(`[mirror] 跳过：逻辑回合已镜像 session=${sessionID} turn=${turnKey}`)
+        return
+      }
+      const digest = buildDigest(messages)
       if (!digest) {
         console.log(`[mirror] 跳过：无可摘要内容（空轮/纯工具轮）session=${sessionID}`)
         return
       }
+      // 在投递前占位：两个完成事件并发到达时，后到的回调也会命中同一回合并被去重。
+      if (turnKey) mirroredTurns.set(sessionID, turnKey)
       for (const userId of owners) {
         // 无最近 ctx（重启后尚未收到新消息）→ 构造主动通道 ctx，
         // deliver 的被动尝试失败会自然降级为主动消息（D4 配额内）。

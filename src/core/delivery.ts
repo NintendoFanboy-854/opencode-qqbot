@@ -56,6 +56,16 @@ function saveQuotaMap(m: ReadonlyMap<string, { day: string; count: number; warne
 // 记"有未送达消息"，下一次成功投递时前缀贴条告知用户（导出供测试）。
 export const UNDELIVERED_NOTICE = "（此前有未能送达的消息）\n"
 
+export interface DeliveryAttempt {
+  text: string
+  at: number
+}
+
+/** AI 长回复的同文短窗幂等：不同 location/重复回合可产生不同事件 ID，最终统一在出站拦截。 */
+export function shouldSuppressDuplicate(previous: DeliveryAttempt | undefined, text: string, now: number, ttlMs = 60_000): boolean {
+  return text.length >= 200 && previous?.text === text && now - previous.at < ttlMs
+}
+
 // B-msgid 纯函数（导出供测试，2026-10-29）：挑选可"骑"的被动 msg_id——
 // 同一聊天类型、时间戳在窗口内才有效；任何不对齐都返回 undefined（回落真主动）。
 export function selectRideMsgId(
@@ -111,6 +121,8 @@ export function createDelivery(
   const pushQueues = new Map<string, PushQueue>()
   // P 项：彻底投递失败的用户集合（贴条状态），下次成功投递时消化
   const undelivered = new Set<string>()
+  // 同文长回复短窗幂等（进程内最后防线）；尝试前占位防并发，失败立即释放允许重试。
+  const recentDeliveries = new Map<string, DeliveryAttempt>()
   const activeQuota = new Map<string, { day: string; count: number; warned: boolean }>()
   // B1（2026-10-29，吸收自 openclaw-qqbot reply-limiter）：被动回复限额预判——
   // 单 msgId 4 次/1h 窗口，耗尽/过期直接转主动，省一次注定被拒的 API 往返。
@@ -160,11 +172,19 @@ export function createDelivery(
   // P 项贴条包装：deliver 入口消化贴条状态——有待贴条则前缀拼入正文；
   // 投递失败则把贴条放回（留待下次），成功才算消化。
   async function deliver(ctx: MessageContext, text: string): Promise<void> {
+    const now = Date.now()
+    if (shouldSuppressDuplicate(recentDeliveries.get(ctx.userId), text, now)) {
+      console.log(`[bridge] 同文长回复已在 60s 内投递，跳过重复出站 user=${ctx.userId}`)
+      return
+    }
+    recentDeliveries.set(ctx.userId, { text, at: now })
     const hadNotice = undelivered.delete(ctx.userId)
     const body = hadNotice ? UNDELIVERED_NOTICE + text : text
     try {
       await deliverCore(ctx, body)
     } catch (error) {
+      // 发送失败不占去重位，后续恢复/重试仍可送达。
+      if (recentDeliveries.get(ctx.userId)?.at === now) recentDeliveries.delete(ctx.userId)
       if (hadNotice) undelivered.add(ctx.userId)
       throw error
     }

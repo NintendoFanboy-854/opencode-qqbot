@@ -76,6 +76,7 @@ export interface MessagePart {
 }
 
 export interface SessionMessage {
+  id?: string
   type?: string
   time?: { created?: number; completed?: number }
   content?: MessagePart[]

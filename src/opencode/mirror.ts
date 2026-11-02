@@ -19,6 +19,26 @@ function answerClipLimit(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
 
+// 逻辑回合并发幂等键：同一用户消息 + 最终 assistant。不同 location 的
+// execution.succeeded 事件 ID 可以不同，但同一逻辑回合仍只应镜像一次。
+export function digestTurnKey(messages: SessionMessage[]): string | null {
+  const ordered = [...messages].reverse()
+  let lastUserIdx = -1
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    if (ordered[i].type === "user") {
+      lastUserIdx = i
+      break
+    }
+  }
+  if (lastUserIdx < 0) return null
+  for (let i = ordered.length - 1; i > lastUserIdx; i--) {
+    const m = ordered[i]
+    if (m.type !== "assistant" || !(m.content ?? []).some((p) => p.type === "text" && p.text?.trim())) continue
+    return `${ordered[lastUserIdx].id ?? `user@${lastUserIdx}`}:${m.id ?? `assistant@${i}`}`
+  }
+  return null
+}
+
 // 构建最近一轮问答的摘要卡；返回 null = 无可镜像正文。
 export function buildDigest(messages: SessionMessage[]): string | null {
   const ordered = [...messages].reverse()
