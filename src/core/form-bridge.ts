@@ -231,7 +231,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
         if (msg.includes("AlreadySettled") || msg.includes("already")) {
           void deps.safeDeliver(ctx, "该选择已在桌面端处理过，任务应已继续").catch(() => {})
         } else {
-          void deps.safeDeliver(ctx, `⚠️ 提交失败：${msg.slice(0, 120)}`).catch(() => {})
+          void deps.safeDeliver(ctx, `⚠️ 提交失败：${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}`).catch(() => {})
         }
       }
     })()

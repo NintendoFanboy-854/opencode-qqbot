@@ -19,7 +19,8 @@ export function classifyProviderError(message: string): ProviderErrorKind {
 /** 救援话术；kind 为 null 时返回 null（调用方走普通错误文案） */
 export function rescueText(kind: ProviderErrorKind, rawMessage: string): string | null {
   if (!kind) return null
-  const raw = rawMessage.replace(/\s+/g, " ").trim().slice(0, 200)
+  const clipped = rawMessage.replace(/\s+/g, " ").trim()
+  const raw = clipped.length > 200 ? `${clipped.slice(0, 200)}…` : clipped // 截断必带省略号
   const head = kind === "billing" ? "❌ 当前模型的余额/额度不足，暂时无法继续对话" : "❌ 当前模型的鉴权信息失效（401/key 无效）"
   return [
     head,

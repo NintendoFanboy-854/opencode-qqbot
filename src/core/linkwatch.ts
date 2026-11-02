@@ -132,7 +132,7 @@ export function startLinkWatch(deps: LinkWatchDeps): LinkWatch {
         if (!alarmOpenSent) {
           alarmOpenSent = true
           await fire(
-            `⚠️ OpenCode 链路失联（自 ${inc.since.slice(11, 16)} 起，错误：${msg.slice(0, 80)}）。已转入自动自愈：发现新端口会自动切换并通知。`,
+            `⚠️ OpenCode 链路失联（自 ${inc.since.slice(11, 16)} 起，错误：${msg.length > 80 ? `${msg.slice(0, 80)}…` : msg}）。已转入自动自愈：发现新端口会自动切换并通知。`,
           )
         }
 

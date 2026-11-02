@@ -165,7 +165,8 @@ export function createClient(baseUrl: string): OpencodeClient {
   async function json(res: Response): Promise<any> {
     if (!res.ok) {
       const txt = await res.text().catch(() => "")
-      throw new Error(`OpenCode API ${res.status}: ${txt.substring(0, 200)}`)
+      const excerpt = txt.length > 200 ? `${txt.substring(0, 200)}…` : txt
+      throw new Error(`OpenCode API ${res.status}: ${excerpt}`)
     }
     // 204 (如 /model /agent /permission reply) 无 body；res.json() 会抛错。
     if (res.status === 204) return null

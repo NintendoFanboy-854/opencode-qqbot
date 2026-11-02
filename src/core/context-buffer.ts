@@ -68,8 +68,8 @@ export function extractEmbeddedQuote(event: { message_type?: unknown; msg_elemen
     }
   }
   walk(event.msg_elements, 0)
-  const text = out.join("\n").trim().slice(0, 2000)
-  return text || null
+  const text = out.join("\n").trim()
+  return (text.length > 2000 ? `${text.slice(0, 2000)}…` : text) || null // 截断必带省略号；空内容回落缓存通道
 }
 
 /** 测试/运维用：清空全部缓存 */
