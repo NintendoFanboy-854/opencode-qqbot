@@ -141,6 +141,8 @@ launchctl load ~/Library/LaunchAgents/net.opencode-qqbot.plist
 | `/agent` | 查看或切换 Agent |
 | `/rename <名>` | 重命名当前会话 |
 | `/watch` / `/watch off` | 观察模式：工具调用里程碑实时推送 |
+| `/progress` | 手动进度查询：工具调用/失败统计、当前在途状态（本地事件源，零模型调用） |
+| `/queue` | 忙碌队列：查看 / `clear` 清空 / `drop <编号>` 定点删除（忙碌时消息自动 FIFO 排队） |
 | `/mirror` | 摘要镜像开关 |
 | `/send <路径>` | 把白名单目录内的文件/图片发到 QQ |
 

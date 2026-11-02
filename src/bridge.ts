@@ -564,11 +564,19 @@ export function createBridge(
 
       if (busyUsers.has(ctx.userId)) {
         // Q1（学习 pi-qqbot 队列 UX）：忙碌不再拒绝——FIFO 排队，回合结束自动执行
+        // 自检补强：入队即下载附件——QQ 签名 URL 短时效，drain 时下载必过期
+        if (ctx.attachments?.length && !ctx.preparedAttachments) {
+          ctx.preparedAttachments = await prepareQQAttachments(ctx.attachments, () =>
+            getAccessToken(config.qq.appId, config.qq.clientSecret),
+          )
+        }
         const queued = msgQueue.push(ctx.userId, ctx)
         if (!queued) {
           await sendReply(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
           return
         }
+        // Q1 自检补强：排队消息也落在途台账（重启对账可恢复；drain 时幂等不重复记）
+        recordInflight({ msgId: ctx.msgId, userId: ctx.userId, sessionId: "", text: content.slice(0, 300), at: Date.now() })
         await sendReply(
           ctx,
           `已排队 #${queued.job.id}${queued.ahead > 0 ? `（前面还有 ${queued.ahead} 条）` : ""}，当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
@@ -613,7 +621,8 @@ export function createBridge(
         turnStart = Date.now()
         // 原生附件接入（2026-10-14）：QQ 图片下载落盘 → prompt files；
         // 下载失败/类型不支持转成可见文字备注，绝不静默丢
-        const prepared = await prepareQQAttachments(ctx.attachments, () =>
+        // Q1 自检补强：排队消息在入队时已预下载（防签名 URL 过期），直接复用
+        const prepared = ctx.preparedAttachments ?? await prepareQQAttachments(ctx.attachments, () =>
           getAccessToken(config.qq.appId, config.qq.clientSecret),
         )
         const { text: promptBody, files } = augmentPromptWithAttachments(content, prepared)

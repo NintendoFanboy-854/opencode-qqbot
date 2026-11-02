@@ -71,9 +71,17 @@ function save(): void {
   }
 }
 
-/** 派发落账：QQ 消息进入 AI 派发管线前调用 */
+/** 派发落账：QQ 消息进入 AI 派发管线前调用。同 msgId 幂等；sessionId 允许后补（入队时未知、drain 时回填） */
 export function recordInflight(entry: Omit<InflightEntry, "state">): void {
   const entries = load()
+  const existing = entries.find((e) => e.msgId === entry.msgId)
+  if (existing) {
+    if (!existing.sessionId && entry.sessionId) {
+      existing.sessionId = entry.sessionId
+      save()
+    }
+    return
+  }
   entries.push({ ...entry, state: "inflight" })
   save()
 }

@@ -147,6 +147,8 @@ export interface MessageContext {
   quoteText?: string
   /** 图片等富媒体附件（原生附件接入 2026-10-14；此前在网关被静默丢弃） */
   attachments?: MessageAttachment[]
+  /** 排队时预下载的附件（Q1：避免 drain 时 QQ 签名 URL 过期——入队即落盘） */
+  preparedAttachments?: import("./media.js").PreparedAttachments
   timestamp?: string
   rawEvent?: C2CMessageEvent | GroupMessageEvent
 }
