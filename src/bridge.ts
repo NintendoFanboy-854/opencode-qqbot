@@ -179,7 +179,7 @@ export function createBridge(
         const st = turnStats.get(sessionID) ?? { tools: 0, failed: 0, lastTool: "", lastAt: 0 }
         if (ev.type === "session.tool.called") {
           st.tools++
-          st.lastTool = String(cmd).slice(0, 60)
+          st.lastTool = cmd.length > 60 ? `${String(cmd).slice(0, 60)}…` : String(cmd) // 截断必带省略号（UAT 实证：硬切被用户误读为坏文本）
         } else if (typeof d.metadata?.exit === "number" && d.metadata.exit !== 0) {
           st.failed++
         }
