@@ -183,28 +183,44 @@ export function classifyInflight(
   messages: HistoryMessage[],
 ): InflightClass {
   const ordered = [...messages].reverse()
-  let lastUserIdx = -1
-  for (let i = ordered.length - 1; i >= 0; i--) {
+  const probe = entry.text.trim().slice(0, 50)
+  let userIdx = -1
+  if (probe === "") {
+    // 纯附件没有文本锚，只能沿用最新用户消息，由 idle/答案状态兜底。
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].type === "user") {
+        userIdx = i
+        break
+      }
+    }
+  } else {
+    // 长任务期间可能出现更新用户消息；必须按原文找回原回合，不能只查最后一条，
+    // 否则会把已到达的旧消息误判为 lost 并再次派发给 LLM。
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].type === "user" && (ordered[i].text ?? "").includes(probe)) {
+        userIdx = i
+        break
+      }
+    }
+  }
+  if (userIdx < 0) return { kind: "lost" }
+
+  // 回合边界 = 原用户消息之后、下一条用户消息之前。后续新回合的 idle/答案
+  // 不能拿来给原回合销账。
+  let turnEnd = ordered.length
+  for (let i = userIdx + 1; i < ordered.length; i++) {
     if (ordered[i].type === "user") {
-      lastUserIdx = i
+      turnEnd = i
       break
     }
   }
-  if (lastUserIdx < 0) return { kind: "lost" }
 
-  const userText = (ordered[lastUserIdx].text ?? "").trim()
-  const probe = entry.text.trim().slice(0, 50)
-  // 纯附件消息（无文字）无法文本匹配——探针为空视为匹配（由 answered 判定兜底）
-  const matched = probe === "" || userText.includes(probe)
-  if (!matched) return { kind: "lost" }
-
-  // 有 assistant 正文 ≠ 回合完成。流式/长任务在运行中也会产生多段正文；
-  // 必须看到该用户消息之后的 idle，才允许启动补投，否则会把半截答案提前发出。
-  const completed = ordered.slice(lastUserIdx + 1).some((m) => m.type === "idle")
+  // 有 assistant 正文 ≠ 回合完成。必须在该回合边界内看到 idle，才允许补投。
+  const completed = ordered.slice(userIdx + 1, turnEnd).some((m) => m.type === "idle")
   if (!completed) return { kind: "running" }
 
-  // 与直答一致：只补投最终 assistant 正文，不把流式进度/阶段前导语重复拼入。
-  for (let i = ordered.length - 1; i > lastUserIdx; i--) {
+  // 与直答一致：只补投该回合最终 assistant 正文，不拼接阶段前导语。
+  for (let i = turnEnd - 1; i > userIdx; i--) {
     const m = ordered[i]
     if (m.type !== "assistant") continue
     const answer = (m.content ?? [])
