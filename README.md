@@ -133,7 +133,7 @@ launchctl load ~/Library/LaunchAgents/net.opencode-qqbot.plist
 | 指令 | 说明 |
 |---|---|
 | `/new` | 开新会话 |
-| `/stop` | 中止当前生成（终止挂起的回合/弹窗等待） |
+| `/stop`（别名 `/cancel`） | 中止当前生成并清空忙碌队列 |
 | `/status` | 服务器/会话/模型/Agent 状态 |
 | `/sessions` | 列出会话并可选择切换 |
 | `/history [N]` | 最近 N 轮历史（默认 3，上限 10；换行/代码块/表格完整保留） |

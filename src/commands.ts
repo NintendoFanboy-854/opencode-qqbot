@@ -90,6 +90,7 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
     case "new":
       return handleNew(ctx, cmdCtx)
     case "stop":
+    case "cancel": // /cancel 与 /stop 同义（用户自然习惯 + pi-qqbot 同款，UAT S3 实证缺口）
       return handleStop(ctx, cmdCtx)
     case "queue":
       return handleQueue(ctx, parsed.args, cmdCtx)
