@@ -9,7 +9,7 @@
 // 纯文本桥时代图片被静默丢弃——现在任何失败（下载不通/类型不支持）都转成
 // 可见的文字备注，绝不静默。
 
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import type { MessageAttachment } from "./types.js"
@@ -154,7 +154,10 @@ export function groupOutcomes(outcomes: AttachmentOutcome[]): PreparedAttachment
   const notes: string[] = []
   for (const o of outcomes) {
     if ("path" in o) {
-      files.push({ uri: `file:///${o.path.replace(/\\/g, "/")}`, name: o.name })
+      // 桌面 TUI 预览实证通道：≤2MB 的图片用 data: URL（opencode 对 data: 内嵌预览友好）；
+      // 大图/非图保留 file:// 路径（避免 base64 膨胀）。
+      const dataUrl = tryImageDataUrl(o.path, 2 * 1024 * 1024)
+      files.push(dataUrl ? { uri: dataUrl, name: o.name } : { uri: `file:///${o.path.replace(/\\/g, "/")}`, name: o.name })
     } else if ("voice" in o) {
       notes.push(`（语音转写：${o.voice}）`)
     } else if ("failed" in o) {
@@ -164,6 +167,18 @@ export function groupOutcomes(outcomes: AttachmentOutcome[]): PreparedAttachment
     }
   }
   return { files, notes }
+}
+
+// 小图转 data: URL（失败回退 null 走 file://），仅用于桌面预览友好化
+function tryImageDataUrl(path: string, maxBytes: number): string | null {
+  try {
+    const st = statSync(path)
+    if (st.size > maxBytes) return null
+    const b = readFileSync(path)
+    return `data:image/png;base64,${b.toString("base64")}`
+  } catch {
+    return null
+  }
 }
 
 /**
