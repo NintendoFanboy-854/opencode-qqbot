@@ -1,6 +1,6 @@
 {
   "name": "@linjz/opencode-qqbot",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "type": "module",
   "description": "QQ Bot for OpenCode AI - chat with AI coding assistant via QQ",
   "exports": {
@@ -50,6 +50,14 @@
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0",
     "effect": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "effect": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opencode/plugin": "^2.0.0",
