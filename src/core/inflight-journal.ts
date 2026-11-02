@@ -203,15 +203,16 @@ export function classifyInflight(
   const completed = ordered.slice(lastUserIdx + 1).some((m) => m.type === "idle")
   if (!completed) return { kind: "running" }
 
-  const answerParts: string[] = []
-  for (let i = lastUserIdx + 1; i < ordered.length; i++) {
+  // 与直答一致：只补投最终 assistant 正文，不把流式进度/阶段前导语重复拼入。
+  for (let i = ordered.length - 1; i > lastUserIdx; i--) {
     const m = ordered[i]
-    if (m.type === "assistant") {
-      for (const p of m.content ?? []) {
-        if (p.type === "text" && p.text?.trim()) answerParts.push(p.text.trim())
-      }
-    }
+    if (m.type !== "assistant") continue
+    const answer = (m.content ?? [])
+      .filter((p) => p.type === "text" && p.text?.trim())
+      .map((p) => p.text!.trim())
+      .join("\n")
+      .trim()
+    if (answer) return { kind: "answered", answer }
   }
-  const answer = answerParts.join("\n").trim()
-  return answer ? { kind: "answered", answer } : { kind: "running" }
+  return { kind: "running" }
 }

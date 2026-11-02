@@ -128,12 +128,17 @@ const TURN_TIMEOUT_MINUTES = (() => {
 })()
 const RESPONSE_TIMEOUT_MS = TURN_TIMEOUT_MINUTES * 60 * 1000
 
-// 聚合某轮（baseline 之后）所有 assistant 消息的文本部件，丢弃 reasoning/tool 部件。
-// promptAndWait 与 bridge 的后台等待共用（后台等待 = 前台超时后不放弃，完成即回传）。
+// 取 baseline 之后最后一个有正文的 assistant 消息，丢弃 reasoning/tool 与阶段前导语。
+// 长回合会产生多条“正在检查/进度总结”assistant 文本；全部拼接会把过程包装成多条
+// 相近答案。promptAndWait 与后台等待都只应交付最终回答。
 export function collectReplyText(msgs: SessionMessage[], baseline: number): string {
-  return msgs
+  const latest = msgs
     .filter((x) => x.type === "assistant" && (x.time?.created ?? 0) >= baseline)
-    .flatMap((x) => (x.content ?? []).filter((p) => p.type === "text").map((p) => p.text ?? ""))
+    .sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))
+    .find((x) => (x.content ?? []).some((p) => p.type === "text" && p.text?.trim()))
+  return (latest?.content ?? [])
+    .filter((p) => p.type === "text")
+    .map((p) => p.text ?? "")
     .join("\n")
     .trim()
 }

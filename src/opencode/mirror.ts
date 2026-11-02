@@ -34,16 +34,16 @@ export function buildDigest(messages: SessionMessage[]): string | null {
 
   const userText = ((ordered[lastUserIdx] as { text?: string }).text ?? "").trim()
 
-  const answerParts: string[] = []
-  for (let i = lastUserIdx + 1; i < ordered.length; i++) {
+  let answer = ""
+  for (let i = ordered.length - 1; i > lastUserIdx; i--) {
     const m = ordered[i]
-    if (m.type === "assistant") {
-      for (const p of m.content ?? []) {
-        if (p.type === "text" && p.text?.trim()) answerParts.push(p.text.trim())
-      }
+    if (m.type !== "assistant") continue
+    const parts = (m.content ?? []).filter((p) => p.type === "text" && p.text?.trim()).map((p) => p.text!.trim())
+    if (parts.length > 0) {
+      answer = parts.join("\n").trim()
+      break
     }
   }
-  const answer = answerParts.join("\n").trim()
   if (!answer) return null
 
   const lines = ["📋 桌面问答摘要"]
