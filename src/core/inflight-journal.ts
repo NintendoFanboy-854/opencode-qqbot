@@ -173,8 +173,8 @@ export type InflightClass =
 
 /**
  * 对账分类：台账条目 × 会话历史 → 该回合的真实状态。
- * - answered：历史里找到该用户消息且其后已有 assistant 正文 → 答案在库里没投出，补投
- * - running：找到该用户消息但尚无 assistant 正文 → 回合在跑（或被中断），重挂后台等待
+ * - answered：找到该用户消息，且其后已有 idle + assistant 正文 → 完整答案在库里没投出，补投
+ * - running：找到该用户消息但尚未 idle（无论是否已有流式正文）→ 回合在跑，重挂后台等待
  * - lost：历史里找不到该用户消息 → 消息从未到达 opencode（网关窗口丢失），重派/通知
  * 匹配口径：历史 user 文本包含台账原文前 50 字（prompt 会加引用前缀/附件注记，不能全等）。
  */
@@ -197,6 +197,11 @@ export function classifyInflight(
   // 纯附件消息（无文字）无法文本匹配——探针为空视为匹配（由 answered 判定兜底）
   const matched = probe === "" || userText.includes(probe)
   if (!matched) return { kind: "lost" }
+
+  // 有 assistant 正文 ≠ 回合完成。流式/长任务在运行中也会产生多段正文；
+  // 必须看到该用户消息之后的 idle，才允许启动补投，否则会把半截答案提前发出。
+  const completed = ordered.slice(lastUserIdx + 1).some((m) => m.type === "idle")
+  if (!completed) return { kind: "running" }
 
   const answerParts: string[] = []
   for (let i = lastUserIdx + 1; i < ordered.length; i++) {

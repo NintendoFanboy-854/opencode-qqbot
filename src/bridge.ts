@@ -740,8 +740,10 @@ export function createBridge(
           settleInflight(entry.msgId)
           console.log(`[bridge] 启动对账：已补投答案 msgId=${entry.msgId}`)
         } else if (cls.kind === "running") {
+          // 跨重启也要保持 QQ 回合同一身份：后台直答完成时，镜像不得再投摘要。
+          mirror.beginTurn(entry.sessionId)
           await deliver(ctx, "🔄 重启恢复：你之前的任务仍在执行，完成即回传结果")
-          startBackgroundWait(entry.sessionId, ctx, Date.now(), entry.msgId)
+          startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId)
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
           settleInflight(entry.msgId) // 旧账结清，重派回合走新账（合成 trackId）
