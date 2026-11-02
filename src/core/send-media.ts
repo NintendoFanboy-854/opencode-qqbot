@@ -6,7 +6,7 @@
 // 安全：路径白名单（默认只允许 QQ 图片缓存目录与 bot 工作目录，QQ_SEND_EXTRA_ROOTS 可扩）；
 // 大小上限 20MB（官方单次上传上限，base64 前检查）。
 import { readFileSync, statSync } from "node:fs"
-import { resolve, extname, basename } from "node:path"
+import { resolve, extname, basename, sep } from "node:path"
 import { imageDir } from "../qq/media.js"
 import { uploadQQMedia, sendQQMediaMessage, MediaFileType } from "../qq/api.js"
 import type { MessageContext } from "../qq/types.js"
@@ -22,10 +22,10 @@ export function allowedSendRoots(extraEnv = process.env.QQ_SEND_EXTRA_ROOTS): st
   return roots.map((r) => resolve(r))
 }
 
-/** 路径白名单校验：规范化后必须落在某个允许根目录内 */
+/** 路径白名单校验：规范化后必须落在某个允许根目录内（分隔符按平台自适应） */
 export function isAllowedSendPath(filePath: string, roots = allowedSendRoots()): boolean {
   const full = resolve(filePath.trim().replace(/^"|"$/g, ""))
-  return roots.some((root) => full === root || full.startsWith(root + "\\") || full.startsWith(root + "/"))
+  return roots.some((root) => full === root || full.startsWith(root + sep))
 }
 
 /** 扩展名 → QQ MediaFileType（图片=1/视频=2/语音=3/其余=文件） */
