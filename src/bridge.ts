@@ -122,8 +122,6 @@ export function createBridge(
   const callCache = new Map<string, string>()              // callID -> 命令摘要（⚠️ 上下文用）
   // Q2：会话工具统计（/progress 手动查询用，本地事件源，零模型成本）
   const turnStats = new Map<string, { tools: number; failed: number; lastTool: string; lastAt: number }>()
-  // Q4：远程场景提示注入标记（sessionId → 该会话已注入过远程指引）
-  const remoteNoticed = new Set<string>()
 
   // E（2026-10-29 同步升级，吸收 dsh session/idle-evictor）：闲置会话回收——
   // 长期无活动的会话退订 SSE，降 opencode 服务端事件扇出；/watch 显式盯着的
@@ -627,14 +625,9 @@ export function createBridge(
         )
         const { text: promptBody, files } = augmentPromptWithAttachments(content, prepared)
         // 缺口 1：引用上文注入——让 AI 明确知道用户引用了哪条消息
-        // Q4（学习 pi-qqbot remote-context）：会话首条 QQ 消息注入远程场景指引——
-        // 用户看不到桌面弹窗/截图，需要图片走离屏生成+发文件通道，回答精炼。
-        // 只注入一次（进程内标记），不污染每轮上下文。
-        const remoteNote = remoteNoticed.has(sessionId)
-          ? ""
-          : "（远程对话，回复精炼。）\n\n"
-        remoteNoticed.add(sessionId)
-        const promptText = remoteNote + (ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody)
+        // Q4 回退（用户评审三连否）：远程备注注入会渲染成独立用户消息、造成"一事两交互"，
+        // 画蛇添足。不再注入任何前缀；场景上下文如需要改走 opencode 隐式 instructions 通道。
+        const promptText = ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody
         // R 项（2026-10-30）：在途台账落账——派发前记录，送达才销账；
         // 进程中途死亡时启动对账据此恢复。重派回合无真实 msgId，用合成键跟踪。
         trackId = ctx.msgId || `redispatch-${sessionId}-${turnStart}`
