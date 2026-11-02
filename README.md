@@ -19,7 +19,7 @@
 | 进度观察 | `/watch` 订阅工具调用里程碑（🔧 命令摘要/退出码），节流合并推送 |
 | **权限审批** | opencode 发起权限请求 → QQ 收 🔐 四键卡片（允许一次/总是允许/拒绝/忽略），点按钮静默生效（点击后按钮回显 ✓，其余置灰），也可文字回复"允许/总是/拒绝" |
 | **选择弹窗桥接** | opencode 的 Form（选择/多选/布尔/文本）→ QQ 📝 卡片，点按钮或回字母（A/B/C）作答；桌面端回合发起的审批/表单**同样**推送（常驻监听，12s 轮询，bot 空闲也收得到） |
-| 远程指令 | `/new /stop /status /sessions /history /model /agent /rename /watch /mirror /send` |
+| 远程指令 | `/new /stop /status /sessions /history /model /agent /rename /watch /mirror /progress /queue /send` |
 | 富媒体 | 收图（原生附件给 AI 看图）；**收语音**（QQ 内置 ASR 免费转文字进 prompt）；**发图/发文件**（AI 回复含 `QQ_SEND_FILE: <路径>` 标记或 `/send <路径>` 指令，20MB 上限） |
 | 引用上下文 | 长按引用某条消息提问，AI 能感知被引用的内容（我方回复也会入索引缓存） |
 | 长任务不丢 | 前台 30min 超时 → 后台等待（SSE + 轮询，最长 24h）；停滞 30min 主动提醒"可能桌面端在等弹窗" |
@@ -176,7 +176,7 @@ src/bridge.ts  编排门面 + 命令系统 commands.ts + 入口 index.ts
 ## 测试
 
 ```bash
-npm run verify        # tsc + 19 个单元套件
+npm run verify        # tsc + 23 个单元套件
 npm run test:e2e      # 五套 e2e（需 opencode 服务在跑）
 ```
 
