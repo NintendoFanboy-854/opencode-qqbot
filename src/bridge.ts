@@ -41,6 +41,7 @@ import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approva
 import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
 import {
+  claimInflight,
   recordInflight,
   settleInflight,
   pendingInflight,
@@ -102,6 +103,8 @@ export function createBridge(
   sessions: SessionManager,
 ): Bridge {
   const busyUsers = new Set<string>()
+  // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
+  const claimedContexts = new WeakSet<MessageContext>()
   // Q1：忙碌消息队列（该用户当前回合结束后自动 drain）
   const msgQueue = new MessageQueue(QUEUE_MAX)
   const draining = new Set<string>()
@@ -502,6 +505,7 @@ export function createBridge(
   purgeOldQQImages()
 
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
+    let claimedMsgId = ""
     try {
       if (!isAllowedUser(ctx.userId, config.allowedUsers)) {
         await sendReply(ctx, "你不在允许使用的名单里")
@@ -560,6 +564,20 @@ export function createBridge(
         return
       }
 
+      // Durable gate：网关 Set 只能防本进程重投；多执行体/重启共用台账认领，
+      // 同一 QQ msgId 在附件下载、排队和 promptAndWait 之前就被去重。
+      if (ctx.msgId) {
+        if (!claimedContexts.has(ctx)) {
+          const claimed = claimInflight({ msgId: ctx.msgId, userId: ctx.userId, sessionId: "", text: content.slice(0, 300), at: Date.now() })
+          if (!claimed) {
+            console.log(`[bridge] 重复消息已跳过 msgId=${ctx.msgId}`)
+            return
+          }
+          claimedContexts.add(ctx)
+        }
+        claimedMsgId = ctx.msgId
+      }
+
       if (busyUsers.has(ctx.userId)) {
         // Q1（学习 pi-qqbot 队列 UX）：忙碌不再拒绝——FIFO 排队，回合结束自动执行
         // 自检补强：入队即下载附件——QQ 签名 URL 短时效，drain 时下载必过期
@@ -570,11 +588,11 @@ export function createBridge(
         }
         const queued = msgQueue.push(ctx.userId, ctx)
         if (!queued) {
+          if (claimedMsgId) settleInflight(claimedMsgId) // 已满回执即终态，不能留账让启动对账再次执行
           await sendReply(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
           return
         }
-        // Q1 自检补强：排队消息也落在途台账（重启对账可恢复；drain 时幂等不重复记）
-        recordInflight({ msgId: ctx.msgId, userId: ctx.userId, sessionId: "", text: content.slice(0, 300), at: Date.now() })
+        // 入队前已由 claimInflight 落账；drain 重入时回填 sessionId，不重复写账。
         await sendReply(
           ctx,
           `已排队 #${queued.job.id}${queued.ahead > 0 ? `（前面还有 ${queued.ahead} 条）` : ""}，当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
@@ -687,6 +705,9 @@ export function createBridge(
         if (sessionId && !bgWaits.has(sessionId)) void drainQueue(ctx.userId)
       }
     } catch (error) {
+      // 认领后、内层回合兜底之前的异常（如排队附件预下载失败）也必须结清，
+      // 否则重启对账会把已反馈失败的消息再执行一次。
+      if (claimedMsgId) settleInflight(claimedMsgId)
       console.error("[bridge] handleMessage failed:", error)
       try {
         await sendReply(ctx, `处理消息失败：${toErrorMessage(error)}`)

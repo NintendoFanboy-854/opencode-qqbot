@@ -1,12 +1,12 @@
 // @input:  fs/path/os（台账落盘）
-// @output: recordInflight, settleInflight, pendingInflight, classifyInflight（纯函数供测试）,
+// @output: claimInflight, recordInflight, settleInflight, pendingInflight, classifyInflight（纯函数供测试）,
 //          resetInflightJournal（测试用）, INFLIGHT_MAX_AGE_MS, REDISPATCH_MAX_AGE_MS
 // @pos:    core - 在途台账（重启换代丢消息修复：QQ 消息派发落账、答复送达销账、启动对账）
 //
 // 事故背景（2026-10-30，用户实证）：bot 重启/网关静默死亡窗口内到达的 QQ 消息
 // 丢失无反馈——在途回合状态全在内存，进程换代即蒸发。本模块把"派发→送达"责任
 // 落盘到 ~/.openqq/inflight.json，启动时对账恢复（bridge.recoverInflightRounds）。
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, statSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 
@@ -37,10 +37,7 @@ function journalPath(): string {
   return process.env.QQ_INFLIGHT_FILE || join(homedir(), ".openqq", "inflight.json")
 }
 
-let cache: InflightEntry[] | null = null
-
 function load(): InflightEntry[] {
-  if (cache) return cache
   let entries: InflightEntry[] = []
   try {
     if (existsSync(journalPath())) {
@@ -50,48 +47,105 @@ function load(): InflightEntry[] {
   } catch {
     entries = [] // 损坏即空，不阻塞启动
   }
-  // 修剪：已销账超 24h 的不再保留；有修剪即落盘（防 settled 条目只进不出）
-  const pruned = entries.filter((e) => e.state === "inflight" || Date.now() - e.at <= INFLIGHT_MAX_AGE_MS)
-  cache = pruned
-  if (pruned.length !== entries.length) save()
-  return cache
+  // 读取始终走磁盘：多个 bot 执行体可能共享台账，进程内 cache 会看不到彼此的认领。
+  return entries.filter((e) => e.state === "inflight" || Date.now() - e.at <= INFLIGHT_MAX_AGE_MS)
 }
 
-function save(): void {
-  if (!cache) return
+function save(entries: InflightEntry[]): void {
+  const path = journalPath()
+  mkdirSync(join(path, ".."), { recursive: true })
+  // 临时文件带进程与随机后缀：并发执行体不会互相覆盖对方的 tmp。
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
   try {
-    const path = journalPath()
-    mkdirSync(join(path, ".."), { recursive: true })
-    // 原子写：先写临时文件再改名，防写一半被杀留坏账
-    const tmp = `${path}.tmp`
-    writeFileSync(tmp, JSON.stringify(cache, null, 2), { mode: 0o600 }) // 台账含用户消息，POSIX 仅本人可读
+    writeFileSync(tmp, JSON.stringify(entries, null, 2), { mode: 0o600 }) // 台账含用户消息，POSIX 仅本人可读
     renameSync(tmp, path)
   } catch (error) {
-    console.warn("[inflight] 台账落盘失败:", error instanceof Error ? error.message : error)
+    try { unlinkSync(tmp) } catch { /* 已改名或清理失败 */ }
+    throw error
   }
 }
 
-/** 派发落账：QQ 消息进入 AI 派发管线前调用。同 msgId 幂等；sessionId 允许后补（入队时未知、drain 时回填） */
-export function recordInflight(entry: Omit<InflightEntry, "state">): void {
-  const entries = load()
-  const existing = entries.find((e) => e.msgId === entry.msgId)
-  if (existing) {
-    if (!existing.sessionId && entry.sessionId) {
-      existing.sessionId = entry.sessionId
-      save()
+// 所有台账 mutation 共用一把短临界区文件锁。仅原子 rename 不够：两个进程仍可能
+// 基于各自旧快照互相覆盖。锁内重新读盘，保证跨进程 claim/settle 不丢更新。
+const JOURNAL_LOCK_STALE_MS = 30_000
+const JOURNAL_LOCK_WAIT_MS = 5_000
+const sleepArray = new Int32Array(new SharedArrayBuffer(4))
+
+function withJournalLock<T>(fn: () => T): T {
+  const path = journalPath()
+  mkdirSync(join(path, ".."), { recursive: true })
+  const lockPath = `${path}.lock`
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const deadline = Date.now() + JOURNAL_LOCK_WAIT_MS
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600)
+      try {
+        writeFileSync(fd, token)
+      } finally {
+        closeSync(fd)
+      }
+      break
+    } catch (error) {
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > JOURNAL_LOCK_STALE_MS) unlinkSync(lockPath)
+      } catch { /* 锁不存在/另一进程正在接管，下轮重试 */ }
+      if (Date.now() >= deadline) {
+        throw new Error(`在途台账锁等待超时: ${error instanceof Error ? error.message : error}`)
+      }
+      Atomics.wait(sleepArray, 0, 0, 10)
     }
-    return
   }
-  entries.push({ ...entry, state: "inflight" })
-  save()
+
+  try {
+    return fn()
+  } finally {
+    // 只释放自己持有的锁； stale 接管后，旧持有者不能误删新锁。
+    try {
+      if (readFileSync(lockPath, "utf-8") === token) unlinkSync(lockPath)
+    } catch { /* 已被 stale 清理 */ }
+  }
+}
+
+function mutate<T>(fn: (entries: InflightEntry[]) => T): T {
+  return withJournalLock(() => {
+    const entries = load()
+    const result = fn(entries)
+    save(entries)
+    return result
+  })
+}
+
+/**
+ * AI 派发前原子认领。真实 QQ msgId 无论在途或已销账，都拒绝再次执行；
+ * 这把网关的进程内 Set 去重提升为跨进程/重启的 durable gate。
+ */
+export function claimInflight(entry: Omit<InflightEntry, "state">): boolean {
+  return mutate((entries) => {
+    if (entries.some((e) => e.msgId === entry.msgId)) return false
+    entries.push({ ...entry, state: "inflight" })
+    return true
+  })
+}
+
+/** 派发落账：同 msgId 幂等；sessionId 允许后补（入队时未知、drain 时回填） */
+export function recordInflight(entry: Omit<InflightEntry, "state">): void {
+  mutate((entries) => {
+    const existing = entries.find((e) => e.msgId === entry.msgId)
+    if (existing) {
+      if (!existing.sessionId && entry.sessionId) existing.sessionId = entry.sessionId
+      return
+    }
+    entries.push({ ...entry, state: "inflight" })
+  })
 }
 
 /** 销账：答复已送达（或已转入有接管的后台等待/已给用户终态反馈） */
 export function settleInflight(msgId: string): void {
-  const entry = load().find((e) => e.msgId === msgId && e.state === "inflight")
-  if (!entry) return
-  entry.state = "settled"
-  save()
+  mutate((entries) => {
+    const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
+    if (entry) entry.state = "settled"
+  })
 }
 
 /** 待对账清单（启动恢复用） */
@@ -99,10 +153,9 @@ export function pendingInflight(): InflightEntry[] {
   return load().filter((e) => e.state === "inflight")
 }
 
-/** 测试用：清空台账缓存与文件状态 */
+/** 测试用：清空台账文件状态 */
 export function resetInflightJournal(): void {
-  cache = []
-  save()
+  withJournalLock(() => save([]))
 }
 
 // —— 对账分类（纯函数）——
