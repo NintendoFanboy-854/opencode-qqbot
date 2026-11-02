@@ -25,6 +25,10 @@ import {
   type WatchApi,
 } from "./commands.js"
 import { createMirror } from "./core/mirror.js"
+import { MessageQueue, previewText, agoLabel } from "./core/message-queue.js"
+import { classifyProviderError, rescueText } from "./core/error-rescue.js"
+
+const QUEUE_MAX = 20 // Q1：忙碌队列上限（学习 pi-qqbot queue.max 默认）
 import {
   createPermissionGate,
   parsePermissionDecision,
@@ -98,6 +102,9 @@ export function createBridge(
   sessions: SessionManager,
 ): Bridge {
   const busyUsers = new Set<string>()
+  // Q1：忙碌消息队列（该用户当前回合结束后自动 drain）
+  const msgQueue = new MessageQueue(QUEUE_MAX)
+  const draining = new Set<string>()
   // Persist greeted users to disk so restarting the bot doesn't re-send the
   // full command list to every user on their next message.
   const greeted = loadGreetedSet()
@@ -113,6 +120,10 @@ export function createBridge(
   const lastCtx = new Map<string, MessageContext>()    // userId -> 最近消息 ctx（推送通道选择依据）
   const bgWaits = new Map<string, { cancel: () => void }>() // 会话 -> 后台等待
   const callCache = new Map<string, string>()              // callID -> 命令摘要（⚠️ 上下文用）
+  // Q2：会话工具统计（/progress 手动查询用，本地事件源，零模型成本）
+  const turnStats = new Map<string, { tools: number; failed: number; lastTool: string; lastAt: number }>()
+  // Q4：远程场景提示注入标记（sessionId → 该会话已注入过远程指引）
+  const remoteNoticed = new Set<string>()
 
   // E（2026-10-29 同步升级，吸收 dsh session/idle-evictor）：闲置会话回收——
   // 长期无活动的会话退订 SSE，降 opencode 服务端事件扇出；/watch 显式盯着的
@@ -159,6 +170,23 @@ export function createBridge(
 
   function onSessionEvent(sessionID: string, ev: V2Event): void {
     sessionLastActivity.set(sessionID, Date.now())
+    // Q2：本地工具统计（/progress 查询数据源，动作类才计——文件类不算进度）
+    const d = (ev.data ?? {}) as Record<string, any>
+    if (ev.type === "session.tool.called" || ev.type === "session.tool.success") {
+      const cmd = typeof d.input === "string" ? d.input : d.input?.command
+      const actionable = ev.type === "session.tool.success" || (typeof cmd === "string" && cmd.trim())
+      if (actionable) {
+        const st = turnStats.get(sessionID) ?? { tools: 0, failed: 0, lastTool: "", lastAt: 0 }
+        if (ev.type === "session.tool.called") {
+          st.tools++
+          st.lastTool = String(cmd).slice(0, 60)
+        } else if (typeof d.metadata?.exit === "number" && d.metadata.exit !== 0) {
+          st.failed++
+        }
+        st.lastAt = Date.now()
+        turnStats.set(sessionID, st)
+      }
+    }
     const line = formatMilestone(ev, callCache)
     if (!line) return
     // 2026-10-14 用户拍板：里程碑只投 /watch 显式订阅者——自身回合回显与
@@ -205,6 +233,8 @@ export function createBridge(
       cleanup()
       // R 项：后台等待到达终态（完成投递/放弃告知）即销账
       if (trackId) settleInflight(trackId)
+      // Q1：后台等待终态 → 放行该用户队列（此前为串行而挂起）
+      void drainQueue(ctx.userId)
       if (kind === "giveup") {
         await safeDeliver(ctx, "⚠️ 后台任务 24 小时仍未完成，停止自动跟进；结果可随时用 /history 查询")
         return
@@ -391,6 +421,47 @@ export function createBridge(
 
   const mirrorApi: MirrorApi = mirror.api
 
+  // Q1：队列命令实现
+  const queueApi = {
+    list: (userId: string): string => {
+      const jobs = msgQueue.list(userId)
+      const busy = busyUsers.has(userId) ? "当前任务：处理中（发 /cancel 可中断）" : "当前任务：空闲"
+      if (jobs.length === 0) return `${busy}\n队列：空`
+      const lines = jobs.map(
+        (j) => `  #${j.id} · ${agoLabel(j.enqueuedAt)} · ${previewText(j.text)}`,
+      )
+      return [
+        busy,
+        `队列：${jobs.length} 条（上限 ${QUEUE_MAX}）`,
+        ...lines,
+        "发 /queue clear 清空，/queue drop <编号> 删除一条。",
+      ].join("\n")
+    },
+    clear: (userId: string): number => msgQueue.clear(userId),
+    drop: (userId: string, id: number): string =>
+      msgQueue.drop(userId, id) ? `已删除队列 #${id}` : `队列里没有 #${id}`,
+  }
+
+  // Q2：手动进度查询（本地事件统计，零模型调用）
+  const progressApi = {
+    query: (userId: string): string => {
+      const session = sessions.getSession(userId)
+      if (!session) return "当前还没有会话，发消息即可开始"
+      const st = turnStats.get(session.sessionId)
+      const busy = busyUsers.has(userId) ? "处理中" : "空闲"
+      const bg = bgWaits.has(session.sessionId) ? " · 后台等待在途" : ""
+      if (!st) return `当前会话：${busy}${bg}\n暂无工具调用记录（本会话新起或尚无动作类里程碑）`
+      return [
+        `当前会话：${busy}${bg}`,
+        `工具调用 ${st.tools} 次（失败 ${st.failed}）`,
+        st.lastTool ? `最近：${st.lastTool}` : "",
+        st.lastAt ? `最近活动：${agoLabel(st.lastAt)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    },
+  }
+
   const commandContext: CommandContext = {
     config,
     client,
@@ -399,6 +470,8 @@ export function createBridge(
     pendingSelections,
     watch: watchApi,
     mirror: mirrorApi,
+    queue: queueApi,
+    progress: progressApi,
   }
 
   // R2 修复批次启动项（2026-10-14）
@@ -490,7 +563,16 @@ export function createBridge(
       }
 
       if (busyUsers.has(ctx.userId)) {
-        await sendReply(ctx, "上一条消息还在处理中，请稍候再试")
+        // Q1（学习 pi-qqbot 队列 UX）：忙碌不再拒绝——FIFO 排队，回合结束自动执行
+        const queued = msgQueue.push(ctx.userId, ctx)
+        if (!queued) {
+          await sendReply(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
+          return
+        }
+        await sendReply(
+          ctx,
+          `已排队 #${queued.job.id}${queued.ahead > 0 ? `（前面还有 ${queued.ahead} 条）` : ""}，当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
+        )
         return
       }
 
@@ -536,7 +618,14 @@ export function createBridge(
         )
         const { text: promptBody, files } = augmentPromptWithAttachments(content, prepared)
         // 缺口 1：引用上文注入——让 AI 明确知道用户引用了哪条消息
-        const promptText = ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody
+        // Q4（学习 pi-qqbot remote-context）：会话首条 QQ 消息注入远程场景指引——
+        // 用户看不到桌面弹窗/截图，需要图片走离屏生成+发文件通道，回答精炼。
+        // 只注入一次（进程内标记），不污染每轮上下文。
+        const remoteNote = remoteNoticed.has(sessionId)
+          ? ""
+          : "（场景备注：用户通过 QQ 远程与你对话，看不到本机桌面与弹窗。需要图片时请用代码离屏生成后经发文件通道送达，不要尝试桌面截图；回复尽量精炼。）\n\n"
+        remoteNoticed.add(sessionId)
+        const promptText = remoteNote + (ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody)
         // R 项（2026-10-30）：在途台账落账——派发前记录，送达才销账；
         // 进程中途死亡时启动对账据此恢复。重派回合无真实 msgId，用合成键跟踪。
         trackId = ctx.msgId || `redispatch-${sessionId}-${turnStart}`
@@ -580,7 +669,10 @@ export function createBridge(
           )
           startBackgroundWait(sessionId, ctx, turnStart, trackId)
         } else {
-          await safeDeliver(ctx, `处理失败：${toErrorMessage(error)}`)
+          // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错
+          const errText = toErrorMessage(error)
+          const rescue = rescueText(classifyProviderError(errText), errText)
+          await safeDeliver(ctx, rescue ?? `处理失败：${errText}`)
           settleInflight(trackId) // R 项：失败反馈已送达 = 终态，销账
         }
       } finally {
@@ -588,6 +680,9 @@ export function createBridge(
         // 镜像解锁：转后台的任务由 bgWait 完成时解锁，其余延迟 5 秒（SSE 事件宽限）
         if (sessionId && !bgWaits.has(sessionId)) mirror.scheduleUnlock(sessionId)
         busyUsers.delete(ctx.userId)
+        // Q1：回合结束（成功/失败/转后台）→ 自动执行该用户队列下一条；
+        // 转后台等待的会话保持串行——由 bgWait 完成时再 drain（不与前序后台任务并发）
+        if (sessionId && !bgWaits.has(sessionId)) void drainQueue(ctx.userId)
       }
     } catch (error) {
       console.error("[bridge] handleMessage failed:", error)
@@ -638,6 +733,24 @@ export function createBridge(
       } catch (error) {
         console.error(`[bridge] 启动对账单条失败 msgId=${entry.msgId}:`, error)
       }
+    }
+  }
+
+  // Q1：队列 drain——取该用户队首消息重走完整管线。draining 防重入；
+  // handleMessage 自身的 finally 会继续 drain 下一条（链式）。
+  async function drainQueue(userId: string): Promise<void> {
+    if (draining.has(userId) || busyUsers.has(userId)) return
+    const job = msgQueue.shift(userId)
+    if (!job) return
+    draining.add(userId)
+    try {
+      await sendReply(job.ctx, `开始执行队列 #${job.id}`)
+      await handleMessage(job.ctx)
+    } catch (error) {
+      console.error("[bridge] 队列执行失败:", error)
+    } finally {
+      draining.delete(userId)
+      if (msgQueue.size(userId) > 0 && !busyUsers.has(userId)) void drainQueue(userId)
     }
   }
 

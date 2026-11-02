@@ -23,6 +23,19 @@ export interface MirrorApi {
   status: () => string
 }
 
+// Q1：忙碌队列 API（bridge 实现：FIFO + drain + 控制命令）
+export interface QueueApi {
+  list: (userId: string) => string
+  /** 清空队列，返回清掉的条数（/cancel 与 /queue clear 共用） */
+  clear: (userId: string) => number
+  drop: (userId: string, id: number) => string
+}
+
+// Q2：手动进度查询 API（bridge 实现：本地事件统计，零模型调用）
+export interface ProgressApi {
+  query: (userId: string) => string
+}
+
 export interface CommandContext {
   config: Config
   client: OpencodeClient
@@ -31,6 +44,8 @@ export interface CommandContext {
   pendingSelections: Map<string, PendingSelection>
   watch: WatchApi
   mirror: MirrorApi
+  queue: QueueApi
+  progress: ProgressApi
 }
 
 export interface PendingSelection {
@@ -76,6 +91,10 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
       return handleNew(ctx, cmdCtx)
     case "stop":
       return handleStop(ctx, cmdCtx)
+    case "queue":
+      return handleQueue(ctx, parsed.args, cmdCtx)
+    case "progress":
+      return cmdCtx.progress.query(ctx.userId)
     case "status":
       return handleStatus(ctx, cmdCtx)
     case "sessions":
@@ -181,12 +200,29 @@ async function handleSend(ctx: MessageContext, args: string, cmdCtx: CommandCont
 
 async function handleStop(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
   const session = cmdCtx.sessions.getSession(ctx.userId)
+  const cleared = cmdCtx.queue.clear(ctx.userId) // Q1：/cancel 同时清队（"停"=全停）
+  const suffix = cleared > 0 ? `，队列中的 ${cleared} 条已清空` : ""
   if (!session) {
-    return "当前还没有会话可停止"
+    return cleared > 0 ? `当前没有会话可停止${suffix}` : "当前还没有会话可停止"
   }
 
   await cmdCtx.client.session.abort({ path: { id: session.sessionId } })
-  return `已发送停止请求：${session.title ?? session.sessionId}`
+  return `已发送停止请求：${session.title ?? session.sessionId}${suffix}`
+}
+
+// Q1：/queue 查看与管理忙碌队列
+function handleQueue(ctx: MessageContext, args: string, cmdCtx: CommandContext): string {
+  const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? ""
+  if (sub === "clear") {
+    const n = cmdCtx.queue.clear(ctx.userId)
+    return n > 0 ? `已清空队列（${n} 条）` : "队列本来就是空的"
+  }
+  if (sub === "drop") {
+    const id = Number(args.trim().split(/\s+/)[1])
+    if (!Number.isInteger(id) || id <= 0) return "用法：/queue drop <编号>"
+    return cmdCtx.queue.drop(ctx.userId, id)
+  }
+  return cmdCtx.queue.list(ctx.userId)
 }
 
 async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
