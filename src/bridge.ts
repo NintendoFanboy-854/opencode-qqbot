@@ -632,7 +632,7 @@ export function createBridge(
         // 只注入一次（进程内标记），不污染每轮上下文。
         const remoteNote = remoteNoticed.has(sessionId)
           ? ""
-          : "（场景备注：用户通过 QQ 远程与你对话，看不到本机桌面与弹窗。需要图片时请用代码离屏生成后经发文件通道送达，不要尝试桌面截图；回复尽量精炼。）\n\n"
+          : "（远程对话，回复精炼。需要图片时优先代码离屏生成并经发文件通道送达；任务明确需要桌面截图时可执行，若截到锁屏/无内容画面则改走离屏生成。）\n\n"
         remoteNoticed.add(sessionId)
         const promptText = remoteNote + (ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody)
         // R 项（2026-10-30）：在途台账落账——派发前记录，送达才销账；
@@ -731,11 +731,11 @@ export function createBridge(
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
           settleInflight(entry.msgId) // 旧账结清，重派回合走新账（合成 trackId）
-          await deliver(ctx, `🔄 重启恢复：重新处理你之前的消息「${entry.text.slice(0, 50)}」`)
+          await deliver(ctx, `🔄 重启恢复：重新处理你之前的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」`)
           void handleMessage(ctx)
           console.log(`[bridge] 启动对账：丢失消息已重派 msgId=${entry.msgId}`)
         } else {
-          await deliver(ctx, `⚠️ 此前重启期间丢失一条你的消息「${entry.text.slice(0, 50)}」（超过自动重派窗口未重发），需要的话请重发一次`)
+          await deliver(ctx, `⚠️ 此前重启期间丢失一条你的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」（超过自动重派窗口未重发），需要的话请重发一次`)
           settleInflight(entry.msgId)
           console.log(`[bridge] 启动对账：超期消息仅通知 msgId=${entry.msgId}`)
         }
