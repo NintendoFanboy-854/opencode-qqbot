@@ -632,7 +632,7 @@ export function createBridge(
         // 只注入一次（进程内标记），不污染每轮上下文。
         const remoteNote = remoteNoticed.has(sessionId)
           ? ""
-          : "（远程对话，回复精炼。需要图片时优先代码离屏生成并经发文件通道送达；任务明确需要桌面截图时可执行，若截到锁屏/无内容画面则改走离屏生成。）\n\n"
+          : "（远程对话，回复精炼。审批与选择题可直接在 QQ 卡片作答，无需到桌面操作。需要图片时优先代码离屏生成并经发文件通道送达；任务明确需要桌面截图时可执行，若截到锁屏/无内容画面则改走离屏生成。）\n\n"
         remoteNoticed.add(sessionId)
         const promptText = remoteNote + (ctx.quoteText ? `> 引用上文：${ctx.quoteText}\n\n${promptBody}` : promptBody)
         // R 项（2026-10-30）：在途台账落账——派发前记录，送达才销账；
