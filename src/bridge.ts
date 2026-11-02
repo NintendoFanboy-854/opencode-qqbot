@@ -9,7 +9,7 @@ import type { Config } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken, sendC2CInputNotify, sendC2CMessage, sendGroupMessage } from "./qq/api.js"
 import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } from "./qq/media.js"
-import type { OpencodeClient } from "./opencode/client.js"
+import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
 import { collectReplyText } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
@@ -720,6 +720,7 @@ export function createBridge(
   // R 项（2026-10-30 重启丢消息事故修复）：启动对账——查在途台账里"已派发未销账"
   // 的回合，按会话历史分类处置：已有答案→补投；仍在执行→重挂后台等待；
   // 从未到达 opencode→30 分钟内自动重派（超期通知请用户重发）。
+  // 恢复读取必须覆盖原回合，而不是只看最新 20 条；否则长任务/新消息一多就误判 lost 重派。
   async function recoverInflightRounds(): Promise<void> {
     const pending = pendingInflight()
     if (pending.length === 0) return
@@ -733,8 +734,8 @@ export function createBridge(
       // 恢复投递走主动通道（原 msgId 的被动窗口早已过期）
       const ctx: MessageContext = { type: "c2c", userId: entry.userId, msgId: "", content: entry.text }
       try {
-        const listJson = await client.session.messages({ path: { id: entry.sessionId } })
-        const cls = classifyInflight(entry, listJson?.data ?? [])
+        const listJson = { data: await fetchRecoveryMessages(client, entry.sessionId) }
+        const cls = classifyInflight(entry, listJson.data)
         if (cls.kind === "answered") {
           await deliver(ctx, `🔄 重启补投：你之前的消息已有答案\n\n${cls.answer}`)
           settleInflight(entry.msgId)
@@ -788,6 +789,21 @@ export function createBridge(
       void formBridge.handleButton(event)
     },
   }
+}
+
+export async function fetchRecoveryMessages(client: OpencodeClient, sessionId: string): Promise<SessionMessage[]> {
+  const all: SessionMessage[] = []
+  let cursor: string | undefined
+  // 上限 2000 条防异常分页循环；常规长会话已足够覆盖原始在途回合。
+  for (let page = 0; page < 10; page++) {
+    const res = await client.session.messages({ path: { id: sessionId }, query: { limit: 200, cursor } })
+    const items = res?.data ?? []
+    all.push(...items)
+    const next = res?.cursor?.next
+    if (!next || items.length === 0) break
+    cursor = next
+  }
+  return all
 }
 
 async function maybeHandlePendingSelection(

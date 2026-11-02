@@ -94,7 +94,10 @@ export interface OpencodeClient {
     create(body?: Record<string, unknown>): Promise<{ data?: { id: string; title?: string } }>
     list(): Promise<{ data?: unknown[] }>
     abort(opts: { path: { id: string } }): Promise<unknown>
-    messages(opts: { path: { id: string } }): Promise<{ data?: SessionMessage[] }>
+    messages(opts: {
+      path: { id: string }
+      query?: { limit?: number; cursor?: string }
+    }): Promise<{ data?: SessionMessage[]; cursor?: { next?: string } }>
     prompt(opts: { path: { id: string }; body: { text: string } & PromptOptions }): Promise<{ data?: { time?: { created?: number } } }>
     setModel(opts: { path: { id: string }; body: { model: { providerID: string; id: string } } }): Promise<unknown>
     setAgent(opts: { path: { id: string }; body: { agent: string } }): Promise<unknown>
@@ -205,7 +208,11 @@ export function createClient(baseUrl: string): OpencodeClient {
         return json(await req(`/session/${opts.path.id}/interrupt`, { method: "POST", body: "{}" }))
       },
       async messages(opts) {
-        return json(await req(`/session/${opts.path.id}/message`))
+        const query = new URLSearchParams()
+        if (opts.query?.limit !== undefined) query.set("limit", String(opts.query.limit))
+        if (opts.query?.cursor) query.set("cursor", opts.query.cursor)
+        const suffix = query.size > 0 ? `?${query.toString()}` : ""
+        return json(await req(`/session/${opts.path.id}/message${suffix}`))
       },
       async prompt(opts) {
         return json(await req(`/session/${opts.path.id}/prompt`, { method: "POST", body: JSON.stringify(opts.body) }))
