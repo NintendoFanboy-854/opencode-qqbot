@@ -57,6 +57,34 @@ function saveQuotaMap(m: ReadonlyMap<string, { day: string; count: number; warne
 // 记"有未送达消息"，下一次成功投递时前缀贴条告知用户（导出供测试）。
 export const UNDELIVERED_NOTICE = "（此前有未能送达的消息）\n"
 
+// QQ 渲染适配（2026-11-03 用户双端截图实证）：QQ 官方 markdown 渲染器把跨
+// 段落的有序列表续接编号（原文 1./2. 渲染成 3./4.），与桌面端所见不一致。
+// 对策=列表标记 `N.` 统一改写为 `N)`：非 CommonMark 列表语法 → 字面保留，
+// 编号所见即原文，桌面与 QQ 端逐字一致；变换幂等（N) 不再被任何渲染器续编）。
+// 代码围栏（```/~~~）内不动；仅行首（含缩进）的 `N. ` 命中，行内「1.5 版本」
+// 类文本无空格不受影响。导出供测试。
+export function qqListNormalize(text: string): string {
+  const lines = text.split("\n")
+  let fence = false
+  let fenceMarker = ""
+  for (let i = 0; i < lines.length; i++) {
+    const fm = lines[i].trim().match(/^(```|~~~)/)
+    if (fm) {
+      if (!fence) {
+        fence = true
+        fenceMarker = fm[1]
+      } else if (fm[1] === fenceMarker) {
+        fence = false
+        fenceMarker = ""
+      }
+      continue
+    }
+    if (fence) continue
+    lines[i] = lines[i].replace(/^(\s*)(\d+)\. /, "$1$2) ")
+  }
+  return lines.join("\n")
+}
+
 export interface DeliveryAttempt {
   text: string
   at: number
@@ -281,7 +309,8 @@ export function createDelivery(
       return
     }
     const hadNotice = undelivered.delete(ctx.userId)
-    const body = hadNotice ? UNDELIVERED_NOTICE + text : text
+    // QQ 渲染适配：有序列表改写，防 QQ 端跨段落续编（桌面所见=QQ 所见）
+    const body = qqListNormalize(hadNotice ? UNDELIVERED_NOTICE + text : text)
     try {
       await deliverCore(ctx, body)
     } catch (error) {
