@@ -59,6 +59,10 @@ export interface PromptAndWaitOptions extends PromptOptions {
   // 原生附件（2026-10-14）：prompt body 的 files（v2 PromptInput schema 内
   // 字段，additionalProperties:false 不会剥它；model/agent 才会被剥）
   files?: Array<{ uri: string; name?: string }>
+  // 修复⑧（2026-11-03）：受领回调——prompt 落库即回传 { promptId, baseline }。
+  // promptId = 本回合 user 消息 id，是「直答归属本回合」的精确锚点（共享会话下
+  // 「baseline 后第一条 assistant」会抓到别回合的产物）。
+  onAccepted?: (info: { promptId: string; baseline: number }) => void
   // 轮询中发现待审批权限时调用；返回用户的审批决策后，promptAndWait 负责
   // POST reply 并继续等待 idle。审批等待时间不计入 5 分钟超时。
   onPermission?: (req: PermissionRequest) => Promise<PermissionDecision>
@@ -111,6 +115,7 @@ export interface OpencodeClient {
   form: {
     list(input: { sessionID: string }): Promise<{ data?: FormInfo[] }>
     reply(opts: { path: { sessionID: string; formID: string }; body: { answer: Record<string, unknown> } }): Promise<unknown>
+    cancel(opts: { path: { sessionID: string; formID: string } }): Promise<unknown>
   }
   app: {
     agents(): Promise<{ data?: unknown[] }>
@@ -145,6 +150,75 @@ export function collectReplyText(msgs: SessionMessage[], baseline: number): stri
     .map((p) => p.text ?? "")
     .join("\n")
     .trim()
+}
+
+// 修复⑧（2026-11-03 定案）：回合边界归属——共享会话错误源实证（expA 等 21 分钟
+// 拿到桌面排障报告）：collectReplyText 的「baseline 后最新 assistant」在共享会话
+// 会抓到别回合产物。正确口径=只取本回合自己：
+//   ① 定位本回合 user 行——promptId 精确匹配（prompt API 受理返回值）；
+//   ② 兜底时间锚：created == baseline 的 user 行（受理即落库，±1s 容差错 skew）；
+//   ③ 边界=该 user 行 → 下一条 user 行之前；hasIdle/text 都只看边界内。
+// 锚点全部失配（形状变化/兼容旧数据）→ 回落旧 baseline 判据（anchored=false）。
+export interface TurnState {
+  /** true=已按回合边界定位（text/hasIdle 只关乎本回合）；false=回落旧判据 */
+  anchored: boolean
+  /** 本回合（或旧判据窗口内）是否已出现 idle 终结标记 */
+  hasIdle: boolean
+  /** 本回合（或旧判据窗口内）最终 assistant 正文；无正文为空串 */
+  text: string
+}
+
+export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: number): TurnState {
+  const ordered = [...msgs].sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0))
+  let userIdx = -1
+  if (promptId) userIdx = ordered.findIndex((m) => m.type === "user" && m.id === promptId)
+  if (userIdx < 0 && baseline > 0) {
+    // 修复⑧时间锚兜底：baseline 即本回合 user 行 created（受理即落库），取最近命中；
+    // 容差 200ms 仅吸收毫秒级落库偏差，防同窗紧邻行误绑（17:37 定案：5 连发行距 ms 级，锚必最准）。
+    let best = -1
+    let bestDelta = Number.POSITIVE_INFINITY
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].type !== "user") continue
+      const delta = Math.abs((ordered[i].time?.created ?? 0) - baseline)
+      if (delta < bestDelta) {
+        bestDelta = delta
+        best = i
+      }
+    }
+    if (best >= 0 && bestDelta <= 200) userIdx = best
+  }
+  if (userIdx < 0) {
+    // 回落旧判据：行为与 collectReplyText 时代一致，不引入新风险
+    const idle = msgs.find((x) => x.type === "idle" && (x.time?.created ?? 0) >= baseline)
+    return { anchored: false, hasIdle: Boolean(idle), text: collectReplyText(msgs, baseline) }
+  }
+  let end = ordered.length
+  for (let i = userIdx + 1; i < ordered.length; i++) {
+    if (ordered[i].type === "user") {
+      end = i
+      break
+    }
+  }
+  const boundary = ordered.slice(userIdx + 1, end)
+  let text = ""
+  for (let i = boundary.length - 1; i >= 0; i--) {
+    const m = boundary[i]
+    if (m.type !== "assistant") continue
+    const joined = (m.content ?? [])
+      .filter((p) => p.type === "text" && p.text?.trim())
+      .map((p) => p.text ?? "")
+      .join("\n")
+      .trim()
+    if (joined) {
+      text = joined
+      break
+    }
+  }
+  return {
+    anchored: true,
+    hasIdle: boundary.some((m) => m.type === "idle"),
+    text,
+  }
 }
 
 let client: OpencodeClient | null = null
@@ -251,6 +325,9 @@ export function createClient(baseUrl: string): OpencodeClient {
           }),
         )
       },
+      async cancel(opts) {
+        return json(await req(`/session/${opts.path.sessionID}/form/${opts.path.formID}`, { method: "DELETE" }))
+      },
     },
 
     app: {
@@ -311,6 +388,11 @@ export function createClient(baseUrl: string): OpencodeClient {
       // Only accept assistant messages created at/after this prompt, so a prior
       // turn's completed reply is never mistaken for this turn's answer.
       const baseline = promptJson?.data?.time?.created ?? 0
+      const promptId = promptJson?.data?.id ?? ""
+      // 修复⑧：受领即回传锚点（调用方存台账/挑选直答归属用）
+      if (options?.onAccepted) options.onAccepted({ promptId, baseline })
+      // LLM 入口实证：user 记录可核对每次真实 /prompt 受理，不再由 QQ 出站反推执行次数。
+      console.log(`[opencode] LLM prompt 已受理 pid=${process.pid} session=${sessionId} user=${promptJson?.data?.id ?? "?"} baseline=${baseline}`)
 
       const deadline = Date.now() + RESPONSE_TIMEOUT_MS
       let permissionWaitMs = 0 // 审批等待时间不计入 5 分钟超时（用户可能几分钟才回复）
@@ -364,17 +446,16 @@ export function createClient(baseUrl: string): OpencodeClient {
 
         const listJson = await json(await req(`/session/${sessionId}/message`))
         const msgs: SessionMessage[] = listJson?.data ?? []
-        // Completion = the idle marker created at/after this prompt. This is the
-        // only reliable "whole turn done" signal: tool-using turns emit several
-        // assistant messages (reasoning+tool) before the final text one, so
-        // "first completed assistant" would return an empty tool message.
-        const idle = msgs.find((x) => x.type === "idle" && (x.time?.created ?? 0) >= baseline)
-        if (idle) {
+        // Completion = the idle marker of THIS turn (修复⑧ 回合边界归属)。
+        // Tool-using turns emit several assistant messages (reasoning+tool) before
+        // the final text one, so "first completed assistant" would return an empty
+        // tool message. 共享会话下别回合的 idle/assistant 都不再计入本回合判定。
+        const turn = turnStateOf(msgs, promptId, baseline)
+        if (turn.hasIdle) {
           // Aggregate text parts from ALL assistant messages of this turn,
           // dropping reasoning/tool parts. In practice only the final assistant
           // carries text; earlier ones are reasoning+tool.
-          const reply = collectReplyText(msgs, baseline)
-          return reply || "(AI 未返回内容)"
+          return turn.text || "(AI 未返回内容)"
         }
       }
       throw new Error(`AI 响应超时（${TURN_TIMEOUT_MINUTES} 分钟）`)

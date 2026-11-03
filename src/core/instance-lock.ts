@@ -9,7 +9,7 @@
 //   - 抢锁失败时看 mtime：超 30s 未刷新判僵尸锁（宿主崩溃）→ 删除强抢
 //   - 未抢到可进入待命循环，每 5s 重试，宿主退出/暴毙后自动接管
 // 锁文件按 appId 隔离：~/.openqq/openqq-<appId>.lock。
-import { openSync, writeFileSync, closeSync, unlinkSync, statSync, utimesSync, mkdirSync } from "fs"
+import { openSync, readFileSync, writeFileSync, closeSync, unlinkSync, statSync, utimesSync, mkdirSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 
@@ -18,6 +18,11 @@ export const INSTANCE_LOCK_DISABLED_ENV = "QQ_INSTANCE_LOCK"
 const LOCK_STALE_MS = 30_000 // 30s 无心跳 = 僵尸锁
 const LOCK_UPDATE_MS = 10_000 // 持锁心跳间隔
 const LOCK_RETRY_MS = 5_000 // 待命抢锁间隔
+// 修复⑤（2026-11-03 定案）：持锁自检周期。背景=「暗 believer」事故：旧实例
+// 心跳 touch 失败是静默的（锁文件被新实例接管/删除后自己并不知道），双 believer
+// 并存造成同 msgId 并发受理（主链）。自检看锁文件里的 pid：不是自己且进程存活
+// → 本实例是残留，自杀退出；锁文件消失同样说明被强抢 → 自杀。待命态无锁不检。
+const LOCK_SELF_CHECK_MS = 60_000
 
 export interface InstanceLock {
   /** 释放锁（清心跳 + 删锁文件），幂等 */
@@ -66,12 +71,34 @@ export function acquireInstanceLockAt(path: string, staleMs: number = LOCK_STALE
   // 测试场景不拖累进程退出
   heartbeat.unref?.()
 
+  // 修复⑤：60s 周期自检——锁被他人接管/锁文件消失 → 本实例即残留 believer，自杀。
+  // 判定只看锁内容里的 pid 与进程存活：pid==自己则继续；锁文件缺失=被强抢流程
+  // 接管中，同样不可信 → 退出（watchdog/bot-launcher 会待命，不产生双跑）。
+  const selfCheck = setInterval(() => {
+    try {
+      const holder = (JSON.parse(readFileSync(path, "utf-8")) as { pid?: number }).pid
+      if (holder === process.pid) return
+      try {
+        process.kill(holder!, 0)
+        console.error(`[instance-lock] 自检：锁已被 pid=${holder} 持有且进程存活，本实例为残留 believer，自杀退出`)
+        process.exit(1)
+      } catch {
+        /* holder 已死：等待其锁被 stale 逻辑回收，本实例继续自检 */
+      }
+    } catch {
+      console.error("[instance-lock] 自检：锁文件已消失（被接管或强抢流程删除），本实例退出")
+      process.exit(1)
+    }
+  }, LOCK_SELF_CHECK_MS)
+  selfCheck.unref?.()
+
   let released = false
   return {
     release: () => {
       if (released) return
       released = true
       clearInterval(heartbeat)
+      clearInterval(selfCheck)
       try {
         unlinkSync(path)
       } catch {

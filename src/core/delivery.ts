@@ -2,7 +2,7 @@
 // @output: createDelivery
 // @pos:    根层/core - 投递域（O7c 2026-10-15 自 bridge.ts 拆出：统一投递
 //          被动→主动降级、日配额记账与落盘、观察推送节流队列、主动/被动通道发送）
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, statSync } from "fs"
 import { join } from "path"
 import { createHash } from "node:crypto"
 import { homedir } from "os"
@@ -75,8 +75,10 @@ export function shouldSuppressDuplicate(
   text: string,
   now: number,
   ttlMs = DELIVERY_DEDUPE_TTL_MS,
+  identity = text,
 ): boolean {
-  return text.length >= 200 && previous?.text === text && now - previous.at < ttlMs
+  // 长度必须看原始正文；identity 可能是较短的 userId:sha256 键，不能拿它做长文门槛。
+  return text.length >= 200 && previous?.text === identity && now - previous.at < ttlMs
 }
 
 // 仅存用户键+内容哈希，不把回复正文写进运行数据。跨重启也能识别同文回复。
@@ -102,9 +104,69 @@ function saveDeliveryAttempts(entries: ReadonlyMap<string, DeliveryAttempt>): vo
     .filter((entry) => Date.now() - entry.at < DELIVERY_DEDUPE_TTL_MS)
     .map((entry) => ({ key: entry.text, at: entry.at }))
   mkdirSync(join(DELIVERY_DEDUPE_FILE, ".."), { recursive: true })
-  const tmp = `${DELIVERY_DEDUPE_FILE}.tmp`
-  writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 })
-  renameSync(tmp, DELIVERY_DEDUPE_FILE)
+  const tmp = `${DELIVERY_DEDUPE_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  try {
+    writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 })
+    renameSync(tmp, DELIVERY_DEDUPE_FILE)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch { /* 已改名或清理失败 */ }
+    throw error
+  }
+}
+
+// 多执行体共用同一把短文件锁：读取→判定→占位必须原子完成，否则不同进程会同时放行同文回复。
+const DELIVERY_LOCK_STALE_MS = 30_000
+const DELIVERY_LOCK_WAIT_MS = 5_000
+const deliverySleepArray = new Int32Array(new SharedArrayBuffer(4))
+
+function withDeliveryLock<T>(fn: () => T): T {
+  mkdirSync(join(DELIVERY_DEDUPE_FILE, ".."), { recursive: true })
+  const lockPath = `${DELIVERY_DEDUPE_FILE}.lock`
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const deadline = Date.now() + DELIVERY_LOCK_WAIT_MS
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600)
+      try { writeFileSync(fd, token) } finally { closeSync(fd) }
+      break
+    } catch (error) {
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > DELIVERY_LOCK_STALE_MS) unlinkSync(lockPath)
+      } catch { /* 锁不存在/另一进程正在接管 */ }
+      if (Date.now() >= deadline) throw new Error(`同文投递锁等待超时: ${error instanceof Error ? error.message : error}`)
+      Atomics.wait(deliverySleepArray, 0, 0, 10)
+    }
+  }
+  try {
+    return fn()
+  } finally {
+    try {
+      if (readFileSync(lockPath, "utf-8") === token) unlinkSync(lockPath)
+    } catch { /* 已被 stale 清理 */ }
+  }
+}
+
+/** 返回占位键；24h 内同文长回复已占位时返回 null。发送失败必须按原时间戳释放。 */
+export function reserveDeliveryAttempt(userId: string, text: string, now = Date.now()): string | null {
+  const attemptKey = deliveryAttemptKey(userId, text)
+  return withDeliveryLock(() => {
+    const entries = loadDeliveryAttempts()
+    if (shouldSuppressDuplicate(entries.get(attemptKey), text, now, DELIVERY_DEDUPE_TTL_MS, attemptKey)) return null
+    entries.set(attemptKey, { text: attemptKey, at: now })
+    saveDeliveryAttempts(entries)
+    return attemptKey
+  })
+}
+
+export function releaseDeliveryAttempt(userId: string, text: string, at: number): void {
+  const attemptKey = deliveryAttemptKey(userId, text)
+  withDeliveryLock(() => {
+    const entries = loadDeliveryAttempts()
+    if (entries.get(attemptKey)?.at === at) {
+      entries.delete(attemptKey)
+      saveDeliveryAttempts(entries)
+    }
+  })
 }
 
 // B-msgid 纯函数（导出供测试，2026-10-29）：挑选可"骑"的被动 msg_id——
@@ -162,8 +224,6 @@ export function createDelivery(
   const pushQueues = new Map<string, PushQueue>()
   // P 项：彻底投递失败的用户集合（贴条状态），下次成功投递时消化
   const undelivered = new Set<string>()
-  // 同文长回复幂等（跨重启 24h）；尝试前占位防并发，失败立即释放允许重试。
-  const recentDeliveries = loadDeliveryAttempts()
   const activeQuota = new Map<string, { day: string; count: number; warned: boolean }>()
   // B1（2026-10-29，吸收自 openclaw-qqbot reply-limiter）：被动回复限额预判——
   // 单 msgId 4 次/1h 窗口，耗尽/过期直接转主动，省一次注定被拒的 API 往返。
@@ -214,20 +274,19 @@ export function createDelivery(
   // 投递失败则把贴条放回（留待下次），成功才算消化。
   async function deliver(ctx: MessageContext, text: string): Promise<void> {
     const now = Date.now()
-    const attemptKey = deliveryAttemptKey(ctx.userId, text)
-    if (shouldSuppressDuplicate(recentDeliveries.get(attemptKey), attemptKey, now)) {
+    // 跨进程原子占位：直答/镜像/恢复即使落在不同执行体，同文长回复也只放行一次。
+    const attemptKey = reserveDeliveryAttempt(ctx.userId, text, now)
+    if (!attemptKey) {
       console.log(`[bridge] 同文长回复已在 24h 内投递，跳过重复出站 user=${ctx.userId}`)
       return
     }
-    recentDeliveries.set(attemptKey, { text: attemptKey, at: now })
     const hadNotice = undelivered.delete(ctx.userId)
     const body = hadNotice ? UNDELIVERED_NOTICE + text : text
     try {
       await deliverCore(ctx, body)
-      saveDeliveryAttempts(recentDeliveries)
     } catch (error) {
       // 发送失败不占去重位，后续恢复/重试仍可送达。
-      if (recentDeliveries.get(attemptKey)?.at === now) recentDeliveries.delete(attemptKey)
+      releaseDeliveryAttempt(ctx.userId, text, now)
       if (hadNotice) undelivered.add(ctx.userId)
       throw error
     }

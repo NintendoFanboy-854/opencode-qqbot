@@ -17,6 +17,13 @@ export interface QueuedJob {
 
 const PREVIEW_MAX = 48
 
+/** 忙碌期间的用户意图键：msgId 不同的重复提问/同图重发仍视为同一意图。 */
+export function intentKeyOf(ctx: MessageContext): string {
+  const text = ctx.content.replace(/\s+/g, " ").trim()
+  const attachments = (ctx.attachments ?? []).map((a) => `${a.content_type}:${a.size}:${a.filename}`).join("|")
+  return JSON.stringify({ text, referenced: ctx.referencedMsgId ?? "", attachments })
+}
+
 export function previewText(text: string, max = PREVIEW_MAX): string {
   const flat = text.replace(/\s+/g, " ").trim()
   return flat.length > max ? `${flat.slice(0, max)}…` : flat || "(空消息)"
@@ -44,6 +51,10 @@ export class MessageQueue {
     list.push(job)
     this.jobs.set(userId, list)
     return { job, ahead: list.length - 1 }
+  }
+
+  hasIntent(userId: string, key: string): boolean {
+    return (this.jobs.get(userId) ?? []).some((job) => intentKeyOf(job.ctx) === key)
   }
 
   shift(userId: string): QueuedJob | undefined {

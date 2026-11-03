@@ -1,6 +1,8 @@
 // @input:  fs/path/os（台账落盘）
 // @output: claimInflight, recordInflight, settleInflight, pendingInflight, classifyInflight（纯函数供测试）,
-//          resetInflightJournal（测试用）, INFLIGHT_MAX_AGE_MS, REDISPATCH_MAX_AGE_MS
+//          pruneInflightEntries（保留策略纯函数）, newInflightAttemptId,
+//          resetInflightJournal（测试用）,
+//          INFLIGHT_MAX_AGE_MS, SETTLED_RETENTION_MS, SETTLED_RETENTION_LIMIT, redispatchMaxAgeMs
 // @pos:    core - 在途台账（重启换代丢消息修复：QQ 消息派发落账、答复送达销账、启动对账）
 //
 // 事故背景（2026-10-30，用户实证）：bot 重启/网关静默死亡窗口内到达的 QQ 消息
@@ -9,6 +11,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, statSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
+import { admissionDecision } from "./inbound-dedupe.js"
 
 export interface InflightEntry {
   /** 跟踪键：真实 QQ msgId；重派回合为合成键 redispatch-<sessionId>-<ts> */
@@ -19,11 +22,47 @@ export interface InflightEntry {
   text: string
   at: number
   state: "inflight" | "settled"
+  /**
+   * 投递代次：settled 允许重新认领后，旧回合迟到的销账/落账回调不得
+   * 作用到新代次。settle 带 attemptId 时必须 msgId+attemptId 双匹配。
+   */
+  attemptId?: string
+  /** K2 内容指纹（messageFingerprint；受理时原子写入，随 settle 释放） */
+  fingerprint?: string
+  /** 本回合的 prompt 用户消息 id（修复⑧直答归属的回合边界锚点） */
+  promptId?: string
 }
 
-// 对账年龄上限：超 24h 的在途账不再追溯（直接清账）。
-// 注意：这也是"重派窗口不限时间"的天然上限——重派窗口设得再大，超 24h 的账已清。
+/** 生成新的投递代次 ID（bridge 显式新回合/显式重投时调用） */
+export function newInflightAttemptId(): string {
+  return `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+// 启动对账年龄上限：超 24h 的在途账仍保留在文件中，但恢复时不再追溯（由恢复流程销账）。
 export const INFLIGHT_MAX_AGE_MS = 24 * 60 * 60 * 1000
+// settled 记录只保留 24h 内、按 at 最新的 20 条；inflight 不受年龄或数量限制。
+export const SETTLED_RETENTION_MS = INFLIGHT_MAX_AGE_MS
+export const SETTLED_RETENTION_LIMIT = 20
+
+/**
+ * 台账保留策略（纯函数）：保留全部 inflight；settled 先按 24h 过滤，再按 at 取最新 20 条。
+ * 输出按 at 升序；at 相同时保持输入相对顺序。数量上限并列时保留输入中靠后的记录。
+ */
+export function pruneInflightEntries(entries: InflightEntry[], now = Date.now()): InflightEntry[] {
+  const indexed = entries.map((entry, index) => ({ entry, index }))
+  const retainedSettled = new Set(
+    indexed
+      .filter(({ entry }) => entry.state === "settled" && now - entry.at <= SETTLED_RETENTION_MS)
+      .sort((a, b) => b.entry.at - a.entry.at || b.index - a.index)
+      .slice(0, SETTLED_RETENTION_LIMIT)
+      .map(({ index }) => index),
+  )
+  return indexed
+    .filter(({ entry, index }) => entry.state === "inflight" || retainedSettled.has(index))
+    .sort((a, b) => a.entry.at - b.entry.at || a.index - b.index)
+    .map(({ entry }) => entry)
+}
+
 // 丢失消息自动重派窗口（2026-10-30 用户拍板：默认 2 小时，env QQ_REDISPATCH_MAX_AGE_MS
 // 可调；0=关闭自动重派一律通知）。窗口内视为"意图仍然新鲜"自动重派；超期只通知请用户
 // 重发——防"陈旧意图"在重启时被意外执行。
@@ -48,16 +87,17 @@ function load(): InflightEntry[] {
     entries = [] // 损坏即空，不阻塞启动
   }
   // 读取始终走磁盘：多个 bot 执行体可能共享台账，进程内 cache 会看不到彼此的认领。
-  return entries.filter((e) => e.state === "inflight" || Date.now() - e.at <= INFLIGHT_MAX_AGE_MS)
+  return pruneInflightEntries(entries)
 }
 
 function save(entries: InflightEntry[]): void {
   const path = journalPath()
   mkdirSync(join(path, ".."), { recursive: true })
+  const retained = pruneInflightEntries(entries)
   // 临时文件带进程与随机后缀：并发执行体不会互相覆盖对方的 tmp。
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
   try {
-    writeFileSync(tmp, JSON.stringify(entries, null, 2), { mode: 0o600 }) // 台账含用户消息，POSIX 仅本人可读
+    writeFileSync(tmp, JSON.stringify(retained, null, 2), { mode: 0o600 }) // 台账含用户消息，POSIX 仅本人可读
     renameSync(tmp, path)
   } catch (error) {
     try { unlinkSync(tmp) } catch { /* 已改名或清理失败 */ }
@@ -116,41 +156,103 @@ function mutate<T>(fn: (entries: InflightEntry[]) => T): T {
   })
 }
 
+/** 受理结果：K1/K2 细分给调用方决定回执纪律（msgid 静默 / intent 给短提示） */
+export type ClaimOutcome = "ok" | "duplicate-msgid" | "duplicate-intent"
+
 /**
- * AI 派发前原子认领。真实 QQ msgId 无论在途或已销账，都拒绝再次执行；
- * 这把网关的进程内 Set 去重提升为跨进程/重启的 durable gate。
+ * AI 派发前原子认领（修复①）：withinJournalLock 单临界区内同时做 K1+K2——
+ * - K1：同 msgId 已在途（任何进程认领的都算）→ duplicate-msgid；
+ * - K2：同用户同内容指纹在同窗在途（不同 msgId 的相同意图）→ duplicate-intent；
+ * 判定与写入原子，杜绝「两进程都看到无占位→双双放行」的竞态。
+ * 窗口=in-flight：settle 即释放指纹与 msgId 占位，重投/重发重新放行（用户拍板）。
+ * 已销账记录允许重新投递，并原位复用、更新为传入的新在途回合（代次 = 传入
+ * attemptId；未传则生成新代次）；不另建去重文件。
+ * 被 24h/20 条保留策略裁掉的旧 msgId 也可正常认领。
  */
-export function claimInflight(entry: Omit<InflightEntry, "state">): boolean {
+export function claimInflightDetailed(entry: Omit<InflightEntry, "state">, opts?: { fingerprint?: string }): ClaimOutcome {
   return mutate((entries) => {
-    if (entries.some((e) => e.msgId === entry.msgId)) return false
-    entries.push({ ...entry, state: "inflight" })
-    return true
+    const fingerprint = opts?.fingerprint ?? entry.fingerprint ?? ""
+    const decision = admissionDecision({
+      hasSameMsgIdInflight: entries.some((e) => e.msgId === entry.msgId && e.state === "inflight"),
+      fingerprint,
+      inflightFingerprints: entries
+        .filter((e) => e.state === "inflight" && e.fingerprint)
+        .map((e) => e.fingerprint as string),
+    })
+    if (decision !== "ok") return decision
+    const attempt = entry.attemptId ?? newInflightAttemptId()
+    const existing = entries.find((e) => e.msgId === entry.msgId)
+    if (existing) {
+      Object.assign(existing, entry, { fingerprint, attemptId: attempt, state: "inflight" as const })
+    } else {
+      entries.push({ ...entry, fingerprint, attemptId: attempt, state: "inflight" as const })
+    }
+    return "ok"
   })
 }
 
-/** 派发落账：同 msgId 幂等；sessionId 允许后补（入队时未知、drain 时回填） */
+/** 兼容旧布尔签名的认领（测试与既有调用方） */
+export function claimInflight(entry: Omit<InflightEntry, "state">): boolean {
+  return claimInflightDetailed(entry) === "ok"
+}
+
+/**
+ * 派发落账：
+ * - 同 msgId + 同 attemptId 且在途：幂等，仅允许后补 sessionId；
+ * - attemptId 不匹配：迟到回调，不得覆盖新回合；
+ * - 已 settled：显式重投重新激活（换新代次与新的 at/user/session/text）；
+ * - 无记录：新增在途。
+ */
 export function recordInflight(entry: Omit<InflightEntry, "state">): void {
   mutate((entries) => {
     const existing = entries.find((e) => e.msgId === entry.msgId)
     if (existing) {
-      if (!existing.sessionId && entry.sessionId) existing.sessionId = entry.sessionId
+      if (existing.state === "inflight") {
+        if (entry.attemptId && existing.attemptId && entry.attemptId !== existing.attemptId) return
+        if (!existing.sessionId && entry.sessionId) existing.sessionId = entry.sessionId
+        if (!existing.promptId && entry.promptId) existing.promptId = entry.promptId
+        return
+      }
+      // settled：视为显式重投，重新激活为新在途回合
+      const attempt = entry.attemptId ?? newInflightAttemptId()
+      Object.assign(existing, entry, { attemptId: attempt, state: "inflight" as const })
       return
     }
-    entries.push({ ...entry, state: "inflight" })
+    entries.push({ ...entry, attemptId: entry.attemptId ?? newInflightAttemptId(), state: "inflight" as const })
   })
 }
 
-/** 销账：答复已送达（或已转入有接管的后台等待/已给用户终态反馈） */
-export function settleInflight(msgId: string): void {
-  mutate((entries) => {
-    const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
-    if (entry) entry.state = "settled"
+/**
+ * 销账：答复已送达（或已转入有接管的后台等待/已给用户终态反馈）。
+ * 传入 attemptId 时必须 msgId + attemptId 双匹配才销账——settled 重新认领后，
+ * 旧代次的迟到 settle 不得把新在途回合误销。返回是否实际销账。
+ */
+export function settleInflight(msgId: string, attemptId?: string): boolean {
+  return mutate((entries) => {
+    const entry = entries.find(
+      (e) => e.msgId === msgId && e.state === "inflight" && (!attemptId || !e.attemptId || e.attemptId === attemptId),
+    )
+    if (!entry) return false
+    entry.state = "settled"
+    return true
   })
 }
 
 /** 待对账清单（启动恢复用） */
 export function pendingInflight(): InflightEntry[] {
   return load().filter((e) => e.state === "inflight")
+}
+
+/**
+ * 回合 prompt 落库后回填 promptId（修复⑧）：后台等待/重启重挂的直答归属
+ * 需要「这是哪个回合」的边界锚点，taskId 台账是跨进程唯一可靠载体。
+ */
+export function markInflightPromptId(msgId: string, promptId: string): void {
+  if (!promptId) return
+  mutate((entries) => {
+    const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
+    if (entry && !entry.promptId) entry.promptId = promptId
+  })
 }
 
 /** 测试用：清空台账文件状态 */
@@ -163,8 +265,14 @@ export function resetInflightJournal(): void {
 interface HistoryMessage {
   type?: string
   text?: string
+  time?: { created?: number }
   content?: Array<{ type?: string; text?: string }>
 }
+
+// 时间锚容差：journal.at = QQ 消息到达时刻，定案实证 prompt user 行落库在秒级内；
+// QQ 服务器时间戳与本地时钟可能偏差，±2 分钟以内只用于「找回那一回合」的兜底，
+// 不足以把别条消息误绑进来（同文4连发间隔 ms 级也包含在窗口内——但它们本就同回合语义）。
+const TIME_ANCHOR_TOLERANCE_MS = 120_000
 
 export type InflightClass =
   | { kind: "answered"; answer: string }
@@ -176,10 +284,13 @@ export type InflightClass =
  * - answered：找到该用户消息，且其后已有 idle + assistant 正文 → 完整答案在库里没投出，补投
  * - running：找到该用户消息但尚未 idle（无论是否已有流式正文）→ 回合在跑，重挂后台等待
  * - lost：历史里找不到该用户消息 → 消息从未到达 opencode（网关窗口丢失），重派/通知
- * 匹配口径：历史 user 文本包含台账原文前 50 字（prompt 会加引用前缀/附件注记，不能全等）。
+ * 匹配口径（修复④加锚）：①文本探针——user 文本包含台账原文前 50 字（prompt 会加
+ * 引用前缀/附件注记，不能全等）；②时间锚——文本找不到时按 journal.at ±2min 找
+ * user 行。修复 423/429 型误伤：旧逻辑文本探针失配即判 lost 重派，把已答回合
+ * 再跑一遍。两个锚都找不到才敢说 lost。
  */
 export function classifyInflight(
-  entry: Pick<InflightEntry, "text">,
+  entry: Pick<InflightEntry, "text"> & Partial<Pick<InflightEntry, "at">>,
   messages: HistoryMessage[],
 ): InflightClass {
   const ordered = [...messages].reverse()
@@ -202,6 +313,22 @@ export function classifyInflight(
         break
       }
     }
+  }
+  if (userIdx < 0 && entry.at !== undefined) {
+    // 修复④时间锚兜底：文本探针失配（引用前缀改写/截断/超长原文）不再轻判 lost——
+    // 按到达时刻找回原 user 行；取时间距最近的命中（防 5 连发同文/邻近回合误绑），
+    // 距离超过容差仍视为找不到。
+    let bestIdx = -1
+    let bestDelta = Number.POSITIVE_INFINITY
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].type !== "user") continue
+      const delta = Math.abs((ordered[i].time?.created ?? 0) - entry.at)
+      if (delta < bestDelta) {
+        bestDelta = delta
+        bestIdx = i
+      }
+    }
+    if (bestIdx >= 0 && bestDelta <= TIME_ANCHOR_TOLERANCE_MS) userIdx = bestIdx
   }
   if (userIdx < 0) return { kind: "lost" }
 

@@ -10,7 +10,7 @@ import type { MessageContext } from "./qq/types.js"
 import { getAccessToken, sendC2CInputNotify, sendC2CMessage, sendGroupMessage } from "./qq/api.js"
 import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } from "./qq/media.js"
 import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
-import { collectReplyText } from "./opencode/client.js"
+import { collectReplyText, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
@@ -25,7 +25,7 @@ import {
   type WatchApi,
 } from "./commands.js"
 import { createMirror } from "./core/mirror.js"
-import { MessageQueue, previewText, agoLabel } from "./core/message-queue.js"
+import { MessageQueue, previewText, agoLabel, intentKeyOf } from "./core/message-queue.js"
 import { classifyProviderError, rescueText } from "./core/error-rescue.js"
 
 const QUEUE_MAX = 20 // Q1：忙碌队列上限（学习 pi-qqbot queue.max 默认）
@@ -41,14 +41,16 @@ import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approva
 import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
 import {
-  claimInflight,
+  claimInflightDetailed,
   recordInflight,
   settleInflight,
   pendingInflight,
   classifyInflight,
+  markInflightPromptId,
   INFLIGHT_MAX_AGE_MS,
   redispatchMaxAgeMs,
 } from "./core/inflight-journal.js"
+import { messageFingerprint } from "./core/inbound-dedupe.js"
 import { extractSendFileMarkers, sendLocalFile } from "./core/send-media.js"
 import type { InteractionEvent } from "./qq/types.js"
 // O7b：解析/格式化保持经 bridge 再导出——单测与既有调用方导入路径不变
@@ -105,6 +107,11 @@ export function createBridge(
   const busyUsers = new Set<string>()
   // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
   const claimedContexts = new WeakSet<MessageContext>()
+  // 修复⑦：队列 drain 重入的 ctx——受理回执跳过（drain 已有「开始执行队列」节点，
+  // 不在同一 intent 上重复点头）。
+  const drainReentries = new WeakSet<MessageContext>()
+  // 忙碌期间按用户意图去重：不同 msgId 的相同问题/同图重发不得重复执行或重复排队。
+  const activeIntents = new Map<string, string>()
   // Q1：忙碌消息队列（该用户当前回合结束后自动 drain）
   const msgQueue = new MessageQueue(QUEUE_MAX)
   const draining = new Set<string>()
@@ -210,7 +217,9 @@ export function createBridge(
   const STALL_NUDGE_INTERVAL_MS = 30 * 60 * 1000
   const STALL_NUDGE_MAX = 3
 
-  function startBackgroundWait(sessionId: string, ctx: MessageContext, baseline: number, trackId?: string): void {
+  function startBackgroundWait(sessionId: string, ctx: MessageContext, baseline: number, trackId?: string, promptId = ""): void {
+    // 同会话只允许一个后台等待：恢复多条在途账/超时重挂不得留下多个完成回调重复投递。
+    bgWaits.get(sessionId)?.cancel()
     let cancelled = false
     let finished = false
     const startedAt = Date.now()
@@ -228,8 +237,31 @@ export function createBridge(
       mirror.scheduleUnlock(sessionId)
     }
 
+    /** 完成判定+文本提取统一走回合边界归属（修复⑧）；锚点完整时用注释里的分布 */
+    function classifyNow(listJson: { data?: SessionMessage[] } | undefined): { done: boolean; text: string } {
+      const msgs = listJson?.data ?? []
+      const turn = turnStateOf(msgs, promptId, baseline)
+      if (!turn.anchored) return { done: turn.hasIdle, text: collectReplyText(msgs, baseline) }
+      // 有 idle 才算完；超早事件（别回合完成唬人）由调用方跳过
+      return { done: turn.hasIdle, text: turn.text }
+    }
+
     async function finish(kind: "done" | "giveup"): Promise<void> {
       if (cancelled || finished) return
+      // 修复⑧防早交：SSE 的 execution.succeeded / 别回合 idle 可能唬人——
+      // promptId 锚点可用时先核实本回合是否真的有 idle 终结标记。
+      if (kind === "done" && promptId) {
+        try {
+          const probe = await client.session.messages({ path: { id: sessionId } })
+          const turn = turnStateOf(probe?.data ?? [], promptId, baseline)
+          if (turn.anchored && !turn.hasIdle) {
+            console.log(`[bridge] 忽略他回合完成事件（本后台回合尚未结束）session=${sessionId}`)
+            return
+          }
+        } catch {
+          /* 探测失败落到既定逻辑，不当早交 */
+        }
+      }
       finished = true
       cleanup()
       // R 项：后台等待到达终态（完成投递/放弃告知）即销账
@@ -244,7 +276,7 @@ export function createBridge(
       await new Promise((r) => setTimeout(r, 2000))
       try {
         const listJson = await client.session.messages({ path: { id: sessionId } })
-        const text = collectReplyText(listJson?.data ?? [], baseline)
+        const { text } = classifyNow(listJson)
         await safeDeliver(
           ctx,
           text
@@ -286,7 +318,8 @@ export function createBridge(
           ).catch(() => {})
         }
 
-        if (msgs.some((x) => x.type === "idle" && (x.time?.created ?? 0) >= baseline)) {
+        const turn = turnStateOf(msgs, promptId, baseline)
+        if (turn.hasIdle) {
           await finish("done")
         }
       } catch (error) {
@@ -506,6 +539,7 @@ export function createBridge(
 
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
     let claimedMsgId = ""
+    const intentKey = intentKeyOf(ctx)
     try {
       if (!isAllowedUser(ctx.userId, config.allowedUsers)) {
         await sendReply(ctx, "你不在允许使用的名单里")
@@ -564,18 +598,38 @@ export function createBridge(
         return
       }
 
-      // Durable gate：网关 Set 只能防本进程重投；多执行体/重启共用台账认领，
-      // 同一 QQ msgId 在附件下载、排队和 promptAndWait 之前就被去重。
+      // Durable gate（修复①）：K1 跨进程 msgId 占位 + K2 同内容在途指纹——
+      // 判定与写入在台账单临界区内原子完成（跨进程互斥读改写），
+      // 多 believer 并发受理与「连发不同 msgId 同问」都在此拦下。
+      // 回执纪律：duplicate-msgid 静默（最先放行的 believer 负责答案，本侧任何出站
+      // 都是重复气泡）；duplicate-intent 给一句短提示（首投方不会发，不构成重复）。
       if (ctx.msgId) {
         if (!claimedContexts.has(ctx)) {
-          const claimed = claimInflight({ msgId: ctx.msgId, userId: ctx.userId, sessionId: "", text: content.slice(0, 300), at: Date.now() })
-          if (!claimed) {
+          const admitted = claimInflightDetailed(
+            { msgId: ctx.msgId, userId: ctx.userId, sessionId: "", text: content.slice(0, 300), at: Date.now() },
+            { fingerprint: messageFingerprint(ctx.userId, intentKey) },
+          )
+          if (admitted === "duplicate-msgid") {
             console.log(`[bridge] 重复消息已跳过 msgId=${ctx.msgId}`)
+            return
+          }
+          if (admitted === "duplicate-intent") {
+            console.log(`[admit-dedupe] 同内容意图在途，本次重发已忽略 msgId=${ctx.msgId}`)
+            await sendReply(ctx, "你的相同问题正在处理中，本次重发已忽略")
             return
           }
           claimedContexts.add(ctx)
         }
         claimedMsgId = ctx.msgId
+      }
+
+      if (busyUsers.has(ctx.userId) && !claimedContexts.has(ctx)) {
+        const duplicateIntent = activeIntents.get(ctx.userId) === intentKey || msgQueue.hasIntent(ctx.userId, intentKey)
+        if (duplicateIntent) {
+          settleInflight(ctx.msgId) // 重复意图已有原回合负责，直接结清，禁止恢复时再跑
+          console.log(`[bridge] 相同意图已在执行/队列，跳过 msgId=${ctx.msgId}`)
+          return
+        }
       }
 
       if (busyUsers.has(ctx.userId)) {
@@ -600,7 +654,16 @@ export function createBridge(
         return
       }
 
+      activeIntents.set(ctx.userId, intentKey)
       busyUsers.add(ctx.userId)
+
+      // 修复⑦（2026-11-03）：受理即回执——前台回合立刻短句确认，消除静默期
+      // （expA 实证：无受理回执时用户观感=「没有任何回复」）。Queue 路径此前
+      // 已回「已排队 #N」、drain 重入已有「开始执行队列」、重派路径有「重启恢复」
+      // 通知——这三处都不进本分支，同一 intent 不重复点头。
+      if (ctx.msgId && !drainReentries.has(ctx)) {
+        await sendReply(ctx, "✅ 已收到，正在处理，完成后自动回复你")
+      }
 
       // B3（2026-10-29 同步升级）：C2C typing 指示——长回合处理中给用户
       // "对方正在输入"体感（官方 input_notify，仅 C2C；失败静默不阻塞主流程）
@@ -614,6 +677,7 @@ export function createBridge(
       let sessionId = ""
       let turnStart = 0
       let trackId = "" // R 项：在途台账跟踪键（try/catch 跨块可见）
+      let promptId = "" // 修复⑧：本回合 user 消息 id（直答归属锚点）
       try {
         const session = await sessions.getOrCreate(ctx.userId)
         sessionId = session.sessionId
@@ -652,6 +716,11 @@ export function createBridge(
         recordInflight({ msgId: trackId, userId: ctx.userId, sessionId, text: content.slice(0, 300), at: Date.now() })
         const replyText = await client.promptAndWait(sessionId, promptText, {
           files: files.length ? files : undefined,
+          // 修复⑧：受领即落台账锚点 + 本地闭合变量（前台超时转后台等待要带上）
+          onAccepted: (info) => {
+            promptId = info.promptId
+            markInflightPromptId(trackId, info.promptId)
+          },
           onPermission: (req) => perm.waitForDecision(ctx, req, sessionId),
           onPermissionReplied: (d) => {
             void safeDeliver(ctx, `已${DECISION_LABELS[d]}，AI 将继续执行…`)
@@ -687,7 +756,7 @@ export function createBridge(
             ctx,
             "⏳ 回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
           )
-          startBackgroundWait(sessionId, ctx, turnStart, trackId)
+          startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId)
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错
           const errText = toErrorMessage(error)
@@ -700,6 +769,7 @@ export function createBridge(
         // 镜像解锁：转后台的任务由 bgWait 完成时解锁，其余延迟 5 秒（SSE 事件宽限）
         if (sessionId && !bgWaits.has(sessionId)) mirror.scheduleUnlock(sessionId)
         busyUsers.delete(ctx.userId)
+        if (activeIntents.get(ctx.userId) === intentKey) activeIntents.delete(ctx.userId)
         // Q1：回合结束（成功/失败/转后台）→ 自动执行该用户队列下一条；
         // 转后台等待的会话保持串行——由 bgWait 完成时再 drain（不与前序后台任务并发）
         if (sessionId && !bgWaits.has(sessionId)) void drainQueue(ctx.userId)
@@ -708,6 +778,7 @@ export function createBridge(
       // 认领后、内层回合兜底之前的异常（如排队附件预下载失败）也必须结清，
       // 否则重启对账会把已反馈失败的消息再执行一次。
       if (claimedMsgId) settleInflight(claimedMsgId)
+      if (activeIntents.get(ctx.userId) === intentKey) activeIntents.delete(ctx.userId)
       console.error("[bridge] handleMessage failed:", error)
       try {
         await sendReply(ctx, `处理消息失败：${toErrorMessage(error)}`)
@@ -733,6 +804,18 @@ export function createBridge(
       }
       // 恢复投递走主动通道（原 msgId 的被动窗口早已过期）
       const ctx: MessageContext = { type: "c2c", userId: entry.userId, msgId: "", content: entry.text }
+      // 修复③（2026-11-03）：排队空账治本——sessionId 为空=「从未进过会话」
+      // （忙碌排队阶段重启丢队）。这类账对永远拿 400 永挂（openqq422 五连铁证），
+      // 且按用户重投哲学不得自动重派执行——只清账通知，请用户重发。
+      if (!entry.sessionId) {
+        settleInflight(entry.msgId)
+        await deliver(
+          ctx,
+          `⚠️ 重启前队列里有一条消息未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免重复执行不自动重派，需要的话请重发一次`,
+        )
+        console.log(`[bridge] 启动对账：排队空账已通知销账 msgId=${entry.msgId}`)
+        continue
+      }
       try {
         const listJson = { data: await fetchRecoveryMessages(client, entry.sessionId) }
         const cls = classifyInflight(entry, listJson.data)
@@ -744,7 +827,7 @@ export function createBridge(
           // 跨重启也要保持 QQ 回合同一身份：后台直答完成时，镜像不得再投摘要。
           mirror.beginTurn(entry.sessionId)
           // 不单独发“仍在执行”通知；完成时统一回传最终答案，避免通知也占一条回复。
-          startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId)
+          startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId, entry.promptId ?? "")
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
           settleInflight(entry.msgId) // 旧账结清，重派回合走新账（合成 trackId）
@@ -771,6 +854,7 @@ export function createBridge(
     draining.add(userId)
     try {
       await sendReply(job.ctx, `开始执行队列 #${job.id}`)
+      drainReentries.add(job.ctx) // 修复⑦：drain 重入跳过受理回执
       await handleMessage(job.ctx)
     } catch (error) {
       console.error("[bridge] 队列执行失败:", error)

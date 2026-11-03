@@ -3,6 +3,7 @@
 // @pos:    qq层 - QQ Bot WebSocket Gateway 状态机 (心跳/重连/消息分发)
 import WebSocket from "ws"
 import { acknowledgeInteraction, clearTokenCache, getAccessToken, getGatewayUrl } from "./api.js"
+import { clearGatewayState, loadGatewayState, saveGatewayState } from "../core/gateway-state.js"
 import type {
   C2CMessageEvent,
   GatewayHelloData,
@@ -49,8 +50,8 @@ interface GatewayState {
   sessionId: string | null
   seq: number | null
   heartbeatAcked: boolean
-  /** 去重（缺口 3）：resume/重连后平台可能重投同一消息，msgId LRU 防重复触发回合 */
-  seenMsgIds: Set<string>
+  /** 仅拦截活跃并发/重入；处理完成后释放，同 msgId 可显式重投 */
+  activeMsgIds: Set<string>
 }
 
 interface GatewayControl {
@@ -58,7 +59,7 @@ interface GatewayControl {
 }
 
 function createInitialState(): GatewayState {
-  return {
+  const state: GatewayState = {
     ws: null,
     stopped: false,
     connecting: false,
@@ -69,20 +70,35 @@ function createInitialState(): GatewayState {
     sessionId: null,
     seq: null,
     heartbeatAcked: true,
-    seenMsgIds: new Set(),
+    activeMsgIds: new Set(),
   }
+  // 修复②：从磁盘恢复 session/seq——重启优先 RESUME（服务端只补断线窗口的
+  // 事件），不再 IDENTIFY 从零重放 backlog。超龄/缺损/RESUME 被拒（op9）时
+  // 自动回退 IDENTIFY，无死循环。加载失败静默走老路径，不阻塞启动。
+  const saved = loadGatewayState()
+  if (saved) {
+    state.sessionId = saved.session_id
+    state.seq = saved.seq
+    const agoSec = Math.max(0, Math.round((Date.now() - saved.savedAt) / 1000))
+    console.log(`[gateway] 已从磁盘恢复网关状态（${agoSec}s 前），将尝试 RESUME session=${saved.session_id} seq=${saved.seq}`)
+  }
+  return state
 }
 
-// 缺口 3：msgId 去重（平台 resume/重投防御）。LRU 上限 500。
-const SEEN_MSGIDS_MAX = 500
-export function markSeenAndFilter(seen: Set<string>, msgId: string): boolean {
-  if (seen.has(msgId)) return false
-  if (seen.size >= SEEN_MSGIDS_MAX) {
-    const first = seen.values().next().value
-    if (first !== undefined) seen.delete(first)
-  }
-  seen.add(msgId)
+// msgId 防重改为「活跃期保护」：占位→处理→finally 释放，
+// 同 msgId 并发/重入丢弃（resume 重回补防御）；处理完成后可显式重投。
+// 持久兜底（跨重启、排队中）由 bridge 的 inflight 台账负责。
+function tryClaimActive(active: Set<string>, msgId: string): boolean {
+  if (active.has(msgId)) return false
+  // 防御性上限：正常路径靠 finally 释放不会积累；到达上限说明出现泄漏式积压，
+  // 此时放弃新增保护（宁可接受极小概率重投，也不无限吞掉新消息）
+  if (active.size >= 1000) return true
+  active.add(msgId)
   return true
+}
+
+function releaseActive(active: Set<string>, msgId: string): void {
+  active.delete(msgId)
 }
 
 function cleanupSocket(state: GatewayState): void {
@@ -146,6 +162,9 @@ function startHeartbeat(state: GatewayState, intervalMs: number): void {
 function resetResumeState(state: GatewayState): void {
   state.sessionId = null
   state.seq = null
+  // 修复②：服务端明确作废会话（op9 不可恢复/Resume 失效码）→ 持久化状态同步清账，
+  // 下次启动不得再拿已作废的 session 去 RESUME。
+  clearGatewayState()
 }
 
 function normalizeMessageContent(content: string): string {
@@ -254,6 +273,8 @@ async function handleDispatchEvent(
     case "READY": {
       const readyData = payload.d as GatewayReadyData
       state.sessionId = readyData.session_id
+      // 修复②：新会话确立即落盘（含 RESUME 失败回退 IDENTIFY 后的新会话）
+      if (state.seq !== null) saveGatewayState(state.sessionId, state.seq)
       // R 项诊断增强（2026-10-30）：首连/重连分界可见——重连后的 READY 打日志，
       // 下次"消息静默丢失"类事故可直接从日志定位断链窗口
       if (state.reconnectAttempt > 0) {
@@ -266,51 +287,70 @@ async function handleDispatchEvent(
 
     case "RESUMED": {
       console.log("[gateway] 会话已恢复（RESUMED，断线期间事件已回补）")
+      // 修复②：心跳延续，落盘一次刷新 savedAt（防窗口使用过期源）
+      if (state.sessionId && state.seq !== null) saveGatewayState(state.sessionId, state.seq)
       state.reconnectAttempt = 0
       return
     }
 
     case "C2C_MESSAGE_CREATE": {
       const event = payload.d as C2CMessageEvent
-      // 缺口 3：重投去重（resume 后同 id 再来不重复触发）
-      if (!markSeenAndFilter(state.seenMsgIds, event.id)) return
+      // 活跃期防重：同 id 并发/重入丢弃；处理完成后 finally 释放，可显式重投
+      if (!tryClaimActive(state.activeMsgIds, event.id)) return
       const message = toC2CMessageContext(event)
       if (message.attachments?.length) {
         // R2-P2-1：打码载荷（签名 URL 不入日志），host/类型/大小够 B7 校准
         console.log("[gateway] 附件载荷:", JSON.stringify(briefAttachments(message.attachments)))
       }
       if (!message.content && !message.attachments?.length) {
+        releaseActive(state.activeMsgIds, event.id)
         return
       }
-      await options.onMessage(message)
+      try {
+        await options.onMessage(message)
+      } finally {
+        releaseActive(state.activeMsgIds, event.id)
+      }
       return
     }
 
     case "GROUP_AT_MESSAGE_CREATE": {
       const event = payload.d as GroupMessageEvent
-      if (!markSeenAndFilter(state.seenMsgIds, event.id)) return
+      if (!tryClaimActive(state.activeMsgIds, event.id)) return
       const message = toGroupMessageContext(event)
       if (message.attachments?.length) {
         // R2-P2-1：打码载荷（签名 URL 不入日志）
         console.log("[gateway] 附件载荷:", JSON.stringify(briefAttachments(message.attachments)))
       }
       if (!message.content && !message.attachments?.length) {
+        releaseActive(state.activeMsgIds, event.id)
         return
       }
-      await options.onMessage(message)
+      try {
+        await options.onMessage(message)
+      } finally {
+        releaseActive(state.activeMsgIds, event.id)
+      }
       return
     }
 
     case "INTERACTION_CREATE": {
       // A 项（2026-10-29）：按钮互动回调。平台要求 3 秒内响应且同 id 只能
-      // 响应一次——先立即 ack（不等业务处理结果），再分发业务。
+      // 响应一次。分发先于 ACK：业务的同步前缀（表单点击持久化落盘等）
+      // 必须在 ACK 之前完成，否则「ACK 后进程崩溃」可能丢掉这次点击。
+      // 不等待其异步结果；同步抛出的异常进入被捕获的 Promise 链：
+      // ① 同步分发仍已执行，② ACK 照常发出。
       const interaction = payload.d as InteractionEvent
+      void Promise.resolve()
+        .then(() => options.onInteraction?.(interaction))
+        .catch((error) => {
+          console.error("[qq-gateway] 互动业务分发失败:", error instanceof Error ? error.message : error)
+        })
       if (state.accessToken && interaction?.id) {
         void acknowledgeInteraction(state.accessToken, interaction.id).catch((error) => {
           console.error("[qq-gateway] 互动响应失败:", error instanceof Error ? error.message : error)
         })
       }
-      await options.onInteraction?.(interaction)
       return
     }
 
@@ -327,7 +367,16 @@ async function handlePayload(
   connect: () => Promise<void>,
 ): Promise<void> {
   if (typeof payload.s === "number") {
+    const prevSeq = state.seq
     state.seq = payload.s
+    // 修复②：session 已确立时把 seq 推进原子落盘（重启恢复窗口的基石）。
+    // 跳号>1 经验上=断线窗口被服务端回补（重放可见性，2026-11-03 定案要求观测日志）。
+    if (state.sessionId && payload.s !== prevSeq) {
+      if (prevSeq !== null && payload.s > prevSeq + 1) {
+        console.log(`[gateway] seq 回补 ${payload.s - prevSeq - 1} 帧（${prevSeq} → ${payload.s}）——断线期间载荷已重放`)
+      }
+      saveGatewayState(state.sessionId, payload.s)
+    }
   }
 
   switch (payload.op) {
