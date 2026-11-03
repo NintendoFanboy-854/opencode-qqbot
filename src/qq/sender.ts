@@ -80,10 +80,15 @@ function convertTables(text: string): string {
   return out.join("\n")
 }
 
-// QQ markdown 消息 content 上限约 2000 字节（中文=3字节/字），留余量取 1800 字节。
-// 注意：必须按 UTF-8 字节切分，不能按字符数——否则中文长消息会超限被 QQ 丢弃（不渲染）。
-const MARKDOWN_MAX_BYTES = 1800
-const PLAIN_MAX_BYTES = 1900
+// 分条字节上限（2026-11-03 探针实证修订，替换旧"约 2000 字节"经验值——该值无官方出处且被证伪）：
+// - 官方文档（bot.q.qq.com/wiki API v2，2026-10-28 版）未公布 content/markdown.content 数值上限，
+//   仅错误码 40054007「消息长度超限」/40054018「消息过长或异常」证明服务端确有校验；
+// - 本机探针（生产环境发真实消息）：纯文本 8 万字/24 万字节、Markdown 60232 字节（2 万字+起止标识）
+//   均 HTTP 200 受理，且 2 万字 Markdown 经用户确认 QQ 客户端完整渲染；
+// - 故取 2 万字实测值为上限：markdown 60232 = 实测精确载荷；plain 60000 = 2 万 CJK 字×3 字节。
+// 注意：必须按 UTF-8 字节切分，不能按字符数——中文 3 字节/字，按字符预算会在字节维度失控。
+const MARKDOWN_MAX_BYTES = 60232
+const PLAIN_MAX_BYTES = 60000
 const encoder = new TextEncoder()
 
 function utf8Bytes(s: string): number {
@@ -281,7 +286,7 @@ export async function replyToQQ(
   const mdFormatted = formatForQQMarkdown(text)
   const plainFormatted = formatForQQ(text)
 
-  // 关键：按 UTF-8 字节切分（QQ markdown 上限约 2000 字节），不能用字符数 maxLength，
+  // 关键：按 UTF-8 字节切分（上限见文件头考据注释：2 万字实测），不能用字符数 maxLength，
   // 否则中文长消息会超限被 QQ 静默丢弃（看似"答非所问"，实则是答案没发出去）。
   const mdChunks = splitMessage(mdFormatted, MARKDOWN_MAX_BYTES)
   const plainChunks = splitMessage(plainFormatted, PLAIN_MAX_BYTES)
