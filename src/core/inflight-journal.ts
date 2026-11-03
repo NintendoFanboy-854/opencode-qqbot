@@ -273,6 +273,11 @@ interface HistoryMessage {
 // QQ 服务器时间戳与本地时钟可能偏差，±2 分钟以内只用于「找回那一回合」的兜底，
 // 不足以把别条消息误绑进来（同文4连发间隔 ms 级也包含在窗口内——但它们本就同回合语义）。
 const TIME_ANCHOR_TOLERANCE_MS = 120_000
+// 文本锚长度（R2 修复 2026-11-03）：50→100——两条消息前 50 字同形（如都以
+// 「帮我看看这个报错：」开头）会把对账匹配到错误回合；100 字降误配率。
+// 注意：probe 越长越避开「引用前缀注入」的前缀失配失效——正文前缀在 50 内的
+// 报错语境注释仍能命中（引用前缀属于前缀，不影响 includes）。
+const PROBE_LENGTH = 100
 
 export type InflightClass =
   | { kind: "answered"; answer: string }
@@ -294,7 +299,7 @@ export function classifyInflight(
   messages: HistoryMessage[],
 ): InflightClass {
   const ordered = [...messages].reverse()
-  const probe = entry.text.trim().slice(0, 50)
+  const probe = entry.text.trim().slice(0, PROBE_LENGTH)
   let userIdx = -1
   if (probe === "") {
     // 纯附件没有文本锚，只能沿用最新用户消息，由 idle/答案状态兜底。
@@ -313,6 +318,22 @@ export function classifyInflight(
         break
       }
     }
+  }
+  if (userIdx < 0 && probe === "" && entry.at !== undefined) {
+    // R1 修复（2026-11-03，外部复盘核验）：纯附件消息无文本锚，旧逻辑直接锚定
+    // 「最新用户消息」——等待窗口内若来了新消息会对错回合。改为时间锚优先
+    // （按 journal.at 找最近 user 行，同修④机制），找不到才回落「最新用户消息」。
+    let bestIdx = -1
+    let bestDelta = Number.POSITIVE_INFINITY
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      if (ordered[i].type !== "user") continue
+      const delta = Math.abs((ordered[i].time?.created ?? 0) - entry.at)
+      if (delta < bestDelta) {
+        bestDelta = delta
+        bestIdx = i
+      }
+    }
+    if (bestIdx >= 0 && bestDelta <= TIME_ANCHOR_TOLERANCE_MS) userIdx = bestIdx
   }
   if (userIdx < 0 && entry.at !== undefined) {
     // 修复④时间锚兜底：文本探针失配（引用前缀改写/截断/超长原文）不再轻判 lost——

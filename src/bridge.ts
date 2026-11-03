@@ -576,7 +576,10 @@ export function createBridge(
     let claimedMsgId = ""
     const intentKey = intentKeyOf(ctx)
     try {
+      // P1 修复（2026-11-03，外部复盘核验）：拒绝时记录 openid——新用户无任何
+      // 途径获取自己的 openid 填 ALLOWED_USERS，首配死锁；白名单内不打印（无需）。
       if (!isAllowedUser(ctx.userId, config.allowedUsers)) {
+        console.log(`[security] 拒绝非白名单用户：openid=${ctx.userId}（把它加入 ~/.openqq/.env 的 ALLOWED_USERS 后重启即开通）`)
         await sendReply(ctx, "你不在允许使用的名单里")
         return
       }
@@ -650,7 +653,10 @@ export function createBridge(
           }
           if (admitted === "duplicate-intent") {
             console.log(`[admit-dedupe] 同内容意图在途，本次重发已忽略 msgId=${ctx.msgId}`)
-            await sendReply(ctx, "你的相同问题正在处理中，本次重发已忽略")
+            // P3（2026-11-03，外部复盘核验 R4）：提示带在途内容摘要提升体感
+            const pend = pendingInflight().find((e) => e.fingerprint === messageFingerprint(ctx.userId, intentKey))
+            const digest = pend ? `（在途内容：${previewText(pend.text)}）` : ""
+            await sendReply(ctx, `你的相同问题正在处理中${digest}，本次重发已忽略`)
             return
           }
           claimedContexts.add(ctx)
@@ -692,11 +698,11 @@ export function createBridge(
       activeIntents.set(ctx.userId, intentKey)
       busyUsers.add(ctx.userId)
 
-      // 修复⑦（2026-11-03）：受理即回执——前台回合立刻短句确认，消除静默期
-      // （expA 实证：无受理回执时用户观感=「没有任何回复」）。Queue 路径此前
-      // 已回「已排队 #N」、drain 重入已有「开始执行队列」、重派路径有「重启恢复」
-      // 通知——这三处都不进本分支，同一 intent 不重复点头。
-      // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
+  // 修复⑦（2026-11-03）：受理即回执——前台回合立刻短句确认，消除静默期
+  // （expA 实证：无受理回执时用户观感=「没有任何回复」）。Queue 路径此前
+  // 已回「已排队 #N」、drain 重入已有「开始执行队列」、重派路径有「重启恢复」
+  // 通知——这三处都不进本分支，同一 intent 不重复点头。
+  // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
       if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
         await sendReply(ctx, "✅ 已收到，正在处理，完成后自动回复你")
       }

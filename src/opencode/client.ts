@@ -131,11 +131,15 @@ export interface OpencodeClient {
 // 常超 5 分钟——超时后答案永久丢失（实测 2026-10-13）。最终回复现已有主动
 // 消息兜底（bridge.deliver 被动失败→主动），已解耦。默认 30 分钟，
 // 可用 env OPENCODE_TURN_TIMEOUT_MINUTES 覆盖。
-const TURN_TIMEOUT_MINUTES = (() => {
+// ★ P0 同族修复（2026-11-03）：静态 const 在模块加载期捕获 env，.env 运行时才
+//    注入——发布包装后 OVERRIDE 永远赶不上。改惰性函数：每次调用现场取值。
+function turnTimeoutMinutes(): number {
   const n = Number(process.env.OPENCODE_TURN_TIMEOUT_MINUTES ?? "30")
   return Number.isFinite(n) && n > 0 ? n : 30
-})()
-const RESPONSE_TIMEOUT_MS = TURN_TIMEOUT_MINUTES * 60 * 1000
+}
+function responseTimeoutMs(): number {
+  return turnTimeoutMinutes() * 60 * 1000
+}
 
 // 取 baseline 之后最后一个有正文的 assistant 消息，丢弃 reasoning/tool 与阶段前导语。
 // 长回合会产生多条“正在检查/进度总结”assistant 文本；全部拼接会把过程包装成多条
@@ -394,7 +398,7 @@ export function createClient(baseUrl: string): OpencodeClient {
       // LLM 入口实证：user 记录可核对每次真实 /prompt 受理，不再由 QQ 出站反推执行次数。
       console.log(`[opencode] LLM prompt 已受理 pid=${process.pid} session=${sessionId} user=${promptJson?.data?.id ?? "?"} baseline=${baseline}`)
 
-      const deadline = Date.now() + RESPONSE_TIMEOUT_MS
+      const deadline = Date.now() + responseTimeoutMs()
       let permissionWaitMs = 0 // 审批等待时间不计入 5 分钟超时（用户可能几分钟才回复）
       const handledPermissions = new Set<string>()
 
@@ -458,7 +462,7 @@ export function createClient(baseUrl: string): OpencodeClient {
           return turn.text || "(AI 未返回内容)"
         }
       }
-      throw new Error(`AI 响应超时（${TURN_TIMEOUT_MINUTES} 分钟）`)
+      throw new Error(`AI 响应超时（${turnTimeoutMinutes()} 分钟）`)
     },
   }
 
