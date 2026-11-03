@@ -63,6 +63,10 @@ export const UNDELIVERED_NOTICE = "（此前有未能送达的消息）\n"
 // 编号所见即原文，桌面与 QQ 端逐字一致；变换幂等（N) 不再被任何渲染器续编）。
 // 代码围栏（```/~~~）内不动；仅行首（含缩进）的 `N. ` 命中，行内「1.5 版本」
 // 类文本无空格不受影响。导出供测试。
+// 顿号实测（2026-11-03 用户截图回传）：「N、」与「一、」在 QQ 被动通道 100% 保真，
+// 「N.」却被整条消息全局续编（连行内点号数字都会渗染起始值）。所以平面化目标
+// 从 N) 升级为 N、——与原生顿号列表视觉一致，编号所见即原文。
+// 变换幂等（N、 再进来不匹配行首 N. 模式，原样通过）。
 export function qqListNormalize(text: string): string {
   const lines = text.split("\n")
   let fence = false
@@ -80,7 +84,7 @@ export function qqListNormalize(text: string): string {
       continue
     }
     if (fence) continue
-    lines[i] = lines[i].replace(/^(\s*)(\d+)\. /, "$1$2) ")
+    lines[i] = lines[i].replace(/^(\s*)(\d+)\. /, "$1$2、")
   }
   return lines.join("\n")
 }
