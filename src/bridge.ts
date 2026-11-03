@@ -125,6 +125,12 @@ export function createBridge(
   client: OpencodeClient,
   sessions: SessionManager,
 ): Bridge {
+  // H2 停滞提醒文案状态开关就用现成 env 读取风格；这里同步实现⑦开关——
+  // 2026-11-03 用户拍板：「已收到」回执默认不发（非调试无价值），调试期在
+  // ~/.openqq/.env 设 QQ_ACK_RECEIPT=1 开启。loadEnvFile 全量注入 process.env，
+  // 排队回执「已排队 #N」为功能性提示不受此开关影响。
+  const ackReceiptEnabled = /^(1|true|on)$/i.test(process.env.QQ_ACK_RECEIPT ?? "")
+
   const busyUsers = new Set<string>()
   // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
   const claimedContexts = new WeakSet<MessageContext>()
@@ -690,7 +696,8 @@ export function createBridge(
       // （expA 实证：无受理回执时用户观感=「没有任何回复」）。Queue 路径此前
       // 已回「已排队 #N」、drain 重入已有「开始执行队列」、重派路径有「重启恢复」
       // 通知——这三处都不进本分支，同一 intent 不重复点头。
-      if (ctx.msgId && !drainReentries.has(ctx)) {
+      // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
+      if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
         await sendReply(ctx, "✅ 已收到，正在处理，完成后自动回复你")
       }
 
