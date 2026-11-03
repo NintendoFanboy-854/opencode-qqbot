@@ -17,7 +17,6 @@ export interface Config {
     externalUrl: boolean
   }
   allowedUsers: string[]
-  maxReplyLength: number
 }
 
 const CONFIG_DIR = join(homedir(), ".openqq")
@@ -68,7 +67,6 @@ export async function ensureConfig(): Promise<void> {
     `QQ_SANDBOX=false`,
     `# OPENCODE_BASE_URL=http://127.0.0.1:<端口>/api（桌面 2.1.x 端口动态，失联时启动流程会自动发现）`,
     `ALLOWED_USERS=`,
-    `MAX_REPLY_LENGTH=60232`,
   ].join("\n") + "\n"
 
   writeFileSync(ENV_FILE, envContent, { mode: 0o600 }) // POSIX 凭据文件仅本人可读
@@ -116,6 +114,5 @@ export function loadConfig(): Config {
       externalUrl: !!process.env.OPENCODE_BASE_URL?.trim(),
     },
     allowedUsers,
-    maxReplyLength: parseInt(process.env.MAX_REPLY_LENGTH ?? "60232", 10),
   }
 }

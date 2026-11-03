@@ -66,7 +66,6 @@ ALLOWED_USERS=你的QQ openid   # fail-closed：必填，非名单用户一律�
 OPENCODE_BASE_URL=http://127.0.0.1:<端口>/api   # opencode 桌面服务地址（2.1.x 端口动态；失联时 bot 启动会自动发现）
 OPENCODE_PASSWORD=opencode 服务密码（桌面端服务配置的 Basic auth 密码）
 QQ_SANDBOX=false
-MAX_REPLY_LENGTH=60232
 ```
 
 ### 启动

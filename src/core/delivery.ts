@@ -95,7 +95,11 @@ export interface DeliveryAttempt {
 }
 
 export const DELIVERY_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000
-const DELIVERY_DEDUPE_FILE = process.env.QQ_DELIVERY_DEDUPE_FILE || join(homedir(), ".openqq", "delivery-dedupe.json")
+// P0 同族修复（2026-11-03）：原 const 在模块加载期捕获 QQ_DELIVERY_DEDUPE_FILE，
+// .env 运行时才注入——测试/多目录重定向永远不生效。改惰性函数。
+function deliveryDedupeFile(): string {
+  return process.env.QQ_DELIVERY_DEDUPE_FILE || join(homedir(), ".openqq", "delivery-dedupe.json")
+}
 
 function deliveryAttemptKey(userId: string, text: string): string {
   return `${userId}:${createHash("sha256").update(text).digest("hex")}`
@@ -117,8 +121,8 @@ export function shouldSuppressDuplicate(
 function loadDeliveryAttempts(): Map<string, DeliveryAttempt> {
   const out = new Map<string, DeliveryAttempt>()
   try {
-    if (!existsSync(DELIVERY_DEDUPE_FILE)) return out
-    const raw = JSON.parse(readFileSync(DELIVERY_DEDUPE_FILE, "utf-8")) as Array<{ key: string; at: number }>
+    if (!existsSync(deliveryDedupeFile())) return out
+    const raw = JSON.parse(readFileSync(deliveryDedupeFile(), "utf-8")) as Array<{ key: string; at: number }>
     const now = Date.now()
     for (const entry of raw) {
       if (typeof entry?.key === "string" && Number.isFinite(entry.at) && now - entry.at < DELIVERY_DEDUPE_TTL_MS) {
@@ -135,11 +139,11 @@ function saveDeliveryAttempts(entries: ReadonlyMap<string, DeliveryAttempt>): vo
   const raw = [...entries.values()]
     .filter((entry) => Date.now() - entry.at < DELIVERY_DEDUPE_TTL_MS)
     .map((entry) => ({ key: entry.text, at: entry.at }))
-  mkdirSync(join(DELIVERY_DEDUPE_FILE, ".."), { recursive: true })
-  const tmp = `${DELIVERY_DEDUPE_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  mkdirSync(join(deliveryDedupeFile(), ".."), { recursive: true })
+  const tmp = `${deliveryDedupeFile()}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
   try {
     writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 })
-    renameSync(tmp, DELIVERY_DEDUPE_FILE)
+    renameSync(tmp, deliveryDedupeFile())
   } catch (error) {
     try { unlinkSync(tmp) } catch { /* 已改名或清理失败 */ }
     throw error
@@ -152,8 +156,8 @@ const DELIVERY_LOCK_WAIT_MS = 5_000
 const deliverySleepArray = new Int32Array(new SharedArrayBuffer(4))
 
 function withDeliveryLock<T>(fn: () => T): T {
-  mkdirSync(join(DELIVERY_DEDUPE_FILE, ".."), { recursive: true })
-  const lockPath = `${DELIVERY_DEDUPE_FILE}.lock`
+  mkdirSync(join(deliveryDedupeFile(), ".."), { recursive: true })
+  const lockPath = `${deliveryDedupeFile()}.lock`
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
   const deadline = Date.now() + DELIVERY_LOCK_WAIT_MS
   for (;;) {
@@ -422,7 +426,7 @@ export function createDelivery(
   async function sendReply(ctx: MessageContext, text: string): Promise<void> {
     const accessToken = await getAccessToken(config.qq.appId, config.qq.clientSecret)
     // J-轻：伪流式错峰（多片时隔 300ms 逐段到达）；replyToQQ 返回片数与服务端消息 id
-    const result = await replyToQQ(accessToken, ctx, text, config.maxReplyLength, {
+    const result = await replyToQQ(accessToken, ctx, text, {
       staggerMs: STREAM_STAGGER_MS,
     })
     // B1：被动回复成功才记额度（失败不计，避免虚耗）；按片记账——平台限额按"条"计，
@@ -437,3 +441,4 @@ export function createDelivery(
 
   return { enqueuePush, deliver, safeDeliver, sendReply }
 }
+

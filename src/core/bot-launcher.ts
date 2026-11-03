@@ -84,7 +84,7 @@ export function buildLaunchPlan(runtime: Runtime, entry: string, logPath?: strin
   // .env 加载规则是"继承环境优先于文件"，不剥离会让宿主环境静默覆盖单点配置
   // （反向时序坑：宿主设了沙箱，.env 改回正式反而不生效）。独立部署形态
   // （用户显式跑 openqq）不受影响——那边环境覆盖是合理诉求。
-  const CONFIG_KEY = [/^QQ_/, /^OPENCODE_/, /^ALLOWED_USERS$/, /^MAX_REPLY_LENGTH$/]
+  const CONFIG_KEY = [/^QQ_/, /^OPENCODE_/, /^ALLOWED_USERS$/]
   const inherited: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue
