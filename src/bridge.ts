@@ -74,6 +74,27 @@ export function evictableIdleSessions(
 
 // H2 停滞提醒决策（导出供测试，2026-10-30）：bgWait 零进展时提醒用户处置桌面弹窗。
 // 首次：startedAt 后 firstMs；之后：上次进展/提醒后 intervalMs；最多 maxNudges 次。
+// 停滞提醒附带任务状态（2026-11-03 用户拍板：提示语改为「执行超过 N 分钟｜状态：…」）。
+// 状态源=回合边界归属（turnStateOf）+ 本地 turnStats 最近工具；纯文本无 markdown 依赖。
+// 注意口径：本提醒只在「零进展」时触发（marker 无变化），所以 anchored 态几乎恒为
+// 「已停滞（回合尚未终结）」——「执行中而仍发提醒」的语义留给 roundRunning=false 的
+// 异常态表达，不臆造。
+export function stallNudgeText(
+  minsExec: number,
+  s: { anchored: boolean; roundRunning: boolean; idleMin: number; lastAction?: string },
+): string {
+  const status =
+    !s.anchored
+      ? "状态不明（历史账无归属锚点）"
+      : s.roundRunning
+        ? "已停滞（回合尚未终结，可能被桌面端审批/选择弹窗阻塞）"
+        : "已终结但未回传（异常）"
+  const action = s.lastAction ? `｜最近动作：${s.lastAction}` : ""
+  return `⚠️ 后台任务执行超过 ${minsExec} 分钟｜状态：${status}｜已 ${s.idleMin} 分钟无进展${action}\n桌面端确实空闲请忽略本提醒；或回复 /stop 中止该回合后重发。`
+}
+
+// H2 停滞提醒决策（导出供测试，2026-10-30）：bgWait 零进展时提醒用户处置桌面弹窗。
+// 首次：startedAt 后 firstMs；之后：上次进展/提醒后 intervalMs；最多 maxNudges 次。
 export function stallNudgeDecision(
   startedAt: number,
   lastProgressAt: number,
@@ -295,7 +316,9 @@ export function createBridge(
         const listJson = await client.session.messages({ path: { id: sessionId } })
         const msgs = listJson?.data ?? []
 
-        // H2 停滞检测：消息数或最新 created 变化=有进展；零进展超窗则提醒用户
+        // H2 停滞检测：消息数或最新 created 变化=有进展；零进展超窗则提醒用户。
+        // 回合状态先于提醒计算（2026-11-03：提醒文案要带「执行中/已停滞/状态不明」）。
+        const turn = turnStateOf(msgs, promptId, baseline)
         let maxCreated = 0
         for (const m of msgs) {
           const created = m.time?.created ?? 0
@@ -311,14 +334,20 @@ export function createBridge(
         ) {
           nudges += 1
           lastProgressAt = now
-          console.log(`[bridge] 后台任务停滞提醒 #${nudges} session=${sessionId}`)
+          const st = turnStats.get(sessionId)
+          const lastAction = st?.lastTool && st?.lastAt ? `${st.lastTool}（${agoLabel(st.lastAt)}）` : undefined
+          console.log(`[bridge] 后台任务状态通告 #${nudges} session=${sessionId} anchored=${turn.anchored}`)
           void safeDeliver(
             ctx,
-            "⚠️ 后台任务已停滞超过 30 分钟——很可能在桌面端等待确认（审批/选择弹窗无法同步到 QQ）。请到桌面端查看处理；或回复 /stop 终止该任务后重发。",
+            stallNudgeText(Math.round((now - startedAt) / 60000), {
+              anchored: turn.anchored,
+              roundRunning: turn.anchored && !turn.hasIdle,
+              idleMin: Math.round((now - lastProgressAt) / 60000),
+              lastAction,
+            }),
           ).catch(() => {})
         }
 
-        const turn = turnStateOf(msgs, promptId, baseline)
         if (turn.hasIdle) {
           await finish("done")
         }
