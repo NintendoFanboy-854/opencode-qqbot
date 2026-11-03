@@ -8,7 +8,9 @@
 import { sendC2CMessage, sendGroupMessage, getNextMsgSeq, type MessageResponse } from "./api.js"
 import type { MessageContext } from "./types.js"
 
-const DEFAULT_MAX_LENGTH = 3000
+// 死参数兼容保留（2026-11-03 核）：replyToQQ 的 _maxLength 形参在函数体内未被使用，
+// 实际限长只有下方两个字节常量。值与 MARKDOWN_MAX_BYTES 对齐，仅消除误导。
+const DEFAULT_MAX_LENGTH = 60232
 
 // Markdown 主路径: QQ 原生渲染标准 markdown（含表格/代码），故基本透传，仅做首尾清理。
 export function formatForQQMarkdown(text: string): string {
@@ -85,10 +87,11 @@ function convertTables(text: string): string {
 //   仅错误码 40054007「消息长度超限」/40054018「消息过长或异常」证明服务端确有校验；
 // - 本机探针（生产环境发真实消息）：纯文本 8 万字/24 万字节、Markdown 60232 字节（2 万字+起止标识）
 //   均 HTTP 200 受理，且 2 万字 Markdown 经用户确认 QQ 客户端完整渲染；
-// - 故取 2 万字实测值为上限：markdown 60232 = 实测精确载荷；plain 60000 = 2 万 CJK 字×3 字节。
+// - 故三处上限统一取 2 万字实测值 60232 字节（markdown=plain=MAX_REPLY_LENGTH=60232）；
+// 分条逻辑（行边界/表格原子/围栏修补）保留，超 60232 字节仍分片。
 // 注意：必须按 UTF-8 字节切分，不能按字符数——中文 3 字节/字，按字符预算会在字节维度失控。
 const MARKDOWN_MAX_BYTES = 60232
-const PLAIN_MAX_BYTES = 60000
+const PLAIN_MAX_BYTES = 60232
 const encoder = new TextEncoder()
 
 function utf8Bytes(s: string): number {
