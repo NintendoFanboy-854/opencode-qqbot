@@ -85,7 +85,11 @@ export async function downloadQQAttachment(
 ): Promise<AttachmentOutcome> {
   // 语音消息：优先用 QQ 内置 ASR 的 asr_refer_text（免费、零下载）；无转写才按附件流程走
   const ctype = (att.content_type || "").toLowerCase()
-  if (ctype.startsWith("audio/") && att.asr_refer_text?.trim()) {
+  // 2026-11-04 修复（UAT 实测 DEF-qqbot-20261104-1）：QQ 语音附件 content_type
+  // 实测为 "voice"（非 audio/*），原 audio/ 前缀判断漏接 → 语音被误判为
+  //「暂不支持的附件类型」。asr 转写存在即优先消费，与具体 content_type 解耦。
+  const isVoice = ctype.startsWith("audio/") || ctype === "voice" || ctype === "amr" || ctype.endsWith("/amr")
+  if (isVoice && att.asr_refer_text?.trim()) {
     return { voice: att.asr_refer_text.trim() }
   }
   const ext = extForImageMime(att.content_type || "")

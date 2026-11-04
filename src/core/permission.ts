@@ -122,7 +122,9 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
           pendingPermissions.delete(ctx.userId)
           savePendingPermMap(pendingPermissions)
           resolve("reject")
-          void sendReply(ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
+          // 2026-11-04 修复（DEF-qqbot-20261104-3）：超时回执改走 safeDeliver——
+          // 原裸 sendReply 投递失败被 .catch 静默吞掉，用户收不到任何超时通知。
+          void safeDeliver(ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
         }
       }, PERM_PROMPT_TTL_MS)
 

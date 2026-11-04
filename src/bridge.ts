@@ -401,6 +401,17 @@ export function createBridge(
 
   // O7c：投递域门面（统一投递/降级/配额/节流队列/被动回复全在 core/delivery.ts）
   const { enqueuePush, safeDeliver, sendReply, deliver } = createDelivery(config, lastCtx)
+  // DEF-1 修复（2026-11-04，UAT 实证）：通知类发送永不阻断主流程——受理回执/
+  // K2 拦截/排队提示/问候等裸 sendReply 一旦被平台拒（40034024/超时）会直接
+  // 中断 handleMessage（实证：回执失败 → 回合未派发给 AI 即结算，用户消息被吞）。
+  // 统一走 notifyUser 兜底：发送失败仅告警，主流程继续。
+  const notifyUser = async (ctx: MessageContext, text: string): Promise<void> => {
+    try {
+      await sendReply(ctx, text)
+    } catch (error) {
+      console.warn("[bridge] 通知发送失败（不阻断主流程）:", toErrorMessage(error))
+    }
+  }
 
   // O7b：审批域门面（挂起槽/等待/裁决/跨重启恢复全在 core/permission.ts）
   const perm = createPermissionGate({
@@ -580,7 +591,7 @@ export function createBridge(
       // 途径获取自己的 openid 填 ALLOWED_USERS，首配死锁；白名单内不打印（无需）。
       if (!isAllowedUser(ctx.userId, config.allowedUsers)) {
         console.log(`[security] 拒绝非白名单用户：openid=${ctx.userId}（把它加入 ~/.openqq/.env 的 ALLOWED_USERS 后重启即开通）`)
-        await sendReply(ctx, "你不在允许使用的名单里")
+        await notifyUser(ctx, "你不在允许使用的名单里")
         return
       }
 
@@ -597,7 +608,7 @@ export function createBridge(
       if (!greeted.has(ctx.userId) && !isCommand(content)) {
         greeted.add(ctx.userId)
         saveGreetedSet(greeted)
-        await sendReply(ctx, buildHelpText())
+        await notifyUser(ctx, buildHelpText())
       }
 
       // 权限审批决策优先于命令/普通消息：原 prompt 在 promptAndWait 里
@@ -619,20 +630,20 @@ export function createBridge(
 
       if (isCommand(content)) {
         const reply = await handleCommand(ctx, commandContext)
-        await sendReply(ctx, reply)
+        await notifyUser(ctx, reply)
         return
       }
 
       const pendingReply = await maybeHandlePendingSelection(ctx, commandContext)
       if (pendingReply !== null) {
-        await sendReply(ctx, pendingReply)
+        await notifyUser(ctx, pendingReply)
         return
       }
 
       // 审批待决时，普通消息不进新 prompt（会话正阻塞在审批上），重发审批菜单
       const pendingPerm = perm.getPending(ctx.userId)
       if (pendingPerm) {
-        await sendReply(ctx, formatPermissionPrompt(pendingPerm.request, pendingPerm.mainSessionId))
+        await notifyUser(ctx, formatPermissionPrompt(pendingPerm.request, pendingPerm.mainSessionId))
         return
       }
 
@@ -656,7 +667,7 @@ export function createBridge(
             // P3（2026-11-03，外部复盘核验 R4）：提示带在途内容摘要提升体感
             const pend = pendingInflight().find((e) => e.fingerprint === messageFingerprint(ctx.userId, intentKey))
             const digest = pend ? `（在途内容：${previewText(pend.text)}）` : ""
-            await sendReply(ctx, `你的相同问题正在处理中${digest}，本次重发已忽略`)
+            await notifyUser(ctx, `你的相同问题正在处理中${digest}，本次重发已忽略`)
             return
           }
           claimedContexts.add(ctx)
@@ -684,11 +695,11 @@ export function createBridge(
         const queued = msgQueue.push(ctx.userId, ctx)
         if (!queued) {
           if (claimedMsgId) settleInflight(claimedMsgId) // 已满回执即终态，不能留账让启动对账再次执行
-          await sendReply(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
+          await notifyUser(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
           return
         }
         // 入队前已由 claimInflight 落账；drain 重入时回填 sessionId，不重复写账。
-        await sendReply(
+        await notifyUser(
           ctx,
           `已排队 #${queued.job.id}${queued.ahead > 0 ? `（前面还有 ${queued.ahead} 条）` : ""}，当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
         )
@@ -704,7 +715,7 @@ export function createBridge(
   // 通知——这三处都不进本分支，同一 intent 不重复点头。
   // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
       if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
-        await sendReply(ctx, "✅ 已收到，正在处理，完成后自动回复你")
+        await notifyUser(ctx, "✅ 已收到，正在处理，完成后自动回复你")
       }
 
       // B3（2026-10-29 同步升级）：C2C typing 指示——长回合处理中给用户
@@ -768,7 +779,7 @@ export function createBridge(
             void safeDeliver(ctx, `已${DECISION_LABELS[d]}，AI 将继续执行…`)
           },
           onPermissionConflict: () => {
-            void safeDeliver(ctx, "⚠️ 该审批已在桌面端处理，AI 继续执行…")
+            void safeDeliver(ctx, "⚠️ 该审批请求状态不明（可能在桌面端处理或已超时）。如命令未执行，请重新发起原操作")
           },
         })
 
@@ -895,7 +906,7 @@ export function createBridge(
     if (!job) return
     draining.add(userId)
     try {
-      await sendReply(job.ctx, `开始执行队列 #${job.id}`)
+      await notifyUser(job.ctx, `开始执行队列 #${job.id}`)
       drainReentries.add(job.ctx) // 修复⑦：drain 重入跳过受理回执
       await handleMessage(job.ctx)
     } catch (error) {

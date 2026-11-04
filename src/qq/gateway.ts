@@ -186,7 +186,7 @@ function briefAttachments(atts: MessageAttachment[]): unknown[] {
     } catch {
       /* 保留 ? */
     }
-    return { host, content_type: a.content_type, size: a.size, filename: a.filename }
+    return { host, content_type: a.content_type, size: a.size, filename: a.filename, asr: a.asr_refer_text ? 1 : 0 }
   })
 }
 
