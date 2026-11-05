@@ -38,8 +38,15 @@ function touch(path: string): void {
   utimesSync(path, now, now)
 }
 
-/** 尝试抢锁一次（显式路径版，导出供测试）；成功返回 InstanceLock，被占/异常返回 null */
-export function acquireInstanceLockAt(path: string, staleMs: number = LOCK_STALE_MS): InstanceLock | null {
+/** 尝试抢锁一次（显式路径版，导出供测试）；成功返回 InstanceLock，被占/异常返回 null
+ *  opts 仅供测试注入时序（默认行为与生产一致）：heartbeatMs 心跳间隔、selfCheckMs 自检周期 */
+export function acquireInstanceLockAt(
+  path: string,
+  staleMs: number = LOCK_STALE_MS,
+  opts?: { heartbeatMs?: number; selfCheckMs?: number },
+): InstanceLock | null {
+  const heartbeatMs = opts?.heartbeatMs ?? LOCK_UPDATE_MS
+  const selfCheckMs = opts?.selfCheckMs ?? LOCK_SELF_CHECK_MS
   try {
     mkdirSync(join(path, ".."), { recursive: true })
     // wx = 原子排他创建，已存在则抛 EEXIST
@@ -67,7 +74,7 @@ export function acquireInstanceLockAt(path: string, staleMs: number = LOCK_STALE
     } catch {
       /* 锁文件被外部删除时心跳失败，下轮仍试；不致命 */
     }
-  }, LOCK_UPDATE_MS)
+  }, heartbeatMs)
   // 测试场景不拖累进程退出
   heartbeat.unref?.()
 
@@ -89,7 +96,7 @@ export function acquireInstanceLockAt(path: string, staleMs: number = LOCK_STALE
       console.error("[instance-lock] 自检：锁文件已消失（被接管或强抢流程删除），本实例退出")
       process.exit(1)
     }
-  }, LOCK_SELF_CHECK_MS)
+  }, selfCheckMs)
   selfCheck.unref?.()
 
   let released = false
