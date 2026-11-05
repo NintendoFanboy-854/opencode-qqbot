@@ -279,6 +279,10 @@ export function createBridge(
       clearInterval(pollTimer)
       clearTimeout(giveupTimer)
       bgWaits.delete(sessionId)
+      // 被新回合取代（cancel 路径）时结清旧账——否则后台空账永久残留：安全重启
+      // 永远等不到空闲、重启恢复会误重挂/补投旧答案（2026-11-05 实证两条僵尸账）。
+      // finish 路径会先置 finished=true 并按 answered/expired 结清，此处不再覆盖。
+      if (!finished && trackId) settleInflight(trackId, undefined, "superseded")
       // 后台等待结束（完成/被新回合取代）→ 延迟解锁摘要镜像
       mirror.scheduleUnlock(sessionId)
     }
@@ -309,9 +313,10 @@ export function createBridge(
         }
       }
       finished = true
-      cleanup()
-      // R 项：后台等待到达终态（完成投递/放弃告知）即销账
+      // R 项：先销账再清理——cleanup 对未完成（被取代）路径按 superseded 结清，
+      // 顺序必须账清在前，否则原因会被 superseded 覆盖（settle 幂等，后写不生效）。
       if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : "expired")
+      cleanup()
       // Q1：后台等待终态 → 放行该用户队列（此前为串行而挂起）
       void drainQueue(ctx.userId)
       if (kind === "giveup") {

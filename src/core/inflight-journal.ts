@@ -63,6 +63,7 @@ export type SettleReason =
   | "cancelled"
   | "dropped"
   | "blocked"
+  | "superseded"
   | "expired"
   | "redispatch"
   | "manual"
