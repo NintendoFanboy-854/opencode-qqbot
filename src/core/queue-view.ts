@@ -326,8 +326,9 @@ function stageLabel(stage: ViewStage): string {
   return STAGE_LABEL[stage]
 }
 
-function reasonLabel(reason: SettleReason | undefined): string {
-  return reason ? REASON_LABEL[reason] : "-"
+function reasonLabel(reason: string | undefined): string {
+  if (!reason) return "-"
+  return (REASON_LABEL as Record<string, string>)[reason] ?? reason
 }
 
 function clampReply(lines: string[], maxChars: number, hint: string): string {
