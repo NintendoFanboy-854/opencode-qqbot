@@ -980,7 +980,29 @@ export function createBridge(
             void safeDeliver(ctx, `已${DECISION_LABELS[d]}，AI 将继续执行…`)
           },
           onPermissionConflict: () => {
-            void safeDeliver(ctx, "⚠️ 该审批请求状态不明（可能在桌面端处理或已超时）。如命令未执行，请重新发起原操作")
+            // 债务D2：请求已被其他端（桌面/自动规则）先处理——不是错误，任务继续。
+            // 2026-11-05 实证修正：立即告警是净噪音（用户点击后任务正常完成仍收到
+            // "状态不明请重发"的恐吓文案）。改为 10 分钟零进展保险网——届时会话仍
+            // 无任何新消息才告警；任务正常产出时保持安静。
+            console.log(`[bridge] 审批冲突（他端已处理），任务继续 msgId=${shortId(ctx.msgId)}`)
+            const conflictAt = Date.now()
+            setTimeout(() => {
+              void (async () => {
+                try {
+                  const listJson = await client.session.messages({ path: { id: sessionId } })
+                  const msgs = listJson?.data ?? []
+                  const progressed = msgs.some((m) => (m.time?.created ?? 0) >= conflictAt)
+                  if (!progressed) {
+                    await safeDeliver(
+                      ctx,
+                      "⚠️ 该审批请求状态不明（可能在桌面端处理或已超时），且任务长时间无进展。如命令未执行，请重新发起原操作",
+                    )
+                  }
+                } catch {
+                  /* 保险网探测失败不打扰用户 */
+                }
+              })()
+            }, 10 * 60_000).unref?.()
           },
         })
 
