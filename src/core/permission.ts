@@ -189,7 +189,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
           if (classifyApprovalReplyError(error) === "expired") {
             await safeDeliver(
               entry.ctx,
-              "⚠️ 这条审批已过期：等待超过时限，服务端已自动拒绝（你点的是重启前的旧卡片）。请重新发起原操作，新审批会正常生效",
+              "⚠️ 审批等待超时：等待超过时限，服务端已自动拒绝。请重新发起原操作，新审批会正常生效",
             )
           } else {
             await safeDeliver(
