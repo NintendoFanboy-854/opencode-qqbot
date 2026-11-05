@@ -1,4 +1,4 @@
-# OpenCode QQ Bot
+﻿# OpenCode QQ Bot
 
 通过 QQ 机器人与 [OpenCode](https://opencode.ai) AI 编程助手对话——双向监控桌面会话、远程发起任务、权限审批与选择弹窗直达 QQ、图片语音双向、长任务不丢答案。
 
@@ -224,6 +224,20 @@ QQ 桥的本质是「opencode 交互事件 → QQ 交互原语」的适配器。
 
 原则：未支持的类型永远给出明确文案 + 桌面端指引，不允许静默丢弃；多字段向导等增强按最小侵入接入。
 
+
+## English Summary
+
+**OpenCode QQ Bot** bridges [OpenCode](https://opencode.ai) (an open-source AI coding agent) into QQ (China's largest IM). Talk to your coding agent from your phone: send tasks, approve dangerous tool calls via interactive cards, dictate prompts with built-in voice-to-text, receive long-running results, and even send/receive files.
+
+- **Approval cards & form prompts**: OpenCode permission requests and multi-step forms render as interactive QQ cards (tap to allow/deny, or reply by text)
+- **Long tasks never lost**: 30-min foreground timeout falls back to a 24h background wait with status-aware stall notices; results are pushed back on completion
+- **Duplicate-proof delivery**: cross-process msgId claim + same-content fingerprint admission; gateway session/seq persisted across restarts (RESUME, no backlog replay)
+- **Notify channel**: cron / CI / any process can push results to QQ via `openqq notify` (file-locked outbox, TTL, idempotent by --id)
+- **QQ rendering fix**: ordered lists auto-flatten to the `、` style — what you see on desktop matches what lands on QQ
+
+Install: `opencode plugin add @linjz/opencode-qqbot` — Chinese README below, docs/review playbook in the repo.
+
 ## License
 
 MIT
+
