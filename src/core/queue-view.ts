@@ -240,12 +240,16 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
       else orphan.push(view) // 同用户串行下不应出现第二条；出现即异常
       continue
     }
-    if (hasDispatched) {
-      // 有会话但当前无运行标记：可能刚结束未销账/进程换代间隙，按已派发展示并告警。
+    // 已派发级（stage ≥ dispatched，含 drain 派发窗口 sessionId 尚未回填的秒级间隙）：
+    // 归「已派发」并告警——绝不判孤儿。否则排队消息在 drain 窗口会被误报孤儿、
+    // 巡检每 10min 刷假告警（2026-11-05 深度自评实证）。
+    if (hasDispatched || stageRank >= STAGE_RANK.dispatched) {
       dispatchedWithoutRuntime++
       dispatchedOthers.push(toViewEntry(entry, "dispatched"))
       continue
     }
+    // 孤儿门槛：只有「从未进过派发」（claimed/queued 级）的超龄空账才算孤儿——
+    // 当初 19 条孤儿正是这种；真卡死的已派发票由 /queue 可见 + 重启恢复兜底。
     if (now - entry.at > orphanMs) {
       orphan.push(toViewEntry(entry, "orphan"))
       continue
