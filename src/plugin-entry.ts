@@ -16,7 +16,10 @@ import { isInstanceAlive } from "./core/instance-lock.js"
 import { resolveRuntime, buildLaunchPlan, spawnBotDetached, resolveBotEntry, readDotEnvField, botLogPath } from "./core/bot-launcher.js"
 
 const ENV_FILE = join(homedir(), ".openqq", ".env")
-const CHECK_INTERVAL_MS = 5 * 60 * 1000 // 看门狗巡检间隔（插件重载会重置，兜底是每小时 reload）
+const CHECK_INTERVAL_MS = (() => {
+  const n = Number(process.env.QQ_WATCHDOG_INTERVAL_MS ?? "300000")
+  return Number.isFinite(n) && n > 0 ? n : 300_000
+})() // 看门狗巡检间隔（env QQ_WATCHDOG_INTERVAL_MS 可调；插件重载会重置，兜底是每小时 reload）
 
 // —— 事件探针（2026-10-30 自 qqbot-event-probe.ts 并入，默认关）——
 // 原独立探针已完成 spike 取证使命（form/permission 事件流实证）；保留为可选诊断：

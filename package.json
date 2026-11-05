@@ -19,9 +19,10 @@
     "verify": "bun run typecheck && bun run test",
     "verify:full": "bun run verify && bun run test:e2e",
     "build:bundle": "bun build src/index.ts --outfile=dist/openqq-bot.js --target=node",
+    "build:notify": "bun build src/cli/notify-main.ts --outfile=dist/notify-cli.js --target=node",
     "build:plugin": "bun build src/plugin-entry.ts --outfile=dist/opencode-qqbot-plugin.js --target=bun --external @opencode/plugin --external effect",
-    "deploy:plugin": "bun run build:bundle && bun run build:plugin && bun scripts/deploy-plugin.mjs",
-    "prepublishOnly": "bun run build:bundle && bun run build:plugin"
+    "deploy:plugin": "bun run build:bundle && bun run build:notify && bun run build:plugin && bun scripts/deploy-plugin.mjs",
+    "prepublishOnly": "bun run build:bundle && bun run build:notify && bun run build:plugin"
   },
   "files": [
     "bin",

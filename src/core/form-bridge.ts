@@ -327,7 +327,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
         if (/AlreadySettled|already|OpenCode API 404/i.test(msg)) {
           // 桌面端先答/先取消是终态；只有明确的服务端冲突才清理。
           if (isCurrent(userId, entry)) clearEntry(userId, entry)
-          await deliver(entry.ctx, "ℹ️ 该选择已在桌面端处理或取消，QQ 卡片已失效")
+          await deliver(entry.ctx, "ℹ️ 该选择已在桌面端处理或取消，QQ 卡片已失效；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
         } else {
           // submitting + answer 保留在内存和磁盘，可手动重试或由 reconcile 续交。
           await deliver(entry.ctx, `⚠️ 提交失败，选择已保留、可在重启后续交：${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}`)
@@ -381,7 +381,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       }
       clearEntry(userId, entry)
     }
-    await deliver(entry.ctx, "⏰ 选择请求已满 30 分钟未作答，服务端已确认取消；如需继续请回桌面重试")
+    await deliver(entry.ctx, "⏰ 选择请求已满 30 分钟未作答，服务端已确认取消；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
   }
 
   function scheduleExpiry(userId: string, entry: InternalPendingForm): void {
