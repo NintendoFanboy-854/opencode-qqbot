@@ -1,5 +1,5 @@
 // @input:  fs（追加写）
-// @output: installFileLog, fileLogStatus
+// @output: installFileLog, fileLogStatus, formatLocalTimestamp
 // @pos:    core - 可选文件日志双写（QQ_LOG_FILE 环境变量开启；2026-11-05 起默认开启）
 //
 // 背景（2026-10-30 清债 P2）：插件拉起的 detached bot 无控制台，bun 子进程 fd
@@ -19,6 +19,20 @@ interface ActiveLog {
 }
 
 let active: ActiveLog | null = null
+
+/** 本地时区时间戳（含偏移，如 2026-11-05T21:09:09.292+08:00）——2026-11-05 用户反馈：
+ *  日志全是 UTC（Z 结尾），与本地时钟差 8 小时，排障要对表。统一改本地。 */
+export function formatLocalTimestamp(d = new Date()): string {
+  const pad = (n: number, w = 2): string => String(n).padStart(w, "0")
+  const offMin = -d.getTimezoneOffset() // 本地超前 UTC 的分钟数（中国 = +480）
+  const sign = offMin >= 0 ? "+" : "-"
+  const abs = Math.abs(offMin)
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}` +
+    `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  )
+}
 
 /** 当前生效的文件日志（未安装返回 null）。 */
 export function fileLogStatus(): { path: string; lastWriteAt: number } | null {
@@ -40,7 +54,7 @@ export function installFileLog(logPath: string): () => void {
         renameSync(logPath, `${logPath}.1`)
       }
       const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")
-      appendFileSync(logPath, `${new Date().toISOString()} [${level}] ${line}\n`, { mode: 0o600 })
+      appendFileSync(logPath, `${formatLocalTimestamp()} [${level}] ${line}\n`, { mode: 0o600 })
       state.lastWriteAt = Date.now()
     } catch {
       // 日志绝不阻断主流程

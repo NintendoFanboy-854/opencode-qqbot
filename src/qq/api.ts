@@ -285,8 +285,6 @@ export interface KeyboardButton {
     data: string
     click_limit?: number
   }
-  /** 同组按钮单选互斥（点一个其余置灰，P0 dsh approval-renderer 实证字段） */
-  group_id?: string
 }
 
 export interface InlineKeyboard {

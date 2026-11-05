@@ -813,10 +813,19 @@ export function createBridge(
         return
       }
 
-      // 审批待决时，普通消息不进新 prompt（会话正阻塞在审批上），重发审批菜单
+      // 审批待决时，普通消息不进新 prompt（会话正阻塞在审批上），重发审批菜单。
+      // 菜单重发也走卡片优先（2026-11-05：只发文字会让用户永远看不到按钮入口）。
       const pendingPerm = perm.getPending(ctx.userId)
       if (pendingPerm) {
-        await notifyUser(ctx, formatPermissionPrompt(pendingPerm.request, pendingPerm.mainSessionId))
+        const sentByCard = await sendApprovalCard(
+          { appId: config.qq.appId, clientSecret: config.qq.clientSecret },
+          ctx,
+          pendingPerm.request,
+          pendingPerm.mainSessionId,
+        ).catch(() => false)
+        if (!sentByCard) {
+          await notifyUser(ctx, formatPermissionPrompt(pendingPerm.request, pendingPerm.mainSessionId))
+        }
         releaseClaimed("blocked", "审批挂起，消息未派发")
         return
       }

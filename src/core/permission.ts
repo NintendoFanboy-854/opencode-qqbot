@@ -208,6 +208,19 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
         restored: true,
       })
       console.log(`[perm] 恢复重启前挂起的审批 ${uid.slice(0, 8)}… request=${e.request.id}`)
+      // 恢复即重推审批卡片（卡片优先，失败降级文字）——重启后用户必须能重新
+      // 看到可点按钮；旧行为只注册槽位不推送，用户收不到任何审批入口（2026-11-05
+      // 按钮丢失事故：重启后只剩文字重发路径，按钮再也出不来）。
+      void (async () => {
+        const sentByCard = deps.sendApprovalPrompt
+          ? await deps.sendApprovalPrompt(e.ctx, e.request, e.mainSessionId).catch(() => false)
+          : false
+        if (!sentByCard) {
+          await sendReply(e.ctx, formatPermissionPrompt(e.request, e.mainSessionId)).catch((error) => {
+            console.error("[bridge] 恢复审批推送失败:", error)
+          })
+        }
+      })()
     }
   }
 

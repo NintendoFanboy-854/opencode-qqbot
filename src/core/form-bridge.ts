@@ -184,8 +184,7 @@ export function buildFormKeyboard(form: FormInfo, _ownerOpenid: string): InlineK
     id: `form-${form.id}-${opt.value}`.slice(0, 64),
     render_data: { label: clipButtonLabel(opt.label), visited_label: clipButtonLabel(`✓ ${opt.label}`), style: 1 },
     // permission 形状对齐腾讯 P0（{type:2} 不带 specify_user_ids，同审批卡；
-    // 平台校验收敛后冲突形状会导致客户端不渲染键盘）。group_id 单选互斥。
-    group_id: `form-${form.id}`.slice(0, 64),
+    // 平台校验收敛后冲突形状会导致客户端不渲染键盘）。
     action: {
       type: 1,
       permission: { type: 2 },
