@@ -107,6 +107,7 @@ const REASON_LABEL: Record<SettleReason, string> = {
   "duplicate-intent": "重复意图",
   cancelled: "已取消",
   dropped: "已删除",
+  blocked: "被阻塞",
   expired: "已过期",
   redispatch: "重启重派",
   manual: "人工结清",

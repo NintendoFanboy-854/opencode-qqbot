@@ -57,6 +57,7 @@ import {
   INFLIGHT_MAX_AGE_MS,
   redispatchMaxAgeMs,
   type InflightEntry,
+  type SettleReason,
 } from "./core/inflight-journal.js"
 import {
   deriveQueueView,
@@ -747,6 +748,14 @@ export function createBridge(
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
     let claimedMsgId = ""
     const intentKey = intentKeyOf(ctx)
+    // drain 重入/重启恢复的 ctx 已带受理账；若它在派发前的早退点（表单消费/命令/
+    // 序号选择/审批挂起）被拦截，必须结清该账——否则台账残留 inflight，孤儿巡检
+    // 会每 10 分钟刷一次告警（2026-11-05 实证：审批挂起导致队列 #1 卡成孤儿）。
+    const releaseClaimed = (reason: SettleReason, note?: string): void => {
+      if (!ctx.msgId || !claimedContexts.has(ctx)) return
+      settleInflight(ctx.msgId, undefined, reason)
+      console.log(`[queue] release-early msg=${shortId(ctx.msgId)} reason=${reason}${note ? ` note=${note}` : ""}`)
+    }
     try {
       // P1 修复（2026-11-03，外部复盘核验）：拒绝时记录 openid——新用户无任何
       // 途径获取自己的 openid 填 ALLOWED_USERS，首配死锁；白名单内不打印（无需）。
@@ -786,18 +795,21 @@ export function createBridge(
       // 文字"允许"与表单答案的歧义：parsePermissionDecision 先行的同时要求存在
       // 待审权限才会消费；表单槽独立判断，互不串线。
       if (formBridge.tryResolveText(ctx.userId, content)) {
+        releaseClaimed("answered")
         return
       }
 
       if (isCommand(content)) {
         const reply = await handleCommand(ctx, commandContext)
         await notifyUser(ctx, reply)
+        releaseClaimed("dropped")
         return
       }
 
       const pendingReply = await maybeHandlePendingSelection(ctx, commandContext)
       if (pendingReply !== null) {
         await notifyUser(ctx, pendingReply)
+        releaseClaimed("dropped")
         return
       }
 
@@ -805,6 +817,7 @@ export function createBridge(
       const pendingPerm = perm.getPending(ctx.userId)
       if (pendingPerm) {
         await notifyUser(ctx, formatPermissionPrompt(pendingPerm.request, pendingPerm.mainSessionId))
+        releaseClaimed("blocked", "审批挂起，消息未派发")
         return
       }
 
@@ -1053,7 +1066,8 @@ export function createBridge(
           for (const job of restoredJobs) {
             // drain 重入必须跳过重复认领，否则 duplicate-msgid 会把恢复条目静默丢掉。
             claimedContexts.add(job.ctx)
-            markInflightStage(job.ctx.msgId, "queued", { queueId: job.id, enqueuedAt: job.enqueuedAt })
+            // force：旧 stage（如 dispatched 空账）在进程换代后不再可信，恢复即回到 queued。
+            markInflightStage(job.ctx.msgId, "queued", { queueId: job.id, enqueuedAt: job.enqueuedAt }, { force: true })
             restorable.add(job.ctx.msgId)
           }
           console.log(
@@ -1120,6 +1134,9 @@ export function createBridge(
   // handleMessage 自身的 finally 会继续 drain 下一条（链式）。
   async function drainQueue(userId: string): Promise<void> {
     if (draining.has(userId) || busyUsers.has(userId)) return
+    // 审批挂起时不出队：此时出队只会被 handleMessage 的 pendingPerm 早退吞掉并结清
+    // （消息白排队）。等挂起审批的回合走完 finally 自然会再次 drain。
+    if (perm.getPending(userId)) return
     const job = msgQueue.shift(userId)
     if (!job) return
     draining.add(userId)

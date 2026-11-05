@@ -173,7 +173,7 @@ function clipButtonLabel(text: string): string {
 }
 
 /** 单选直接提交字符串；多选按钮与文字路径一致，提交单值数组。 */
-export function buildFormKeyboard(form: FormInfo, ownerOpenid: string): InlineKeyboard | null {
+export function buildFormKeyboard(form: FormInfo, _ownerOpenid: string): InlineKeyboard | null {
   const visible = form.fields.filter((f) => !(f as FieldLike).hidden)
   if (visible.length !== 1) return null
   const field = visible[0] as FieldLike
@@ -183,9 +183,12 @@ export function buildFormKeyboard(form: FormInfo, ownerOpenid: string): InlineKe
   const buttons: KeyboardButton[] = opts.slice(0, 20).map((opt) => ({
     id: `form-${form.id}-${opt.value}`.slice(0, 64),
     render_data: { label: clipButtonLabel(opt.label), visited_label: clipButtonLabel(`✓ ${opt.label}`), style: 1 },
+    // permission 形状对齐腾讯 P0（{type:2} 不带 specify_user_ids，同审批卡；
+    // 平台校验收敛后冲突形状会导致客户端不渲染键盘）。group_id 单选互斥。
+    group_id: `form-${form.id}`.slice(0, 64),
     action: {
       type: 1,
-      permission: { type: 2, specify_user_ids: [ownerOpenid] },
+      permission: { type: 2 },
       data: encodeFormButton({ t: "form", f: form.id, k: field.key, v: opt.value }),
     },
   }))

@@ -55,16 +55,19 @@ function clipLabel(text: string): string {
   return s.length > BUTTON_LABEL_MAX ? s.slice(0, BUTTON_LABEL_MAX - 1) + "…" : s
 }
 
-function makeButton(label: string, style: number, data: ApprovalButtonData, ownerOpenid: string): KeyboardButton {
-  // visited_label = 点击后的原生回显（QQ 客户端把已点按钮渲染为已访问态、其余置灰——
-  // 这就是"dsh 点一个其余变灰"的平台原生机制，2026-10-30 用户要求抄的效果）
+function makeButton(label: string, style: number, data: ApprovalButtonData, _ownerOpenid: string): KeyboardButton {
+  // visited_label = 点击后的原生回显；group_id=approval 让四个按钮单选互斥
+  // （点一个其余置灰——dsh P0 approval-renderer 实证机制，2026-10-30 用户要求抄的效果）。
+  // _ownerOpenid 保留在签名里维持 buildApprovalKeyboard 的既有接口（身份索引在交互回调侧完成）。
   const visited = data.d === "once" || data.d === "always" ? `✓ ${label}` : data.d === "reject" ? `✗ ${label}` : label
   return {
     id: `approval-${data.d}-${data.r}`.slice(0, 64),
     render_data: { label: clipLabel(label), visited_label: clipLabel(visited), style },
-    // permission.type=2 + specify_user_ids：仅审批发起人可点（官方 P0 字段，
-    // 防止群里其他人代点裁决）
-    action: { type: 1, permission: { type: 2, specify_user_ids: [ownerOpenid] }, data: encodeButtonData(data) },
+    group_id: "approval",
+    // permission 形状对齐腾讯 P0 当前实现（approval-renderer.ts）：{type:2} 不带 specify_user_ids。
+    // 官方语义 type=2=所有人可操作；叠加 specify_user_ids 是冲突形状——平台校验收敛后
+    // 客户端直接不渲染键盘（dsh-notifier#26 实证：API 2xx、正文到、按钮没）。
+    action: { type: 1, permission: { type: 2 }, data: encodeButtonData(data) },
   }
 }
 

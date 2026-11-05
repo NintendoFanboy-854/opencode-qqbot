@@ -62,6 +62,7 @@ export type SettleReason =
   | "duplicate-intent"
   | "cancelled"
   | "dropped"
+  | "blocked"
   | "expired"
   | "redispatch"
   | "manual"
@@ -330,13 +331,15 @@ export function listInflightView(): InflightView {
 }
 
 /**
- * 阶段推进（可观测性）：只对在途账生效，stage 只前进不回退。
+ * 阶段推进（可观测性）：只对在途账生效，默认只前进不回退。
  * patch 用于回填 queueId/enqueuedAt/sessionId/promptId/lastError。
+ * opts.force：重启恢复排队时允许回退到 queued（进程换代后旧 stage 不再可信）。
  */
 export function markInflightStage(
   msgId: string,
   stage: InflightStage,
   patch?: Partial<Pick<InflightEntry, "queueId" | "enqueuedAt" | "sessionId" | "promptId" | "lastError">>,
+  opts?: { force?: boolean },
 ): boolean {
   const rank: Record<InflightStage, number> = {
     claimed: 0,
@@ -349,7 +352,7 @@ export function markInflightStage(
   return mutate((entries) => {
     const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
     if (!entry) return false
-    if (!entry.stage || rank[stage] >= rank[entry.stage]) entry.stage = stage
+    if (opts?.force || !entry.stage || rank[stage] >= rank[entry.stage]) entry.stage = stage
     if (patch?.queueId !== undefined) entry.queueId = patch.queueId
     if (patch?.enqueuedAt !== undefined) entry.enqueuedAt = patch.enqueuedAt
     if (patch?.sessionId && !entry.sessionId) entry.sessionId = patch.sessionId
