@@ -485,6 +485,12 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     pending.set(userId, entry)
     scheduleExpiry(userId, entry)
     if (previous) {
+      // 举一反三（2026-11-05）：被取代的旧表单台账必须同步清理——否则非终态记录
+      // 永久残留，每次重启都被 restore 重载（updatedAt 比较能防顶替新槽，但僵尸账
+      // 无限累积），与 bgWait superseded 同罪。
+      try {
+        journal.remove(userId, previous.form.id)
+      } catch { /* 下次替换/reconcile 再清理 */ }
       void deliver(previous.ctx, "⚠️ 有新的选择请求，上一个表单已取消在 QQ 的作答（仍可回桌面处理）")
     }
     console.log(`[form-bridge] 表单已推送 user=${userId.slice(0, 8)}… form=${form.id} title=${form.title.slice(0, 40)}`)

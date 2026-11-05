@@ -443,6 +443,9 @@ export function createBridge(
     client,
     sendReply,
     safeDeliver,
+    // 2026-11-05 举一反三：审批槽清空（裁决/TTL）即唤醒该用户队列——否则挂起期间
+    // 入队的消息要等用户再发一条才会动（drainQueue 的 pendingPerm 守卫无人解除）。
+    onDecision: (userId) => void drainQueue(userId),
     // A 项：审批卡片发送（失败自动降级文字菜单，permission 域内处理）
     sendApprovalPrompt: (ctx, request, mainSessionId) =>
       sendApprovalCard({ appId: config.qq.appId, clientSecret: config.qq.clientSecret }, ctx, request, mainSessionId),

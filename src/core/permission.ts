@@ -93,6 +93,10 @@ export interface PermissionGateDeps {
   safeDeliver: (ctx: MessageContext, text: string) => Promise<void>
   /** A 项（2026-10-29）：卡片按钮审批发送通道；返回 false 时本域自动降级文字菜单 */
   sendApprovalPrompt?: (ctx: MessageContext, request: PermissionRequest, mainSessionId: string) => Promise<boolean>
+  /** 槽位清空的唤醒钩子（用户裁决/TTL 自动拒绝均触发）：审批挂起期间 drainQueue 被守卫
+   *  挡回，裁决后须由调用方重新放行队列——否则挂起期间入队的消息要等用户再发一条才动
+   *  （2026-11-05 举一反三：permission 域的"终态无人唤醒"漏洞）。 */
+  onDecision?: (userId: string) => void
 }
 
 export interface PermissionGate {
@@ -135,6 +139,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
         if (pendingPermissions.get(ctx.userId)?.request.id === request.id) {
           pendingPermissions.delete(ctx.userId)
           savePendingPermMap(pendingPermissions)
+          deps.onDecision?.(ctx.userId) // TTL 自动拒绝也要唤醒被守卫挡回的队列
           resolve("reject")
           // 2026-11-04 修复（DEF-qqbot-20261104-3）：超时回执改走 safeDeliver——
           // 原裸 sendReply 投递失败被 .catch 静默吞掉，用户收不到任何超时通知。
@@ -172,6 +177,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
     if (entry.timer) clearTimeout(entry.timer)
     pendingPermissions.delete(userId)
     savePendingPermMap(pendingPermissions)
+    deps.onDecision?.(userId) // 裁决即唤醒队列（drainQueue 的 pendingPerm 守卫此刻已放行）
     if (entry.restored) {
       // O2（P2-4a）：跨重启——原 waiter 已随进程消失，直连 POST reply 争取
       // 原位生效；会话已不在等待则明确回执"重新发起"，绝不灌会话当普通消息
@@ -222,6 +228,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
             })
             .catch(() => {})
           void safeDeliver(e.ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
+          deps.onDecision?.(uid) // 恢复槽 TTL 拒绝也要唤醒队列
         }
       }, left)
       pendingPermissions.set(uid, {
@@ -268,6 +275,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
       if (pendingPermissions.get(userId)?.request.id !== request.id) return
       pendingPermissions.delete(userId)
       savePendingPermMap(pendingPermissions)
+      deps.onDecision?.(userId) // 外部审批 TTL 拒绝也要唤醒队列
       void client.permission
         .reply({ path: { sessionID: request.sessionID, requestID: request.id }, body: { decision: "reject" } })
         .catch(() => {})
