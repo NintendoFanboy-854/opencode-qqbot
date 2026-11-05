@@ -20,6 +20,7 @@ import {
   handlePendingSelection,
   isCommand,
   type CommandContext,
+  type LedgerApi,
   type MirrorApi,
   type PendingSelection,
   type WatchApi,
@@ -29,6 +30,9 @@ import { MessageQueue, previewText, agoLabel, intentKeyOf } from "./core/message
 import { classifyProviderError, rescueText } from "./core/error-rescue.js"
 
 const QUEUE_MAX = 20 // Q1：忙碌队列上限（学习 pi-qqbot queue.max 默认）
+// 2026-11-05：队列完成回执（"队列 #N 完成（剩余 M 条）"）默认关闭——批量排空时
+// 会放大主动消息配额消耗；排障/验收期设 QQ_QUEUE_RECEIPTS=1 打开。
+const QUEUE_RECEIPTS_ENABLED = /^(1|true|on)$/i.test(process.env.QQ_QUEUE_RECEIPTS ?? "")
 import {
   createPermissionGate,
   parsePermissionDecision,
@@ -48,9 +52,20 @@ import {
   pendingInflight,
   classifyInflight,
   markInflightPromptId,
+  markInflightStage,
+  listInflightView,
   INFLIGHT_MAX_AGE_MS,
   redispatchMaxAgeMs,
+  type InflightEntry,
 } from "./core/inflight-journal.js"
+import {
+  deriveQueueView,
+  formatQueueReply,
+  formatLedgerReply,
+  formatStatusLine,
+  shortId,
+  type QueueView,
+} from "./core/queue-view.js"
 import { messageFingerprint } from "./core/inbound-dedupe.js"
 import { extractSendFileMarkers, sendLocalFile } from "./core/send-media.js"
 import type { InteractionEvent } from "./qq/types.js"
@@ -143,6 +158,8 @@ export function createBridge(
   // Q1：忙碌消息队列（该用户当前回合结束后自动 drain）
   const msgQueue = new MessageQueue(QUEUE_MAX)
   const draining = new Set<string>()
+  // 队列 drain 重入的 ctx → 队列编号（完成回执/诊断用；WeakMap 不阻回收）
+  const queueIdOfCtx = new WeakMap<MessageContext, number>()
   // Persist greeted users to disk so restarting the bot doesn't re-send the
   // full command list to every user on their next message.
   const greeted = loadGreetedSet()
@@ -293,7 +310,7 @@ export function createBridge(
       finished = true
       cleanup()
       // R 项：后台等待到达终态（完成投递/放弃告知）即销账
-      if (trackId) settleInflight(trackId)
+      if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : "expired")
       // Q1：后台等待终态 → 放行该用户队列（此前为串行而挂起）
       void drainQueue(ctx.userId)
       if (kind === "giveup") {
@@ -369,6 +386,7 @@ export function createBridge(
     const pollTimer = setInterval(() => void tick(), BG_POLL_MS)
     const giveupTimer = setTimeout(() => void finish("giveup"), BG_WAIT_MAX_MS)
     bgWaits.set(sessionId, { cancel: cleanup })
+    if (trackId) markInflightStage(trackId, "background", { sessionId })
     console.log(`[bridge] 会话 ${sessionId} 转入后台等待（最长 ${BG_WAIT_MAX_MS / 3_600_000} 小时）`)
   }
 
@@ -511,25 +529,157 @@ export function createBridge(
 
   const mirrorApi: MirrorApi = mirror.api
 
-  // Q1：队列命令实现
+  // Q1：队列/台账派生视图（三源 join：内存队列 + 磁盘台账 + 运行态）
+  function queueViewFor(userId: string): QueueView {
+    const journal = listInflightView()
+    const session = sessions.getSession(userId)
+    return deriveQueueView({
+      entries: [...journal.inflight, ...journal.settled].filter((e) => e.userId === userId),
+      jobs: msgQueue.list(userId),
+      runtime: {
+        busy: busyUsers.has(userId),
+        draining: draining.has(userId),
+        ...(session?.sessionId ? { sessionId: session.sessionId } : {}),
+        bgSessions: new Set(bgWaits.keys()),
+      },
+    })
+  }
+
+  // Q1：队列命令实现（2026-11-05：/queue 默认 join 台账，不再只看内存）
   const queueApi = {
-    list: (userId: string): string => {
-      const jobs = msgQueue.list(userId)
-      const busy = busyUsers.has(userId) ? "当前任务：处理中（发 /cancel 可中断）" : "当前任务：空闲"
-      if (jobs.length === 0) return `${busy}\n队列：空`
-      const lines = jobs.map(
-        (j) => `  #${j.id} · ${agoLabel(j.enqueuedAt)} · ${previewText(j.text)}`,
-      )
-      return [
-        busy,
-        `队列：${jobs.length} 条（上限 ${QUEUE_MAX}）`,
-        ...lines,
-        "发 /queue clear 清空，/queue drop <编号> 删除一条。",
-      ].join("\n")
+    list: (userId: string): string => formatQueueReply(queueViewFor(userId), { limit: QUEUE_MAX }),
+    listAll: (userId: string, page = 1): string =>
+      formatQueueReply(queueViewFor(userId), { all: true, page, limit: QUEUE_MAX }),
+    summary: (userId: string): string => formatStatusLine(queueViewFor(userId)),
+    clear: (userId: string): number => {
+      const jobs = [...msgQueue.list(userId)]
+      for (const job of jobs) {
+        if (job.ctx.msgId) settleInflight(job.ctx.msgId, undefined, "cancelled")
+      }
+      const n = msgQueue.clear(userId)
+      if (n > 0) console.log(`[queue] clear user=${userId.slice(0, 8)}… count=${n} settle=cancelled`)
+      return n
     },
-    clear: (userId: string): number => msgQueue.clear(userId),
-    drop: (userId: string, id: number): string =>
-      msgQueue.drop(userId, id) ? `已删除队列 #${id}` : `队列里没有 #${id}`,
+    drop: (userId: string, id: number): string => {
+      const job = msgQueue.find(userId, id)
+      if (!job) return `队列里没有 #${id}`
+      if (job.ctx.msgId) settleInflight(job.ctx.msgId, undefined, "dropped")
+      msgQueue.drop(userId, id)
+      console.log(`[queue] drop user=${userId.slice(0, 8)}… qid=${id} settle=dropped`)
+      return `已删除队列 #${id}（台账已结清）`
+    },
+  }
+
+  // 台账诊断命令实现（/ledger /ledger check /ledger settle）
+  const ledgerApi: LedgerApi = {
+    view: async (userId: string, args: string): Promise<string> => {
+      const view = queueViewFor(userId)
+      const parts = args.trim().split(/\s+/).filter(Boolean)
+      const sub = parts[0]?.toLowerCase() ?? ""
+      if (/^\d+$/.test(sub)) return formatLedgerReply(view, { page: Math.max(1, Number(sub)) })
+      if (sub === "orphan" || sub === "rejected" || sub === "inflight" || sub === "settled") {
+        const page = Number(parts[1] ?? "1")
+        return formatLedgerReply(view, {
+          filter: sub,
+          page: Number.isInteger(page) && page > 0 ? page : 1,
+        })
+      }
+      if (sub && sub !== "all") {
+        const pool = [...view.inflightEntries, ...view.settledRecent]
+        const hit = pool.find((e) => e.msgId === sub || e.msgId.endsWith(sub) || shortId(e.msgId) === sub)
+        if (!hit) return `台账里没有匹配「${sub}」的条目（发 /ledger 查看尾号）`
+        return formatLedgerReply(view, { detail: hit })
+      }
+      return formatLedgerReply(view)
+    },
+    check: async (userId: string): Promise<string> => {
+      const view = queueViewFor(userId)
+      if (view.inflightEntries.length === 0) return "台账在途：0 条，无需对账"
+      const lines = [`台账对账 · 在途 ${view.inflightEntries.length} 条`]
+      let answered = 0
+      let running = 0
+      let lost = 0
+      let failed = 0
+      for (const e of view.inflightEntries.slice(0, 20)) {
+        const label = `${shortId(e.msgId)}「${previewText(e.text, 20)}」`
+        if (!e.sessionId) {
+          lost++
+          lines.push(` · ${label} → lost（从未进入会话；可 /ledger settle ${shortId(e.msgId)} confirm 结清）`)
+          continue
+        }
+        try {
+          const msgs = await fetchRecoveryMessages(client, e.sessionId)
+          const cls = classifyInflight({ text: e.text, at: e.at }, msgs)
+          if (cls.kind === "answered") {
+            answered++
+            lines.push(` · ${label} → answered（答案已在库里，重启会补投）`)
+          } else if (cls.kind === "running") {
+            running++
+            lines.push(` · ${label} → running（回合在跑/未终结）`)
+          } else {
+            lost++
+            lines.push(` · ${label} → lost（会话历史找不到；可重发或结清）`)
+          }
+        } catch (error) {
+          failed++
+          lines.push(` · ${label} → 对账失败：${toErrorMessage(error)}`)
+        }
+      }
+      if (view.inflightEntries.length > 20) lines.push(` …其余 ${view.inflightEntries.length - 20} 条未展开`)
+      lines.push(`汇总：answered ${answered} · running ${running} · lost ${lost}${failed ? ` · 失败 ${failed}` : ""}`)
+      lines.push("修复：/ledger settle <尾号> confirm 人工结清；重启对账会自动补投/重挂")
+      console.log(
+        `[journal] check user=${userId.slice(0, 8)}… inflight=${view.inflightEntries.length} answered=${answered} running=${running} lost=${lost} failed=${failed}`,
+      )
+      return lines.join("\n")
+    },
+    settle: (userId: string, key: string, confirm: boolean): string => {
+      const view = queueViewFor(userId)
+      const hits = view.inflightEntries.filter(
+        (e) => e.msgId === key || e.msgId.endsWith(key) || shortId(e.msgId) === key,
+      )
+      if (hits.length === 0) return `台账在途里没有匹配「${key}」的条目`
+      if (hits.length > 1) return `尾号「${key}」匹配到 ${hits.length} 条，请给更长的尾号`
+      const hit = hits[0]
+      if (!hit) return `台账在途里没有匹配「${key}」的条目`
+      if (!confirm) {
+        return `将结清：${shortId(hit.msgId)}「${previewText(hit.text, 30)}」\n确认请发 /ledger settle ${key} confirm`
+      }
+      const ok = settleInflight(hit.msgId, undefined, "manual")
+      const job = msgQueue.list(userId).find((j) => j.ctx.msgId === hit.msgId)
+      if (job) msgQueue.drop(userId, job.id)
+      console.log(`[journal] settle-manual user=${userId.slice(0, 8)}… msg=${shortId(hit.msgId)} ok=${ok}`)
+      return ok ? `已结清：${shortId(hit.msgId)}（人工）` : "该条目已不在在途状态"
+    },
+  }
+
+  // 孤儿巡检：每 60s 扫一次台账；仅对新增孤儿且距上次提醒 >10min 的用户发一条汇总。
+  const ORPHAN_SCAN_MS = (() => {
+    const n = Number(process.env.QQ_ORPHAN_SCAN_SECONDS ?? "60")
+    return Number.isFinite(n) && n > 0 ? Math.floor(n * 1000) : 0
+  })()
+  const ORPHAN_NOTIFY_GAP_MS = 10 * 60_000
+  const lastOrphanNotify = new Map<string, number>()
+  if (ORPHAN_SCAN_MS > 0) {
+    setInterval(() => {
+      try {
+        const now = Date.now()
+        const users = new Set(listInflightView().inflight.map((e) => e.userId))
+        for (const uid of users) {
+          const view = queueViewFor(uid)
+          if (view.counts.orphan === 0) continue
+          if (now - (lastOrphanNotify.get(uid) ?? 0) < ORPHAN_NOTIFY_GAP_MS) continue
+          lastOrphanNotify.set(uid, now)
+          console.log(`[queue] orphan-scan user=${uid.slice(0, 8)}… count=${view.counts.orphan}`)
+          void safeDeliver(
+            ctxForUser(uid),
+            `⚠️ 台账发现 ${view.counts.orphan} 条孤儿消息（受理后未入队/未派发）。发 /queue 查看；/ledger settle <尾号> confirm 可人工结清。`,
+          ).catch(() => {})
+        }
+      } catch (error) {
+        console.error("[queue] 孤儿巡检失败:", toErrorMessage(error))
+      }
+    }, ORPHAN_SCAN_MS)
   }
 
   // Q2：手动进度查询（本地事件统计，零模型调用）
@@ -561,6 +711,7 @@ export function createBridge(
     watch: watchApi,
     mirror: mirrorApi,
     queue: queueApi,
+    ledger: ledgerApi,
     progress: progressApi,
   }
 
@@ -688,7 +839,7 @@ export function createBridge(
       if (busyUsers.has(ctx.userId) && !claimedContexts.has(ctx)) {
         const duplicateIntent = activeIntents.get(ctx.userId) === intentKey || msgQueue.hasIntent(ctx.userId, intentKey)
         if (duplicateIntent) {
-          settleInflight(ctx.msgId) // 重复意图已有原回合负责，直接结清，禁止恢复时再跑
+          settleInflight(ctx.msgId, undefined, "duplicate-intent") // 重复意图已有原回合负责，直接结清，禁止恢复时再跑
           console.log(`[bridge] 相同意图已在执行/队列，跳过 msgId=${ctx.msgId}`)
           return
         }
@@ -704,14 +855,21 @@ export function createBridge(
         }
         const queued = msgQueue.push(ctx.userId, ctx)
         if (!queued) {
-          if (claimedMsgId) settleInflight(claimedMsgId) // 已满回执即终态，不能留账让启动对账再次执行
-          await notifyUser(ctx, `排队已满（${QUEUE_MAX} 条），请稍候再试或 /cancel 中止当前任务`)
+          if (claimedMsgId) settleInflight(claimedMsgId, undefined, "queue-full") // 已满回执即终态，不能留账让启动对账再次执行
+          console.log(`[queue] reject user=${ctx.userId.slice(0, 8)}… msg=${shortId(ctx.msgId)} reason=full size=${msgQueue.size(ctx.userId)}/${QUEUE_MAX}`)
+          await notifyUser(ctx, `排队已满（${QUEUE_MAX} 条），本条未入队；请稍候再试或 /cancel 中止当前任务`)
           return
         }
+        if (ctx.msgId) {
+          markInflightStage(ctx.msgId, "queued", { queueId: queued.job.id, enqueuedAt: queued.job.enqueuedAt })
+        }
+        console.log(
+          `[queue] enqueue user=${ctx.userId.slice(0, 8)}… qid=${queued.job.id} msg=${shortId(ctx.msgId)} ahead=${queued.ahead} size=${msgQueue.size(ctx.userId)}/${QUEUE_MAX}`,
+        )
         // 入队前已由 claimInflight 落账；drain 重入时回填 sessionId，不重复写账。
         await notifyUser(
           ctx,
-          `已排队 #${queued.job.id}${queued.ahead > 0 ? `（前面还有 ${queued.ahead} 条）` : ""}，当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
+          `已排队 #${queued.job.id}（第 ${queued.ahead + 1} 位${queued.ahead > 0 ? `，前面还有 ${queued.ahead} 条` : ""}），当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
         )
         return
       }
@@ -777,12 +935,15 @@ export function createBridge(
         // 进程中途死亡时启动对账据此恢复。重派回合无真实 msgId，用合成键跟踪。
         trackId = ctx.msgId || `redispatch-${sessionId}-${turnStart}`
         recordInflight({ msgId: trackId, userId: ctx.userId, sessionId, text: content.slice(0, 300), at: Date.now() })
+        markInflightStage(trackId, "dispatched", { sessionId })
+        console.log(`[journal] dispatch user=${ctx.userId.slice(0, 8)}… msg=${shortId(trackId)} sid=${shortId(sessionId)}`)
         const replyText = await client.promptAndWait(sessionId, promptText, {
           files: files.length ? files : undefined,
           // 修复⑧：受领即落台账锚点 + 本地闭合变量（前台超时转后台等待要带上）
           onAccepted: (info) => {
             promptId = info.promptId
             markInflightPromptId(trackId, info.promptId)
+            console.log(`[journal] running msg=${shortId(trackId)} prompt=${shortId(info.promptId)}`)
           },
           onPermission: (req) => perm.waitForDecision(ctx, req, sessionId),
           onPermissionReplied: (d) => {
@@ -809,7 +970,7 @@ export function createBridge(
           // 超长回合可能已超被动窗口：deliver 被动失败自动降级主动，答案不丢
           if (extracted.text) await safeDeliver(ctx, extracted.text)
         }
-        settleInflight(trackId) // R 项：回合处理到终态（答案已投递尝试），销账
+        settleInflight(trackId, undefined, "answered") // R 项：回合处理到终态（答案已投递尝试），销账
       } catch (error) {
         if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
           // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 5 分钟轮询兜底，
@@ -825,7 +986,7 @@ export function createBridge(
           const errText = toErrorMessage(error)
           const rescue = rescueText(classifyProviderError(errText), errText)
           await safeDeliver(ctx, rescue ?? `处理失败：${errText}`)
-          settleInflight(trackId) // R 项：失败反馈已送达 = 终态，销账
+          settleInflight(trackId, undefined, "error") // R 项：失败反馈已送达 = 终态，销账
         }
       } finally {
         if (sessionId) unsubscribeSession(sessionId, ctx.userId) // /watch 若仍挂着则保留订阅
@@ -833,6 +994,11 @@ export function createBridge(
         if (sessionId && !bgWaits.has(sessionId)) mirror.scheduleUnlock(sessionId)
         busyUsers.delete(ctx.userId)
         if (activeIntents.get(ctx.userId) === intentKey) activeIntents.delete(ctx.userId)
+        // 队列完成回执（默认关闭）：只对 drain 重入的条目发，普通消息不刷屏。
+        const finishedQueueId = queueIdOfCtx.get(ctx)
+        if (finishedQueueId !== undefined && QUEUE_RECEIPTS_ENABLED) {
+          await notifyUser(ctx, `队列 #${finishedQueueId} 完成（剩余 ${msgQueue.size(ctx.userId)} 条）`)
+        }
         // Q1：回合结束（成功/失败/转后台）→ 自动执行该用户队列下一条；
         // 转后台等待的会话保持串行——由 bgWait 完成时再 drain（不与前序后台任务并发）
         if (sessionId && !bgWaits.has(sessionId)) void drainQueue(ctx.userId)
@@ -840,7 +1006,7 @@ export function createBridge(
     } catch (error) {
       // 认领后、内层回合兜底之前的异常（如排队附件预下载失败）也必须结清，
       // 否则重启对账会把已反馈失败的消息再执行一次。
-      if (claimedMsgId) settleInflight(claimedMsgId)
+      if (claimedMsgId) settleInflight(claimedMsgId, undefined, "error")
       if (activeIntents.get(ctx.userId) === intentKey) activeIntents.delete(ctx.userId)
       console.error("[bridge] handleMessage failed:", error)
       try {
@@ -853,30 +1019,72 @@ export function createBridge(
 
   // R 项（2026-10-30 重启丢消息事故修复）：启动对账——查在途台账里"已派发未销账"
   // 的回合，按会话历史分类处置：已有答案→补投；仍在执行→重挂后台等待；
-  // 从未到达 opencode→30 分钟内自动重派（超期通知请用户重发）。
-  // 恢复读取必须覆盖原回合，而不是只看最新 20 条；否则长任务/新消息一多就误判 lost 重派。
+  // 从未到达 opencode→窗口内自动重派（超期通知请用户重发）。
+  // 2026-11-05（队列/台账可观测性）：从未进会话的在途账 = 重启前还在排队，
+  // 先按 enqueuedAt/at 重建内存队列（保留 #id 与顺序），不再直接结清丢弃。
   async function recoverInflightRounds(): Promise<void> {
     const pending = pendingInflight()
     if (pending.length === 0) return
     console.log(`[bridge] 启动对账：${pending.length} 条在途消息待恢复`)
+
+    const restoreWindow = redispatchMaxAgeMs()
+    const restorable = new Set<string>()
+    const queueCandidates = pending.filter(
+      (e) => !e.sessionId && !e.promptId && Date.now() - e.at <= restoreWindow,
+    )
+    if (queueCandidates.length > 0) {
+      const byUser = new Map<string, InflightEntry[]>()
+      for (const e of queueCandidates) {
+        const list = byUser.get(e.userId) ?? []
+        list.push(e)
+        byUser.set(e.userId, list)
+      }
+      for (const [userId, list] of byUser) {
+        list.sort((a, b) => (a.enqueuedAt ?? a.at) - (b.enqueuedAt ?? b.at))
+        const jobs = list.map((e) => ({
+          ...(e.queueId !== undefined ? { id: e.queueId } : {}),
+          ctx: { type: "c2c" as const, userId, msgId: e.msgId, content: e.text, timestamp: String(e.at) },
+          text: e.text,
+          enqueuedAt: e.enqueuedAt ?? e.at,
+        }))
+        const restored = msgQueue.restore(userId, jobs)
+        if (restored > 0) {
+          const restoredJobs = msgQueue.list(userId).slice(-restored)
+          for (const job of restoredJobs) {
+            // drain 重入必须跳过重复认领，否则 duplicate-msgid 会把恢复条目静默丢掉。
+            claimedContexts.add(job.ctx)
+            markInflightStage(job.ctx.msgId, "queued", { queueId: job.id, enqueuedAt: job.enqueuedAt })
+            restorable.add(job.ctx.msgId)
+          }
+          console.log(
+            `[queue] restore user=${userId.slice(0, 8)}… count=${restored} window=${Math.round(restoreWindow / 60_000)}m`,
+          )
+          await deliver(
+            ctxForUser(userId),
+            `🔄 重启恢复：${restored} 条排队消息已恢复（发 /queue 查看；/queue clear 可清空）`,
+          )
+        }
+      }
+    }
+
     for (const entry of pending) {
+      if (restorable.has(entry.msgId)) continue
       const ageMs = Date.now() - entry.at
       if (ageMs > INFLIGHT_MAX_AGE_MS) {
-        settleInflight(entry.msgId) // 超 24h：清账不追溯
+        settleInflight(entry.msgId, undefined, "expired") // 超 24h：清账不追溯
         continue
       }
       // 恢复投递走主动通道（原 msgId 的被动窗口早已过期）
       const ctx: MessageContext = { type: "c2c", userId: entry.userId, msgId: "", content: entry.text }
-      // 修复③（2026-11-03）：排队空账治本——sessionId 为空=「从未进过会话」
-      // （忙碌排队阶段重启丢队）。这类账对永远拿 400 永挂（openqq422 五连铁证），
-      // 且按用户重投哲学不得自动重派执行——只清账通知，请用户重发。
+      // 修复③（2026-11-03）：排队空账治本——sessionId 为空=「从未进过会话」。
+      // 2026-11-05：窗口内的已在上方恢复进队列；走到这里的只剩超窗空账，只清账通知。
       if (!entry.sessionId) {
-        settleInflight(entry.msgId)
+        settleInflight(entry.msgId, undefined, "expired")
         await deliver(
           ctx,
-          `⚠️ 重启前队列里有一条消息未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免重复执行不自动重派，需要的话请重发一次`,
+          `⚠️ 重启前队列里有一条消息超过恢复窗口未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免执行陈旧意图未自动重派，需要的话请重发一次`,
         )
-        console.log(`[bridge] 启动对账：排队空账已通知销账 msgId=${entry.msgId}`)
+        console.log(`[bridge] 启动对账：超窗排队空账已通知销账 msgId=${entry.msgId}`)
         continue
       }
       try {
@@ -884,7 +1092,7 @@ export function createBridge(
         const cls = classifyInflight(entry, listJson.data)
         if (cls.kind === "answered") {
           await deliver(ctx, `🔄 重启补投：你之前的消息已有答案\n\n${cls.answer}`)
-          settleInflight(entry.msgId)
+          settleInflight(entry.msgId, undefined, "answered")
           console.log(`[bridge] 启动对账：已补投答案 msgId=${entry.msgId}`)
         } else if (cls.kind === "running") {
           // 跨重启也要保持 QQ 回合同一身份：后台直答完成时，镜像不得再投摘要。
@@ -893,13 +1101,13 @@ export function createBridge(
           startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId, entry.promptId ?? "")
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
-          settleInflight(entry.msgId) // 旧账结清，重派回合走新账（合成 trackId）
+          settleInflight(entry.msgId, undefined, "redispatch") // 旧账结清，重派回合走新账（合成 trackId）
           await deliver(ctx, `🔄 重启恢复：重新处理你之前的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」`)
           void handleMessage(ctx)
           console.log(`[bridge] 启动对账：丢失消息已重派 msgId=${entry.msgId}`)
         } else {
           await deliver(ctx, `⚠️ 此前重启期间丢失一条你的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」（超过自动重派窗口未重发），需要的话请重发一次`)
-          settleInflight(entry.msgId)
+          settleInflight(entry.msgId, undefined, "expired")
           console.log(`[bridge] 启动对账：超期消息仅通知 msgId=${entry.msgId}`)
         }
       } catch (error) {
@@ -915,14 +1123,19 @@ export function createBridge(
     const job = msgQueue.shift(userId)
     if (!job) return
     draining.add(userId)
+    queueIdOfCtx.set(job.ctx, job.id)
+    if (job.ctx.msgId) markInflightStage(job.ctx.msgId, "dispatched", { queueId: job.id })
+    const remain = msgQueue.size(userId)
+    console.log(`[queue] drain-start user=${userId.slice(0, 8)}… qid=${job.id} remain=${remain}`)
     try {
-      await notifyUser(job.ctx, `开始执行队列 #${job.id}`)
+      await notifyUser(job.ctx, `开始执行队列 #${job.id}（剩余 ${remain} 条）`)
       drainReentries.add(job.ctx) // 修复⑦：drain 重入跳过受理回执
       await handleMessage(job.ctx)
     } catch (error) {
       console.error("[bridge] 队列执行失败:", error)
     } finally {
       draining.delete(userId)
+      console.log(`[queue] drain-done user=${userId.slice(0, 8)}… qid=${job.id} remain=${msgQueue.size(userId)}`)
       if (msgQueue.size(userId) > 0 && !busyUsers.has(userId)) void drainQueue(userId)
     }
   }

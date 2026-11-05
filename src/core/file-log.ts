@@ -1,15 +1,29 @@
 // @input:  fs（追加写）
-// @output: installFileLog
-// @pos:    core - 可选文件日志双写（QQ_LOG_FILE 环境变量开启）
+// @output: installFileLog, fileLogStatus
+// @pos:    core - 可选文件日志双写（QQ_LOG_FILE 环境变量开启；2026-11-05 起默认开启）
 //
 // 背景（2026-10-30 清债 P2）：插件拉起的 detached bot 无控制台，bun 子进程 fd
 // 重定向实测不落盘（bot.out.log 0 字节）——改为 bot 进程内 console 双写，
 // 不依赖 spawn 侧 fd 语义，跨运行时（bun/node）确定生效。
 // 轮转：超 5MB 改名 .1（单代备份足够排障）。
+// 2026-11-05：install 返回卸载函数不变；新增 fileLogStatus() 供 /status 展示
+// 「日志最后写入时间」，堵住"日志 17:17 后无写入却无人发现"的观测缺口。
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "fs"
 import { join } from "path"
 
 const ROTATE_BYTES = 5 * 1024 * 1024
+
+interface ActiveLog {
+  path: string
+  lastWriteAt: number
+}
+
+let active: ActiveLog | null = null
+
+/** 当前生效的文件日志（未安装返回 null）。 */
+export function fileLogStatus(): { path: string; lastWriteAt: number } | null {
+  return active ? { ...active } : null
+}
 
 /** console.log/warn/error 双写到文件；返回卸载函数（测试用） */
 export function installFileLog(logPath: string): () => void {
@@ -18,6 +32,8 @@ export function installFileLog(logPath: string): () => void {
   } catch {
     /* 目录已存在或不可建——写时再兜底 */
   }
+  const state: ActiveLog = { path: logPath, lastWriteAt: 0 }
+  active = state
   const write = (level: string, args: unknown[]): void => {
     try {
       if (existsSync(logPath) && statSync(logPath).size > ROTATE_BYTES) {
@@ -25,6 +41,7 @@ export function installFileLog(logPath: string): () => void {
       }
       const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")
       appendFileSync(logPath, `${new Date().toISOString()} [${level}] ${line}\n`, { mode: 0o600 })
+      state.lastWriteAt = Date.now()
     } catch {
       // 日志绝不阻断主流程
     }
@@ -41,5 +58,6 @@ export function installFileLog(logPath: string): () => void {
     console.log = orig.log
     console.warn = orig.warn
     console.error = orig.error
+    if (active === state) active = null
   }
 }

@@ -39,15 +39,23 @@ export function agoLabel(at: number, now = Date.now()): string {
 
 export class MessageQueue {
   private jobs = new Map<string, QueuedJob[]>()
-  private nextId = 1
+  // 票号按用户独立递增（2026-11-05）：全局计数器会让 A 用户看到 #7 而队列只有 1 条；
+  // 票号只增不复用——它是身份/引用键，不是排队位置（位置由视图层单独计算）。
+  private nextIds = new Map<string, number>()
 
   constructor(private limit = 20) {}
+
+  private issueId(userId: string): number {
+    const next = this.nextIds.get(userId) ?? 1
+    this.nextIds.set(userId, next + 1)
+    return next
+  }
 
   /** 入队；满员返回 null（调用方回绝并提示） */
   push(userId: string, ctx: MessageContext): { job: QueuedJob; ahead: number } | null {
     const list = this.jobs.get(userId) ?? []
     if (list.length >= this.limit) return null
-    const job: QueuedJob = { id: this.nextId++, userId, ctx, text: ctx.content, enqueuedAt: Date.now() }
+    const job: QueuedJob = { id: this.issueId(userId), userId, ctx, text: ctx.content, enqueuedAt: Date.now() }
     list.push(job)
     this.jobs.set(userId, list)
     return { job, ahead: list.length - 1 }
@@ -66,6 +74,39 @@ export class MessageQueue {
 
   list(userId: string): readonly QueuedJob[] {
     return this.jobs.get(userId) ?? []
+  }
+
+  /** 按队列编号查单条（/queue drop 与 /ledger 对账用） */
+  find(userId: string, id: number): QueuedJob | undefined {
+    return (this.jobs.get(userId) ?? []).find((job) => job.id === id)
+  }
+
+  /** 队首（drain 前预读，不改变队列） */
+  peek(userId: string): QueuedJob | undefined {
+    return this.jobs.get(userId)?.[0]
+  }
+
+  /**
+   * 重启恢复：按给定顺序重建队列。id 缺省时续接该用户票号，
+   * 显式 id 时同步推进该用户票号，保证后续入队编号不冲突。
+   * 超过上限的部分不恢复，返回实际恢复条数。
+   */
+  restore(
+    userId: string,
+    jobs: Array<{ ctx: MessageContext; text: string; enqueuedAt: number; id?: number }>,
+  ): number {
+    const list = this.jobs.get(userId) ?? []
+    let restored = 0
+    for (const item of jobs) {
+      if (list.length >= this.limit) break
+      const explicit = Number.isInteger(item.id) && (item.id ?? 0) > 0 ? (item.id as number) : 0
+      const id = explicit > 0 ? explicit : this.issueId(userId)
+      if (id >= (this.nextIds.get(userId) ?? 1)) this.nextIds.set(userId, id + 1)
+      list.push({ id, userId, ctx: item.ctx, text: item.text, enqueuedAt: item.enqueuedAt })
+      restored++
+    }
+    if (list.length > 0) this.jobs.set(userId, list)
+    return restored
   }
 
   drop(userId: string, id: number): boolean {

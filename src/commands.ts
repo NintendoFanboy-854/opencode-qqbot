@@ -7,6 +7,7 @@ import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
 import { renderHistory } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
 import { sendLocalFile } from "./core/send-media.js"
+import { fileLogStatus } from "./core/file-log.js"
 
 const SELECTION_TTL_MS = 60_000
 
@@ -26,9 +27,20 @@ export interface MirrorApi {
 // Q1：忙碌队列 API（bridge 实现：FIFO + drain + 控制命令）
 export interface QueueApi {
   list: (userId: string) => string
-  /** 清空队列，返回清掉的条数（/cancel 与 /queue clear 共用） */
+  /** 全量/分页视图（/queue all [页码]） */
+  listAll: (userId: string, page?: number) => string
+  /** /status 摘要行（排队/在途/执行中/孤儿/最近拒绝） */
+  summary: (userId: string) => string
+  /** 清空队列，返回清掉的条数（/cancel 与 /queue clear 共用；同时结清台账） */
   clear: (userId: string) => number
   drop: (userId: string, id: number) => string
+}
+
+// 台账诊断 API（bridge 实现：磁盘台账 + 会话历史对账）
+export interface LedgerApi {
+  view: (userId: string, args: string) => Promise<string>
+  check: (userId: string) => Promise<string>
+  settle: (userId: string, key: string, confirm: boolean) => string
 }
 
 // Q2：手动进度查询 API（bridge 实现：本地事件统计，零模型调用）
@@ -45,6 +57,7 @@ export interface CommandContext {
   watch: WatchApi
   mirror: MirrorApi
   queue: QueueApi
+  ledger: LedgerApi
   progress: ProgressApi
 }
 
@@ -94,6 +107,8 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
       return handleStop(ctx, cmdCtx)
     case "queue":
       return handleQueue(ctx, parsed.args, cmdCtx)
+    case "ledger":
+      return handleLedger(ctx, parsed.args, cmdCtx)
     case "progress":
       return cmdCtx.progress.query(ctx.userId)
     case "status":
@@ -211,19 +226,43 @@ async function handleStop(ctx: MessageContext, cmdCtx: CommandContext): Promise<
   return `已发送停止请求：${session.title ?? session.sessionId}${suffix}`
 }
 
-// Q1：/queue 查看与管理忙碌队列
+// Q1：/queue 查看与管理忙碌队列（2026-11-05：默认视图 join 台账，不再只看内存）
 function handleQueue(ctx: MessageContext, args: string, cmdCtx: CommandContext): string {
-  const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? ""
+  const parts = args.trim().split(/\s+/).filter(Boolean)
+  const sub = parts[0]?.toLowerCase() ?? ""
   if (sub === "clear") {
     const n = cmdCtx.queue.clear(ctx.userId)
     return n > 0 ? `已清空队列（${n} 条）` : "队列本来就是空的"
   }
   if (sub === "drop") {
-    const id = Number(args.trim().split(/\s+/)[1])
+    const id = Number(parts[1])
     if (!Number.isInteger(id) || id <= 0) return "用法：/queue drop <编号>"
     return cmdCtx.queue.drop(ctx.userId, id)
   }
+  if (sub === "all") {
+    const page = Number(parts[1] ?? "1")
+    return cmdCtx.queue.listAll(ctx.userId, Number.isInteger(page) && page > 0 ? page : 1)
+  }
+  if (/^\d+$/.test(sub)) {
+    return cmdCtx.queue.listAll(ctx.userId, Math.max(1, Number(sub)))
+  }
   return cmdCtx.queue.list(ctx.userId)
+}
+
+// 2026-11-05：/ledger——台账诊断（快照 / 对账 / 人工结清）
+async function handleLedger(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
+  const parts = args.trim().split(/\s+/).filter(Boolean)
+  const sub = parts[0]?.toLowerCase() ?? ""
+  if (sub === "check") {
+    return cmdCtx.ledger.check(ctx.userId)
+  }
+  if (sub === "settle") {
+    const key = parts[1] ?? ""
+    const confirm = (parts[2] ?? "").toLowerCase() === "confirm"
+    if (!key) return "用法：/ledger settle <msgId尾号> confirm"
+    return cmdCtx.ledger.settle(ctx.userId, key, confirm)
+  }
+  return cmdCtx.ledger.view(ctx.userId, args)
 }
 
 async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
@@ -233,6 +272,14 @@ async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promis
 
   const openCodeStatus = await getOpenCodeStatus(cmdCtx.client)
   const qqStatus = await getQQStatus(cmdCtx)
+  const log = fileLogStatus()
+  const logLine = log
+    ? (() => {
+        const ageSec = log.lastWriteAt ? Math.round((Date.now() - log.lastWriteAt) / 1000) : -1
+        const stale = ageSec > 300 ? " ⚠️ 日志停滞" : ""
+        return `日志：${log.path} · ${ageSec >= 0 ? `最后写入 ${ageSec}s 前` : "尚未写入"}${stale}`
+      })()
+    : "日志：未启用（QQ_LOG_FILE=off）"
 
   return [
     "OpenCode 状态",
@@ -241,6 +288,8 @@ async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promis
     `会话：${session ? `${session.title ?? "未命名会话"} (${session.sessionId})` : "未创建"}`,
     `模型：${providerId && modelId ? `${providerId} / ${modelId}` : "默认"}`,
     `Agent：${agentId ?? "默认"}`,
+    cmdCtx.queue.summary(ctx.userId),
+    logLine,
   ].join("\n")
 }
 
@@ -513,7 +562,8 @@ export function buildHelpText(): string {
     "/watch <会话ID> - 观察指定会话",
     "/watch off - 停止观察",
     "/progress - 手动进度查询（工具调用/失败统计、在途状态，本地事件源零模型调用）",
-    "/queue - 忙碌队列查看；/queue clear 清空；/queue drop <编号> 定点删除",
+    "/queue - 队列与台账对账视图；/queue all [页码] 全量；/queue clear 清空；/queue drop <编号> 定点删除",
+    "/ledger - 台账快照（在途/孤儿/最近拒绝）；/ledger check 对账会话历史；/ledger settle <尾号> confirm 人工结清",
     "/cancel - 同 /stop：中止当前 AI 运行并清空忙碌队列",
     "/mirror [on|off] - 桌面问答摘要镜像开关（会话轮次完成推送问答摘要）",
     "",

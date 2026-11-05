@@ -1,6 +1,6 @@
 // @input:  fs/path/os（台账落盘）
 // @output: claimInflight, recordInflight, settleInflight, pendingInflight, classifyInflight（纯函数供测试）,
-//          pruneInflightEntries（保留策略纯函数）, newInflightAttemptId,
+//          markInflightStage, listInflightView, pruneInflightEntries（保留策略纯函数）, newInflightAttemptId,
 //          resetInflightJournal（测试用）,
 //          INFLIGHT_MAX_AGE_MS, SETTLED_RETENTION_MS, SETTLED_RETENTION_LIMIT, redispatchMaxAgeMs
 // @pos:    core - 在途台账（重启换代丢消息修复：QQ 消息派发落账、答复送达销账、启动对账）
@@ -31,6 +31,44 @@ export interface InflightEntry {
   fingerprint?: string
   /** 本回合的 prompt 用户消息 id（修复⑧直答归属的回合边界锚点） */
   promptId?: string
+  /**
+   * 可观测细化阶段（2026-11-05 队列/台账可观测性）：
+   * claimed=已受理未入队 | queued=已入队 | dispatched=已派发未落 promptId
+   * running=执行中 | background=后台等待 | settled=已结清。
+   * state 仍是权威二元态；stage 只做诊断，缺失时按 sessionId/promptId 推导。
+   */
+  stage?: InflightStage
+  /** 与内存队列 #id 对齐（重启恢复 FIFO 顺序用） */
+  queueId?: number
+  /** 入队时刻（重启按此排序重建队列） */
+  enqueuedAt?: number
+  /** 最后一次状态变更时刻 */
+  updatedAt?: number
+  /** 结清原因（诊断"为什么没答"） */
+  settleReason?: SettleReason
+  /** 受理/更新所属进程（跨进程归属诊断） */
+  ownerPid?: number
+  /** 最近一次失败摘要（截 200 字） */
+  lastError?: string
+}
+
+export type InflightStage = "claimed" | "queued" | "dispatched" | "running" | "background" | "settled"
+
+export type SettleReason =
+  | "answered"
+  | "error"
+  | "queue-full"
+  | "duplicate-msgid"
+  | "duplicate-intent"
+  | "cancelled"
+  | "dropped"
+  | "expired"
+  | "redispatch"
+  | "manual"
+
+export interface InflightView {
+  inflight: InflightEntry[]
+  settled: InflightEntry[]
 }
 
 /** 生成新的投递代次 ID（bridge 显式新回合/显式重投时调用） */
@@ -181,11 +219,27 @@ export function claimInflightDetailed(entry: Omit<InflightEntry, "state">, opts?
     })
     if (decision !== "ok") return decision
     const attempt = entry.attemptId ?? newInflightAttemptId()
+    const now = Date.now()
     const existing = entries.find((e) => e.msgId === entry.msgId)
     if (existing) {
-      Object.assign(existing, entry, { fingerprint, attemptId: attempt, state: "inflight" as const })
+      Object.assign(existing, entry, {
+        fingerprint,
+        attemptId: attempt,
+        state: "inflight" as const,
+        stage: entry.stage ?? "claimed",
+        updatedAt: now,
+        ownerPid: entry.ownerPid ?? process.pid,
+      })
     } else {
-      entries.push({ ...entry, fingerprint, attemptId: attempt, state: "inflight" as const })
+      entries.push({
+        ...entry,
+        fingerprint,
+        attemptId: attempt,
+        state: "inflight" as const,
+        stage: entry.stage ?? "claimed",
+        updatedAt: now,
+        ownerPid: entry.ownerPid ?? process.pid,
+      })
     }
     return "ok"
   })
@@ -205,20 +259,39 @@ export function claimInflight(entry: Omit<InflightEntry, "state">): boolean {
  */
 export function recordInflight(entry: Omit<InflightEntry, "state">): void {
   mutate((entries) => {
+    const now = Date.now()
     const existing = entries.find((e) => e.msgId === entry.msgId)
     if (existing) {
       if (existing.state === "inflight") {
         if (entry.attemptId && existing.attemptId && entry.attemptId !== existing.attemptId) return
         if (!existing.sessionId && entry.sessionId) existing.sessionId = entry.sessionId
         if (!existing.promptId && entry.promptId) existing.promptId = entry.promptId
+        // 派发落账 = 已进入会话；stage 只前进不回退（queued → dispatched）
+        if (entry.sessionId) existing.stage = existing.stage === "running" || existing.stage === "background" ? existing.stage : "dispatched"
+        existing.updatedAt = now
+        if (!existing.ownerPid) existing.ownerPid = process.pid
         return
       }
       // settled：视为显式重投，重新激活为新在途回合
       const attempt = entry.attemptId ?? newInflightAttemptId()
-      Object.assign(existing, entry, { attemptId: attempt, state: "inflight" as const })
+      Object.assign(existing, entry, {
+        attemptId: attempt,
+        state: "inflight" as const,
+        stage: entry.stage ?? (entry.sessionId ? "dispatched" : "claimed"),
+        updatedAt: now,
+        settleReason: undefined,
+        ownerPid: entry.ownerPid ?? process.pid,
+      })
       return
     }
-    entries.push({ ...entry, attemptId: entry.attemptId ?? newInflightAttemptId(), state: "inflight" as const })
+    entries.push({
+      ...entry,
+      attemptId: entry.attemptId ?? newInflightAttemptId(),
+      state: "inflight" as const,
+      stage: entry.stage ?? (entry.sessionId ? "dispatched" : "claimed"),
+      updatedAt: now,
+      ownerPid: entry.ownerPid ?? process.pid,
+    })
   })
 }
 
@@ -226,14 +299,18 @@ export function recordInflight(entry: Omit<InflightEntry, "state">): void {
  * 销账：答复已送达（或已转入有接管的后台等待/已给用户终态反馈）。
  * 传入 attemptId 时必须 msgId + attemptId 双匹配才销账——settled 重新认领后，
  * 旧代次的迟到 settle 不得把新在途回合误销。返回是否实际销账。
+ * reason 记录"为什么结束"，供 /ledger 区分 answered 与 rejected。
  */
-export function settleInflight(msgId: string, attemptId?: string): boolean {
+export function settleInflight(msgId: string, attemptId?: string, reason: SettleReason = "answered"): boolean {
   return mutate((entries) => {
     const entry = entries.find(
       (e) => e.msgId === msgId && e.state === "inflight" && (!attemptId || !e.attemptId || e.attemptId === attemptId),
     )
     if (!entry) return false
     entry.state = "settled"
+    entry.stage = "settled"
+    entry.settleReason = reason
+    entry.updatedAt = Date.now()
     return true
   })
 }
@@ -243,15 +320,59 @@ export function pendingInflight(): InflightEntry[] {
   return load().filter((e) => e.state === "inflight")
 }
 
+/** 台账快照（/queue 与 /ledger 派生视图的数据源；不做用户过滤） */
+export function listInflightView(): InflightView {
+  const entries = load()
+  return {
+    inflight: entries.filter((e) => e.state === "inflight").sort((a, b) => a.at - b.at),
+    settled: entries.filter((e) => e.state === "settled").sort((a, b) => b.at - a.at),
+  }
+}
+
+/**
+ * 阶段推进（可观测性）：只对在途账生效，stage 只前进不回退。
+ * patch 用于回填 queueId/enqueuedAt/sessionId/promptId/lastError。
+ */
+export function markInflightStage(
+  msgId: string,
+  stage: InflightStage,
+  patch?: Partial<Pick<InflightEntry, "queueId" | "enqueuedAt" | "sessionId" | "promptId" | "lastError">>,
+): boolean {
+  const rank: Record<InflightStage, number> = {
+    claimed: 0,
+    queued: 1,
+    dispatched: 2,
+    running: 3,
+    background: 4,
+    settled: 5,
+  }
+  return mutate((entries) => {
+    const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
+    if (!entry) return false
+    if (!entry.stage || rank[stage] >= rank[entry.stage]) entry.stage = stage
+    if (patch?.queueId !== undefined) entry.queueId = patch.queueId
+    if (patch?.enqueuedAt !== undefined) entry.enqueuedAt = patch.enqueuedAt
+    if (patch?.sessionId && !entry.sessionId) entry.sessionId = patch.sessionId
+    if (patch?.promptId && !entry.promptId) entry.promptId = patch.promptId
+    if (patch?.lastError !== undefined) entry.lastError = patch.lastError.slice(0, 200)
+    entry.updatedAt = Date.now()
+    return true
+  })
+}
+
 /**
  * 回合 prompt 落库后回填 promptId（修复⑧）：后台等待/重启重挂的直答归属
  * 需要「这是哪个回合」的边界锚点，taskId 台账是跨进程唯一可靠载体。
+ * 2026-11-05：同时把 stage 推进到 running（可观测性）。
  */
 export function markInflightPromptId(msgId: string, promptId: string): void {
   if (!promptId) return
   mutate((entries) => {
     const entry = entries.find((e) => e.msgId === msgId && e.state === "inflight")
-    if (entry && !entry.promptId) entry.promptId = promptId
+    if (!entry) return
+    if (!entry.promptId) entry.promptId = promptId
+    entry.stage = "running"
+    entry.updatedAt = Date.now()
   })
 }
 
