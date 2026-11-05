@@ -1,5 +1,6 @@
 // @input:  ../opencode/client, ../qq/types, fs/path/os
-// @output: createPermissionGate, parsePermissionDecision, formatPermissionPrompt, DECISION_LABELS, PERM_PROMPT_TTL_MS
+// @output: createPermissionGate, parsePermissionDecision, formatPermissionPrompt, DECISION_LABELS,
+//          PERM_PROMPT_TTL_MS, classifyApprovalReplyError（纯函数供测试）, ApprovalReplyFailure
 // @pos:    根层/core - 审批域（O7b 2026-10-15 自 bridge.ts 拆出：挂起槽、等待/
 //          裁决、跨重启恢复、自然语言决策解析、菜单格式化、中断态落盘）
 import { existsSync, readFileSync, writeFileSync } from "fs"
@@ -26,6 +27,19 @@ export const DECISION_LABELS: Record<PermissionDecision, string> = {
   once: "允许（本次）",
   always: "总是允许（已存入项目白名单）",
   reject: "拒绝",
+}
+
+/**
+ * 跨重启审批转发失败的分类（纯函数，供单测）。
+ * - expired：404/410——请求已不在服务端（等待超时已被自动拒绝/已裁决），
+ *   用户点的是"重启后恢复的过期副本"，重试无意义，只能重新发起原操作；
+ * - transient：网络错误/5xx 等——可能只是服务端暂时不可达，可稍后重试。
+ * 错误形状来自 opencode/client.ts 的 `OpenCode API {status}: {excerpt}`。
+ */
+export type ApprovalReplyFailure = "expired" | "transient"
+export function classifyApprovalReplyError(error: unknown): ApprovalReplyFailure {
+  const msg = error instanceof Error ? error.message : String(error)
+  return /\bAPI\s+(404|410)\b/.test(msg) ? "expired" : "transient"
 }
 
 // O2（2026-10-15，P2-4a）：审批中断态落盘——重启前挂起的审批重启后仍可
@@ -169,8 +183,20 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
             body: { decision },
           })
           await safeDeliver(entry.ctx, `✅ 审批已跨重启完成（${label}），原会话已继续`)
-        } catch {
-          await safeDeliver(entry.ctx, "⚠️ 审批未能跨重启完成（原请求可能已失效），请重新发起原操作")
+        } catch (error) {
+          // 2026-11-05 用户拍板：失败按类型区分文案——过期副本（点的是旧卡片）明确说
+          // "重新发起"，服务异常才说"稍后重试"，不再一句"可能已失效"糊在一起。
+          if (classifyApprovalReplyError(error) === "expired") {
+            await safeDeliver(
+              entry.ctx,
+              "⚠️ 这条审批已过期：等待超过时限，服务端已自动拒绝（你点的是重启前的旧卡片）。请重新发起原操作，新审批会正常生效",
+            )
+          } else {
+            await safeDeliver(
+              entry.ctx,
+              `⚠️ 审批转发失败（${error instanceof Error ? error.message : String(error)}），请稍后重试；若仍未生效请重新发起原操作`,
+            )
+          }
         }
       })()
       return
