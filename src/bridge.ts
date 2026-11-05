@@ -37,6 +37,7 @@ import {
 } from "./core/permission.js"
 import { truncate } from "./core/util.js"
 import { createDelivery } from "./core/delivery.js"
+import { createNotifySink } from "./core/notify-sink.js"
 import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approval.js"
 import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
@@ -425,6 +426,15 @@ export function createBridge(
 
   // O7d：摘要镜像域门面（订阅/回合标记/延迟解锁/摘要投递全在 core/mirror.ts）
   const mirror = createMirror({ sessions, eventStream, client, lastCtx, safeDeliver, bgWaits, busyUsers })
+
+  // openqq notify 外部入队通道（feature：headless 定时任务结果推送，2026-11-05 外部提案 Part1）：
+  // cron/CI 任意进程经 `openqq notify` 写 ~/.openqq/outbox.json（只入队），bot 进程消费投递。
+  // delivery 全量复用（配额/降级/分条/24h 同文去重）；TTL 过期丢弃；失败退避重试到上限。
+  createNotifySink({
+    config,
+    deliver: (ctx, text) => deliver(ctx, text),
+    ...(process.env.QQ_OUTBOX_FILE ? { filePath: process.env.QQ_OUTBOX_FILE } : {}),
+  })
 
   // L 项（2026-10-30）：表单桥（选择弹窗 A/B/C/D 的 QQ 同步与作答回传）。
   // 与审批共用"每用户单一交互槽"心智：表单挂起时优先消费用户回复。

@@ -4,12 +4,33 @@
 //   无 bun → node dist/openqq-bot.js（发布 bundle，零额外依赖）
 // 应用者 npm i -g 后只有 node 也能跑；开发者有 bun 时始终跑源码。
 // 注意：本文件必须保持纯 JS（无类型标注）——node 用户直接执行它。
+// 2026-11-05 外部提案 Part1 采纳：新增 `openqq notify` 子命令分发（只入队不发送）。
 import { spawnSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { join, dirname } from "node:path"
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
+
+// notify 子命令分发（不改变无参数行为）：CLI 只入队 ~openqq/outbox.json，
+// 发送由 bot 进程 notify-sink 消费；CLI 不联网不取 token 不抢锁。
+const argv = process.argv.slice(2)
+if (argv[0] === "notify") {
+  const notifyArgs = argv.slice(1)
+  const cliDist = join(root, "dist", "notify-cli.js")
+  const cliSrc = join(root, "src", "cli", "notify.ts")
+  const bun = detectBun()
+  if (existsSync(cliDist)) {
+    const r = spawnSync("node", [cliDist, ...notifyArgs], { stdio: "inherit" })
+    process.exit(r.status ?? 1)
+  }
+  if (bun && existsSync(cliSrc)) {
+    const r = spawnSync(bun, ["run", cliSrc, ...notifyArgs], { stdio: "inherit" })
+    process.exit(r.status ?? 1)
+  }
+  console.error("[openqq] notify CLI 不存在（包安装不完整，请重装 @linjz/opencode-qqbot）")
+  process.exit(1)
+}
 
 // bun 探测要覆盖全形态：npm 装的 bun 在 PATH 上只有 bun.ps1（CreateProcess 起不来），
 // 真正可执行体在 npm\bun 包内 bin\bun.exe；官方安装则直接是 bun/bun.exe。

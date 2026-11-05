@@ -20,7 +20,7 @@ export interface Config {
 }
 
 const CONFIG_DIR = join(homedir(), ".openqq")
-const ENV_FILE = join(CONFIG_DIR, ".env")
+export const ENV_FILE = join(CONFIG_DIR, ".env")
 
 function askTwo(q1: string, q2: string): Promise<[string, string]> {
   return new Promise((resolve, reject) => {
@@ -76,7 +76,7 @@ export async function ensureConfig(): Promise<void> {
   process.env.QQ_APP_SECRET = appSecret
 }
 
-function loadEnvFile(path: string): void {
+export function loadEnvFile(path: string): void {
   const content = readFileSync(path, "utf-8")
   for (const line of content.split("\n")) {
     const trimmed = line.trim()
