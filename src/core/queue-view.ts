@@ -63,6 +63,8 @@ export interface QueueView {
   running?: ViewEntry
   /** 后台等待的条目 */
   background: ViewEntry[]
+  /** 已派发但当前无运行标记的条目（可能刚结束未销账/进程换代间隙） */
+  dispatchedOthers: ViewEntry[]
   /** 孤儿：台账在途、不在队列、不在运行/后台、超过阈值 */
   orphan: ViewEntry[]
   /** 幽灵：队列有、台账无 */
@@ -78,6 +80,7 @@ export interface QueueView {
     inflight: number
     running: number
     background: number
+    dispatched: number
     claimed: number
     orphan: number
     ghost: number
@@ -214,6 +217,7 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
 
   const claimed: ViewEntry[] = []
   const background: ViewEntry[] = []
+  const dispatchedOthers: ViewEntry[] = []
   const orphan: ViewEntry[] = []
   let running: ViewEntry | undefined
   let dispatchedWithoutRuntime = 0
@@ -236,9 +240,9 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
       continue
     }
     if (hasDispatched) {
-      // 有会话但当前无运行标记：可能刚结束未销账，按已派发展示并告警。
+      // 有会话但当前无运行标记：可能刚结束未销账/进程换代间隙，按已派发展示并告警。
       dispatchedWithoutRuntime++
-      background.push(toViewEntry(entry, "dispatched"))
+      dispatchedOthers.push(toViewEntry(entry, "dispatched"))
       continue
     }
     if (now - entry.at > orphanMs) {
@@ -264,7 +268,7 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
     .slice(0, 20)
     .map((e) => toViewEntry(e, "settled"))
 
-  const inflightEntries = [...queued, ...claimed, ...background, ...(running ? [running] : []), ...orphan].sort(
+  const inflightEntries = [...queued, ...claimed, ...background, ...dispatchedOthers, ...(running ? [running] : []), ...orphan].sort(
     (a, b) => a.at - b.at,
   )
 
@@ -291,6 +295,7 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
     claimed,
     ...(running ? { running } : {}),
     background,
+    dispatchedOthers,
     orphan,
     ghost,
     rejected,
@@ -301,6 +306,7 @@ export function deriveQueueView(input: DeriveQueueViewInput): QueueView {
       inflight: inflight.length,
       running: running ? 1 : 0,
       background: background.length,
+      dispatched: dispatchedOthers.length,
       claimed: claimed.length,
       orphan: orphan.length,
       ghost: ghost.length,
@@ -386,6 +392,10 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
 
   if (view.counts.background > 0) {
     lines.push(`后台等待 ${view.counts.background} 条（完成会自动回传）`)
+  }
+
+  if (view.counts.dispatched > 0) {
+    lines.push(`已派发 ${view.counts.dispatched} 条（等待接续执行）`)
   }
 
   if (view.counts.orphan > 0) {
