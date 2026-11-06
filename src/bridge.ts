@@ -579,6 +579,37 @@ export function createBridge(
     },
   }
 
+  // DEF-qqbot-20261105-P1 防线 B（2026-11-07）：/cancel 彻底复位。abort 只杀
+  // opencode 侧回合；bot 侧悬挂的前台等待与残留台账账仍冻结 drain（11-06
+  // 复现：cancel 后队列死锁 12 分钟直至重启）。此处统一：清队列 + abort +
+  // 杀后台等待 + 结清该用户全部在途账 + 立即 drain 拉起。
+  async function stopAllForUser(userId: string): Promise<{ cleared: number; title: string | undefined }> {
+    const cleared = queueApi.clear(userId)
+    const session = sessions.getSession(userId)
+    if (session) {
+      bgWaits.get(session.sessionId)?.cancel()
+      try {
+        await client.session.abort({ path: { id: session.sessionId } })
+      } catch {
+        /* 悬挂回合可能已自行终结，abort 失败不阻断复位 */
+      }
+    }
+    let settled = 0
+    for (const e of pendingInflight()) {
+      if (e.userId !== userId) continue
+      settleInflight(e.msgId, undefined, "cancelled")
+      settled++
+    }
+    // 内存忙标志复位：悬挂的前台等待不退出时 busyUsers/draining 永久挡 drain
+    // （11-06 实证 cancel 后死锁 12 分钟）。复位后 opencode 会话串行约束仍在
+    // （服务端排队），bot 侧账幂等，不会出现重复投递。
+    busyUsers.delete(userId)
+    draining.delete(userId)
+    if (settled > 0) console.log(`[bridge] stopAll 结清在途账 user=${userId.slice(0, 8)}… count=${settled}`)
+    void drainQueue(userId)
+    return { cleared, title: session?.title }
+  }
+
   // 台账诊断命令实现（/ledger /ledger check /ledger settle）
   const ledgerApi: LedgerApi = {
     view: async (userId: string, args: string): Promise<string> => {
@@ -722,6 +753,7 @@ export function createBridge(
     queue: queueApi,
     ledger: ledgerApi,
     progress: progressApi,
+    stopAll: stopAllForUser,
   }
 
   // R2 修复批次启动项（2026-10-14）

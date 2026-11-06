@@ -59,6 +59,8 @@ export interface CommandContext {
   queue: QueueApi
   ledger: LedgerApi
   progress: ProgressApi
+  /** P1 防线 B：/cancel 彻底复位（清队列+abort+杀后台等待+结清在途账+drain） */
+  stopAll: (userId: string) => Promise<{ cleared: number; title: string | undefined }>
 }
 
 export interface PendingSelection {
@@ -215,15 +217,14 @@ async function handleSend(ctx: MessageContext, args: string, cmdCtx: CommandCont
 }
 
 async function handleStop(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
-  const session = cmdCtx.sessions.getSession(ctx.userId)
-  const cleared = cmdCtx.queue.clear(ctx.userId) // Q1：/cancel 同时清队（"停"=全停）
+  const hadSession = !!cmdCtx.sessions.getSession(ctx.userId)
+  const { cleared, title } = await cmdCtx.stopAll(ctx.userId)
   const suffix = cleared > 0 ? `，队列中的 ${cleared} 条已清空` : ""
-  if (!session) {
+  if (!hadSession && !title) {
     return cleared > 0 ? `当前没有会话可停止${suffix}` : "当前还没有会话可停止"
   }
-
-  await cmdCtx.client.session.abort({ path: { id: session.sessionId } })
-  return `已发送停止请求：${session.title ?? session.sessionId}${suffix}`
+  const target = title?.trim() ? title : cmdCtx.sessions.getSession(ctx.userId)?.sessionId ?? ""
+  return `已发送停止请求：${target}${suffix}`
 }
 
 // Q1：/queue 查看与管理忙碌队列（2026-11-05：默认视图 join 台账，不再只看内存）
