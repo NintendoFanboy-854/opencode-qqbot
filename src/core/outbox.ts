@@ -106,7 +106,8 @@ export interface Outbox {
   recover(options?: { ignoreLeases?: boolean; maxAttempts?: number }): Promise<OutboxRecoverResult>
   /** 扫描 pending/failed；默认只处理 nextAttemptAt 已到期的项。 */
   flush(options?: OutboxFlushOptions): Promise<OutboxEntry[]>
-  start(options?: { recover?: boolean }): Promise<void>
+  /** start 的 maxAttempts 会透传 recover/flush：失败达到该次数后保持 failed，不再无限重试。 */
+  start(options?: { recover?: boolean; maxAttempts?: number }): Promise<void>
   /** 停止定时器，不等待正在发送的 handler；需要等待时调用 drain。 */
   stop(): void
   /** 等待当前及等待期间新启动的本实例发送全部结束。 */
@@ -494,16 +495,16 @@ export function createOutbox(options: OutboxOptions = {}): Outbox {
     dispatch,
     recover,
     flush,
-    async start(startOptions = {}) {
+    async start(startOptions: { recover?: boolean; maxAttempts?: number } = {}) {
       stopped = false
-      if (startOptions.recover !== false) await recover()
+      if (startOptions.recover !== false) await recover({ maxAttempts: startOptions.maxAttempts })
       if (pollIntervalMs === 0 || timer) return
       timer = setInterval(() => {
         if (stopped) return
-        void flush().catch(() => { /* 下轮继续；失败已持久化 */ })
+        void flush({ maxAttempts: startOptions.maxAttempts }).catch(() => { /* 下轮继续；失败已持久化 */ })
       }, pollIntervalMs)
       timer.unref?.()
-      void flush().catch(() => { /* 下轮继续 */ })
+      void flush({ maxAttempts: startOptions.maxAttempts }).catch(() => { /* 下轮继续 */ })
     },
     stop() {
       stopped = true

@@ -977,7 +977,11 @@ export function createBridge(
           },
           onPermission: (req) => perm.waitForDecision(ctx, req, sessionId),
           onPermissionReplied: (d) => {
-            void safeDeliver(ctx, `已${DECISION_LABELS[d]}，AI 将继续执行…`)
+            // 拒绝与允许的后续语义不同：拒绝=该动作不执行，回合继续走其余步骤。
+            const text = d === "reject"
+              ? "已拒绝，该操作不会执行；AI 将继续其余步骤"
+              : `已${DECISION_LABELS[d]}，AI 将继续执行…`
+            void safeDeliver(ctx, text)
           },
           onPermissionConflict: () => {
             // 债务D2：请求已被其他端（桌面/自动规则）先处理——不是错误，任务继续。
