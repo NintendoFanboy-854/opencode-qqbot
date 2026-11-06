@@ -167,8 +167,15 @@ function resetResumeState(state: GatewayState): void {
   clearGatewayState()
 }
 
+// QQ 表情实体剥离（2026-11-06 UAT 实证 DEF-P1）：`<faceType=1,faceId="0",ext="…">`
+// 形式的内嵌表情若不去除，会让「[表情]/model …」整体落入聊天分支（命令失效），
+// 且原始实体标签进入 prompt/台账。剥离后纯表情消息为空文本，按空白消息规则吞掉。
+function stripFaceEntities(content: string): string {
+  return content.replace(/<faceType=\d+,[^>]*>/g, "")
+}
+
 function normalizeMessageContent(content: string): string {
-  return content.replace(/\r\n/g, "\n").trim()
+  return stripFaceEntities(content.replace(/\r\n/g, "\n")).trim()
 }
 
 function stripGroupAtPrefix(content: string): string {

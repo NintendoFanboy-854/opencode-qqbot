@@ -569,7 +569,7 @@ export function buildHelpText(): string {
     "",
     "权限审批（AI 请求权限时）：",
     "回复「允许」= 本次允许｜「总是」= 总是允许｜「拒绝」= 拒绝",
-    "也可用 /allow /always /deny（30 分钟无响应自动拒绝）",
+    "（30 分钟无响应自动拒绝）",
   ].join("\n")
 }
 

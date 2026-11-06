@@ -24,6 +24,7 @@ export interface NotifyCliResult {
   chars: number
   truncated: boolean
   dryRun: boolean
+  json: boolean
   reason?: string
 }
 
@@ -105,7 +106,7 @@ export async function runNotifyCli(
       "  --dry-run / --json   不入队 / 机器可读输出",
     ].join("\n")
     console.log(help)
-    return { ok: true, queued: false, id: "", user: "", chars: 0, truncated: false, dryRun: true, reason: "help" }
+    return { ok: true, queued: false, id: "", user: "", chars: 0, truncated: false, dryRun: true, json: parsed.json, reason: "help" }
   }
   // .env 注入：bot 进程入口已做；CLI 独立进程需自行加载（ALLOWED_USERS/凭据同源单点）
   if (!options.env && existsSync(ENV_FILE)) loadEnvFile(ENV_FILE)
@@ -125,7 +126,7 @@ export async function runNotifyCli(
   const id = parsed.id || `notify-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const filePath = options.filePath ?? defaultOutboxPath()
   if (parsed.dryRun) {
-    return { ok: true, queued: false, id, user, chars: content.length, truncated: content.length !== raw.length, dryRun: true }
+    return { ok: true, queued: false, id, user, chars: content.length, truncated: content.length !== raw.length, dryRun: true, json: parsed.json }
   }
   const ttlHours =
     parsed.ttlHours ?? Number(process.env.QQ_NOTIFY_TTL_HOURS ?? 24)
@@ -141,7 +142,7 @@ export async function runNotifyCli(
     sessionId: "",
     nextAttemptAt,
   })
-  return { ok: true, queued: true, id: entry.id, user, chars: content.length, truncated: content.length !== raw.length, dryRun: false }
+  return { ok: true, queued: true, id: entry.id, user, chars: content.length, truncated: content.length !== raw.length, dryRun: false, json: parsed.json }
 }
 
 /** bin/openqq.js 入口：返回进程退出码（0=已入队；1=参数/配置错误）。 */
@@ -149,7 +150,13 @@ export async function main(argv: readonly string[]): Promise<number> {
   try {
     const result = await runNotifyCli(argv)
     if (result.reason === "help") return 0
-    if (result.queued && !result.dryRun) console.log(`[notify] 已入队 id=${result.id} user=${result.user} chars=${result.chars}${result.truncated ? "（已截断）" : ""}`)
+    if (result.json) {
+      console.log(JSON.stringify(result))
+    } else if (result.queued && !result.dryRun) {
+      console.log(`[notify] 已入队 id=${result.id} user=${result.user} chars=${result.chars}${result.truncated ? "（已截断）" : ""}`)
+    } else if (result.dryRun) {
+      console.log(`[notify] dry-run：将入队 user=${result.user} chars=${result.chars}${result.truncated ? "（已截断）" : ""}`)
+    }
     return result.ok ? 0 : 1
   } catch (error) {
     console.error(`[notify] 入队失败：${error instanceof Error ? error.message : String(error)}`)

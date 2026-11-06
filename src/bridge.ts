@@ -1024,7 +1024,9 @@ export function createBridge(
             }
           }
           // 超长回合可能已超被动窗口：deliver 被动失败自动降级主动，答案不丢
-          if (extracted.text) await safeDeliver(ctx, extracted.text)
+          // 直答出口统一脱敏（DEF-qqbot-20261106-2）：与 history/mirror/form 同一脱敏器，
+          // 防 AI 复述的密钥/令牌经直答气泡明文外泄。
+          if (extracted.text) await safeDeliver(ctx, redactSecrets(extracted.text))
         }
         settleInflight(trackId, undefined, "answered") // R 项：回合处理到终态（答案已投递尝试），销账
       } catch (error) {
