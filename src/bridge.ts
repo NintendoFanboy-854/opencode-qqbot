@@ -831,10 +831,12 @@ export function createBridge(
         return
       }
 
-      // L 项：表单作答消费（选择弹窗 A/B/C/D）——有挂起表单时优先于命令/普通消息。
-      // 文字"允许"与表单答案的歧义：parsePermissionDecision 先行的同时要求存在
-      // 待审权限才会消费；表单槽独立判断，互不串线。
-      if (formBridge.tryResolveText(ctx.userId, content)) {
+      // L 项：表单作答消费（选择弹窗 A/B/C/D）。命令一律放行——表单挂起期间
+      // /queue /cancel 等管理命令不得被表单吞掉（DEF-qqbot-20261106-P3：表单
+      // pending 曾把全部命令当答案消费，统一回「没看懂」且会话失能数分钟）。
+      // 文字"允许"与表单答案的歧义：parsePermissionDecision 先行且要求存在
+      // 待审权限才会消费；表单槽只消费非命令输入，互不串线。
+      if (!isCommand(content) && formBridge.tryResolveText(ctx.userId, content)) {
         releaseClaimed("answered")
         return
       }

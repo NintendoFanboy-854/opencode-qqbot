@@ -220,7 +220,12 @@ export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: 
   }
   return {
     anchored: true,
-    hasIdle: boundary.some((m) => m.type === "idle"),
+    // 防线 A（2026-11-07，DEF-qqbot-20261105-P1 根因钉死）：共享会话串行执行时，
+    // 回合完成不产生 idle（idle 只在会话整体空转时产生）——桌面注入的下一回合
+    // 紧邻排队会让本回合边界内永无 idle，bot 悬挂至 30 分钟超时（11-06 实证：
+    // 15 分钟悬挂 + cancel 后 drain 死锁链 + 重启误重挂 24h）。boundary 后出现
+    // 下一 user 消息 = 本回合已被接替终结，与 idle 等价判定为 done。
+    hasIdle: boundary.some((m) => m.type === "idle") || end < ordered.length,
     text,
   }
 }
@@ -448,7 +453,12 @@ export function createClient(baseUrl: string): OpencodeClient {
           }
         }
 
-        const listJson = await json(await req(`/session/${sessionId}/message`))
+        // DEF-qqbot-20261105-P1 防线 A 配套（2026-11-07）：裸 /message 默认只回
+        // 50 条——长会话里占回合之后的 idle/下一 user 证据被窗口截断，回合
+        // 完成却判不出 done，悬挂至 30 分钟超时（11-07 实证 6 分钟悬挂+完整
+        // 消息链取证）。显式 limit=200 扩大判定窗口（与 fetchRecoveryMessages
+        // 同档；极端长会话由防线 A 的「下一 user 接替」判据兜住边界）。
+        const listJson = await json(await req(`/session/${sessionId}/message?limit=200`))
         const msgs: SessionMessage[] = listJson?.data ?? []
         // Completion = the idle marker of THIS turn (修复⑧ 回合边界归属)。
         // Tool-using turns emit several assistant messages (reasoning+tool) before
