@@ -99,6 +99,13 @@ export class SessionManager {
     return this.sessions.get(userId)
   }
 
+  /** 仅登记映射（不创建远端会话）：ACP 迁移用——会话由 ACP session/new 创建。 */
+  adopt(userId: string, sessionId: string, title?: string): void {
+    const prev = this.sessions.get(userId)
+    this.sessions.set(userId, { ...prev, sessionId, ...(title !== undefined ? { title } : {}) })
+    this.saveSessions()
+  }
+
   // 枚举全部映射（摘要镜像订阅、会话→用户反查用）
   all(): Array<{ userId: string; sessionId: string }> {
     return [...this.sessions.entries()].map(([userId, s]) => ({ userId, sessionId: s.sessionId }))
