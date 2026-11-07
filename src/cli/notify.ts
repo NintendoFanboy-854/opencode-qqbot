@@ -117,7 +117,9 @@ export async function runNotifyCli(
     throw new Error(
       allowedUsers.length === 0
         ? "ALLOWED_USERS 为空——fail-closed 不允许无名单入队（先在 ~/.openqq/.env 配置）"
-        : "多用户名单必须用 --user <openid> 显式指定收件人",
+        : parsed.user
+          ? `收件人不在名单：${parsed.user}（ALLOWED_USERS 共 ${allowedUsers.length} 项，--user 必须精确命中；请核对 openid）`
+          : "多用户名单必须用 --user <openid> 显式指定收件人",
     )
   }
   const raw = readBody(parsed)

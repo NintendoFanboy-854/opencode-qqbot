@@ -68,8 +68,9 @@ export interface PromptAndWaitOptions extends PromptOptions {
   onPermission?: (req: PermissionRequest) => Promise<PermissionDecision>
   // reply POST 成功后回调（确认消息在服务端受理后再发，避免误导）
   onPermissionReplied?: (decision: PermissionDecision) => void
-  // reply 404 = 请求已在其他端（桌面）被处理：不致命，任务继续，仅需提示
-  onPermissionConflict?: () => void
+  // reply 404 = 请求已在其他端（桌面/引擎自动放行）被处理：不致命，任务继续。
+  // 2026-11-07：回调带裁决值——「拒绝」遇 404 说明动作可能已执行，须告警（DEF-qqbot-20261107-1）。
+  onPermissionConflict?: (decision: PermissionDecision) => void
 }
 
 export interface MessagePart {
@@ -470,7 +471,7 @@ export function createClient(baseUrl: string): OpencodeClient {
               })
               if (replyRes.status === 404) {
                 // 债务D2：请求已被其他端（桌面）先处理——不是错误，任务继续
-                options?.onPermissionConflict?.()
+                options?.onPermissionConflict?.(decision)
               } else {
                 await json(replyRes)
                 options?.onPermissionReplied?.(decision)

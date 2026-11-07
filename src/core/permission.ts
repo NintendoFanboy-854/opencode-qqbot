@@ -1,6 +1,6 @@
 // @input:  ../opencode/client, ../qq/types, fs/path/os
 // @output: createPermissionGate, parsePermissionDecision, formatPermissionPrompt, DECISION_LABELS,
-//          PERM_PROMPT_TTL_MS, classifyApprovalReplyError（纯函数供测试）, ApprovalReplyFailure
+//          PERM_PROMPT_TTL_MS, classifyApprovalReplyError, formatPermissionConflictNotice（纯函数供测试）, ApprovalReplyFailure
 // @pos:    根层/core - 审批域（O7b 2026-10-15 自 bridge.ts 拆出：挂起槽、等待/
 //          裁决、跨重启恢复、自然语言决策解析、菜单格式化、中断态落盘）
 import { existsSync, readFileSync, writeFileSync } from "fs"
@@ -27,6 +27,17 @@ export const DECISION_LABELS: Record<PermissionDecision, string> = {
   once: "允许（本次）",
   always: "总是允许（已存入项目白名单）",
   reject: "拒绝",
+}
+
+/**
+ * 拒绝裁决遇到「他端已处理（404）」时的用户告警（纯函数，供单测）。
+ * 2026-11-07 DEF-qqbot-20261107-1：引擎 ask fail-open 下，用户点「拒绝」时
+ * 操作可能已被服务端先行放行并执行。此时静默继续=用户误以为已阻断，
+ * 必须给出明确告警；允许类冲突仍走 10 分钟保险网，不在此处噪音。
+ */
+export function formatPermissionConflictNotice(decision: PermissionDecision): string | null {
+  if (decision !== "reject") return null
+  return "⚠️ 已收到「拒绝」，但服务端在该裁决前已放行此操作（引擎 ask fail-open），命令可能已执行。本条结果请勿视为已授权；若为破坏性命令请立即核对现场。"
 }
 
 /**

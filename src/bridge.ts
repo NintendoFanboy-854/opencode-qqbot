@@ -37,6 +37,7 @@ import {
   createPermissionGate,
   parsePermissionDecision,
   formatPermissionPrompt,
+  formatPermissionConflictNotice,
   DECISION_LABELS,
 } from "./core/permission.js"
 import { truncate } from "./core/util.js"
@@ -71,7 +72,7 @@ import { messageFingerprint } from "./core/inbound-dedupe.js"
 import { extractSendFileMarkers, sendLocalFile } from "./core/send-media.js"
 import type { InteractionEvent } from "./qq/types.js"
 // O7b：解析/格式化保持经 bridge 再导出——单测与既有调用方导入路径不变
-export { parsePermissionDecision, formatPermissionPrompt } from "./core/permission.js"
+export { parsePermissionDecision, formatPermissionPrompt, formatPermissionConflictNotice } from "./core/permission.js"
 
 // E 闲置回收纯函数（导出供测试，2026-10-29）：返回应回收的闲置会话 id——
 // 超过 idleMs 无活动且未被 /watch 显式盯住的会话。
@@ -1030,12 +1031,16 @@ export function createBridge(
               : `已${DECISION_LABELS[d]}，AI 将继续执行…`
             void safeDeliver(ctx, text)
           },
-          onPermissionConflict: () => {
+          onPermissionConflict: (decision) => {
             // 债务D2：请求已被其他端（桌面/自动规则）先处理——不是错误，任务继续。
             // 2026-11-05 实证修正：立即告警是净噪音（用户点击后任务正常完成仍收到
             // "状态不明请重发"的恐吓文案）。改为 10 分钟零进展保险网——届时会话仍
             // 无任何新消息才告警；任务正常产出时保持安静。
-            console.log(`[bridge] 审批冲突（他端已处理），任务继续 msgId=${shortId(ctx.msgId)}`)
+            // 2026-11-07 例外（DEF-qqbot-20261107-1）：用户点了「拒绝」却 404 =
+            // 引擎先放行后执行，必须立刻明说，不能静默（否则用户误以为已阻断）。
+            console.log(`[bridge] 审批冲突（他端已处理），任务继续 msgId=${shortId(ctx.msgId)} decision=${decision}`)
+            const notice = formatPermissionConflictNotice(decision)
+            if (notice) void safeDeliver(ctx, notice)
             const conflictAt = Date.now()
             setTimeout(() => {
               void (async () => {
