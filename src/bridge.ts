@@ -10,7 +10,7 @@ import type { MessageContext } from "./qq/types.js"
 import { getAccessToken, sendC2CInputNotify, sendC2CMessage, sendGroupMessage } from "./qq/api.js"
 import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } from "./qq/media.js"
 import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
-import { collectReplyText, turnStateOf } from "./opencode/client.js"
+import { collectReplyText, SupersededError, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
@@ -296,14 +296,17 @@ export function createBridge(
       return { done: turn.hasIdle, text: turn.text }
     }
 
-    async function finish(kind: "done" | "giveup"): Promise<void> {
+    async function finish(kind: "done" | "giveup" | "superseded"): Promise<void> {
       if (cancelled || finished) return
       // 修复⑧防早交：SSE 的 execution.succeeded / 别回合 idle 可能唬人——
       // promptId 锚点可用时先核实本回合是否真的有 idle 终结标记。
+      // DEF-qqbot-20261107-P2：核实同时检查「被同会话新输入接管」——SSE 完成事件
+      // 落在死回合上时改按被打断终态结算，不交付「后台任务完成」假结果。
       if (kind === "done" && promptId) {
         try {
           const probe = await client.session.messages({ path: { id: sessionId } })
           const turn = turnStateOf(probe?.data ?? [], promptId, baseline)
+          if (turn.anchored && turn.superseded) return finish("superseded")
           if (turn.anchored && !turn.hasIdle) {
             console.log(`[bridge] 忽略他回合完成事件（本后台回合尚未结束）session=${sessionId}`)
             return
@@ -315,10 +318,17 @@ export function createBridge(
       finished = true
       // R 项：先销账再清理——cleanup 对未完成（被取代）路径按 superseded 结清，
       // 顺序必须账清在前，否则原因会被 superseded 覆盖（settle 幂等，后写不生效）。
-      if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : "expired")
+      if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : kind === "giveup" ? "expired" : "superseded")
       cleanup()
       // Q1：后台等待终态 → 放行该用户队列（此前为串行而挂起）
       void drainQueue(ctx.userId)
+      if (kind === "superseded") {
+        // DEF-qqbot-20261107-P2：后台等到的回合已被同会话新输入接管——任务已死，
+        // 明确交代而非沉默到 24 小时 giveup。
+        console.log(`[bridge] 后台回合被同会话新输入接管（superseded）session=${sessionId}`)
+        await safeDeliver(ctx, "⚠️ 后台任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+        return
+      }
       if (kind === "giveup") {
         await safeDeliver(ctx, "⚠️ 后台任务 24 小时仍未完成，停止自动跟进；结果可随时用 /history 查询")
         return
@@ -378,7 +388,10 @@ export function createBridge(
           ).catch(() => {})
         }
 
-        if (turn.hasIdle) {
+        if (turn.superseded) {
+          // DEF-qqbot-20261107-P2：死回合立即按被打断终态结算（交付+销账在 finish）
+          await finish("superseded")
+        } else if (turn.hasIdle) {
           await finish("done")
         }
       } catch (error) {
@@ -1064,7 +1077,15 @@ export function createBridge(
         }
         settleInflight(trackId, undefined, "answered") // R 项：回合处理到终态（答案已投递尝试），销账
       } catch (error) {
-        if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
+        if (error instanceof SupersededError) {
+          // DEF-qqbot-20261107-P2：同会话新输入（桌面端/他端直注）接管了本回合——
+          // runner 接管语义下本回合已被打断且不会有正文。给用户可见交代并按
+          // superseded 销账：不转后台（任务已死，「继续执行」是谎言）、不占位符、
+          // 不挂 30 分钟超时。账本结清后 finally 正常 drain 队列。
+          console.log(`[bridge] 回合被同会话新输入接管（superseded）msg=${shortId(trackId)} sid=${shortId(sessionId)}`)
+          await safeDeliver(ctx, "⚠️ 上一条任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+          settleInflight(trackId, undefined, "superseded")
+        } else if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
           // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 5 分钟轮询兜底，
           // 最长 24 小时），完成时经 deliver 被动/主动回传 —— 12 小时长任务的答案也不丢。
           // R 项：不销账——bgWait 完成投递时才销（完成前死亡由启动对账接管）。

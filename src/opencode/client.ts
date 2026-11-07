@@ -170,6 +170,19 @@ export interface TurnState {
   hasIdle: boolean
   /** 本回合（或旧判据窗口内）最终 assistant 正文；无正文为空串 */
   text: string
+  /** DEF-qqbot-20261107-P2：本回合已被同会话新输入接管（runner 接管语义，
+   *  回合已死，idle/正文永远不会到来）；前台/后台等待方据此按「被打断」终态结算 */
+  superseded: boolean
+}
+
+/** DEF-qqbot-20261107-P2（2026-11-07）：本回合被同会话新输入接管。
+ *  前台/后台等待方捕获后给用户可见交代并按 superseded 销账——不等 30 分钟超时、
+ *  不谎称「转后台继续执行」、不再交付占位符。 */
+export class SupersededError extends Error {
+  constructor(readonly sessionId: string) {
+    super(`superseded: 会话 ${sessionId} 的回合被同会话新输入接管`)
+    this.name = "SupersededError"
+  }
 }
 
 export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: number): TurnState {
@@ -194,7 +207,7 @@ export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: 
   if (userIdx < 0) {
     // 回落旧判据：行为与 collectReplyText 时代一致，不引入新风险
     const idle = msgs.find((x) => x.type === "idle" && (x.time?.created ?? 0) >= baseline)
-    return { anchored: false, hasIdle: Boolean(idle), text: collectReplyText(msgs, baseline) }
+    return { anchored: false, hasIdle: Boolean(idle), text: collectReplyText(msgs, baseline), superseded: false }
   }
   let end = ordered.length
   for (let i = userIdx + 1; i < ordered.length; i++) {
@@ -224,10 +237,27 @@ export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: 
   // (AI 未返回内容) 且丢失真实答案（11-07 10:16 实证）。正文在=回合实质已完，
   // 接替判据才安全；正文空则继续等 idle/正文。
   const nextTurnStarted = end < ordered.length && Boolean(text)
+  // DEF-qqbot-20261107-P2（11-07 10:16/10:29 实证 ×2）：OpenCode V2 runner 对忙会话的
+  // 新 /prompt 是「接管」语义——新 user 行受理即在途回合被 打断（消息链实证：assistant
+  // finish=tool_calls 后无第二步，死回合）。防线 A 守卫只防早交占位符，防不了「等一个
+  // 永远不会来的 idle/正文」：死回合会挂到前台 30 分钟超时，转后台还谎称任务继续执行。
+  // 判定口径：边界内无正文、无 idle（回合未完），但边界外（下一条 user 行之后）已出现
+  // assistant/idle 活动 → runner 已在推进后续回合，本回合死亡。正文已落库或本回合 idle
+  // 已现时不适用（superseded 仅在 !text 下计算，正常终结维持原判定）。
+  let superseded = false
+  if (!text && end < ordered.length) {
+    const lastBoundaryCreated = boundary.length
+      ? (boundary[boundary.length - 1].time?.created ?? 0)
+      : (ordered[userIdx].time?.created ?? 0)
+    superseded = ordered
+      .slice(end + 1)
+      .some((m) => (m.type === "assistant" || m.type === "idle") && (m.time?.created ?? 0) > lastBoundaryCreated)
+  }
   return {
     anchored: true,
     hasIdle: boundary.some((m) => m.type === "idle") || nextTurnStarted,
     text,
+    superseded,
   }
 }
 
@@ -472,6 +502,10 @@ export function createClient(baseUrl: string): OpencodeClient {
           // carries text; earlier ones are reasoning+tool.
           return turn.text || "(AI 未返回内容)"
         }
+        // DEF-qqbot-20261107-P2：死回合不等待——检测到同会话新输入接管立即以
+        // 「被打断」终态抛出（bridge 给用户可见交代 + superseded 销账）。检测延迟
+        // ≈新回合首个 assistant/idle 行落库（实证探针回合约 2 秒）。
+        if (turn.superseded) throw new SupersededError(sessionId)
       }
       throw new Error(`AI 响应超时（${turnTimeoutMinutes()} 分钟）`)
     },
