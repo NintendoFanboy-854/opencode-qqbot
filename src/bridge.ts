@@ -9,7 +9,7 @@ import type { Config } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import { getAccessToken, sendC2CInputNotify, sendC2CMessage, sendGroupMessage } from "./qq/api.js"
 import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } from "./qq/media.js"
-import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
+import type { OpencodeClient, SessionMessage, PermissionRequest } from "./opencode/client.js"
 import { collectReplyText, SupersededError, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
@@ -549,6 +549,21 @@ export function createBridge(
     setInterval(() => void interactionTick(), INTERACTION_WATCH_MS)
     console.log(`[interaction-watch] 常驻交互监听已启动（每 ${INTERACTION_WATCH_MS / 1000}s 轮询权限+表单）`)
   }
+
+  // 事件驱动权限推送（2026-11-08，DEF-qqbot-20261107-1 根因修复）。
+  // 桌面端走 /api/event 的 permission.asked 即时弹窗，引擎会停在裁决前；
+  // bot 原先只靠 12s 轮询，取到时请求常已被引擎自行放行。这里复用同一条 SSE：
+  // 事件到达即推 QQ 卡，12s 轮询保留为断线兜底（双防线）。
+  eventStream.subscribeAll((ev) => {
+    if (ev.type !== "permission.asked") return
+    const req = ev.data as unknown as PermissionRequest | undefined
+    if (!req?.id || !req.sessionID) return
+    for (const uid of usersOfSession(req.sessionID)) {
+      if (perm.hasPending(uid)) continue
+      console.log(`[perm-event] permission.asked 即时推送 user=${uid.slice(0, 8)}… request=${req.id}`)
+      perm.pushExternal(uid, ctxForUser(uid), req, req.sessionID)
+    }
+  })
 
   const mirrorApi: MirrorApi = mirror.api
 

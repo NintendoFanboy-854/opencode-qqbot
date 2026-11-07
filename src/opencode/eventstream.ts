@@ -28,6 +28,7 @@ export class EventStream {
   private base: string
   private headers: Record<string, string>
   private listeners = new Map<string, Set<EventCallback>>()
+  private allListeners = new Set<EventCallback>()
   private running = false
   private backoffMs = RECONNECT_MIN_MS
 
@@ -59,6 +60,17 @@ export class EventStream {
     }
   }
 
+  // 全量订阅（2026-11-08）：不按 sessionID 过滤，供权限/表单等全局事件使用。
+  // 权限请求必须在事件到达时即时推送——实测桌面端走同源 SSE，引擎会停在裁决前；
+  // bot 若只靠 12s 轮询，取到时请求往往已被引擎自行放行。
+  subscribeAll(callback: EventCallback): () => void {
+    this.allListeners.add(callback)
+    if (!this.running) void this.consume()
+    return () => {
+      this.allListeners.delete(callback)
+    }
+  }
+
   get activeSessions(): number {
     return this.listeners.size
   }
@@ -75,7 +87,7 @@ export class EventStream {
 
   private async consume(): Promise<void> {
     this.running = true
-    while (this.listeners.size > 0) {
+    while (this.listeners.size > 0 || this.allListeners.size > 0) {
       try {
         const res = await fetch(`${this.base}/event`, { headers: this.headers })
         if (!res.ok || !res.body) {
@@ -97,7 +109,7 @@ export class EventStream {
         }
         throw new Error("SSE 流意外结束")
       } catch (error) {
-        if (this.listeners.size === 0) break
+        if (this.listeners.size === 0 && this.allListeners.size === 0) break
         console.error(
           `[eventstream] 连接中断，${this.backoffMs}ms 后重连:`,
           error instanceof Error ? error.message : String(error),
@@ -115,6 +127,13 @@ export class EventStream {
       if (!line.startsWith("data:")) continue
       try {
         const ev = JSON.parse(line.slice(5).trim()) as V2Event
+        for (const cb of this.allListeners) {
+          try {
+            cb(ev)
+          } catch (error) {
+            console.error("[eventstream] 全局订阅回调异常:", error)
+          }
+        }
         const sid = ev.data?.sessionID
         if (!sid) continue
         const set = this.listeners.get(sid)
