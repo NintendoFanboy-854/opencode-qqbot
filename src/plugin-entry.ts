@@ -41,7 +41,7 @@ function probeAppend(line: string): void {
 
 export default Plugin.define({
   id: "opencode-qqbot",
-  setup(_ctx) {
+  setup(ctx) {
     // P3（2026-10-30 清债）：阻塞原因告警只在"状态变化"时打——插件每小时重载
     // + 5min 巡检，缺凭据/无运行时不处理会重复喷日志。恢复畅通时复位。
     let lastBlocker: string | null = null
@@ -85,6 +85,38 @@ export default Plugin.define({
     ensure()
     const timer = setInterval(ensure, CHECK_INTERVAL_MS)
 
+    // ── 前置权限守卫（2026-11-08，DEF-qqbot-20261107-1）────────────────────
+    // 引擎 ask 存在 fail-open 竞态：规则命中后工具可能在裁决前执行。
+    // 这里在 tool.execute.before 对高危 shell 命令显式调用 permission.assert，
+    // 强制走「建请求 → 等客户端裁决」链路；QQ 端由 bot 的审批卡承接。
+    // 默认开启；QQBOT_PERM_GUARD=0 可关（排障用）。
+    const GUARD_ON = !/^(0|false|off)$/i.test(process.env.QQBOT_PERM_GUARD ?? "1")
+    const RISKY = /^\s*(del|erase|rm|rmdir|rd|ri|rmi|remove-item|format|mkfs|diskpart|shutdown|restart-computer|reg\s+delete|git\s+push)\b/i
+    let guardReg: { dispose: () => Promise<void> } | null = null
+    if (GUARD_ON) {
+      void ctx.tool
+        .hook("execute.before", async (ev) => {
+          if (ev.tool !== "shell") return
+          const input = ev.input as { command?: unknown } | undefined
+          const cmd = typeof input?.command === "string" ? input.command : ""
+          if (!cmd || !RISKY.test(cmd)) return
+          console.log(`[perm-guard] assert shell: ${cmd.slice(0, 80)}`)
+          await ctx.permission.assert({
+            sessionID: ev.sessionID,
+            agent: ev.agent,
+            action: "shell",
+            resources: [cmd],
+            source: { type: "tool", messageID: ev.messageID, id: ev.id },
+          })
+        })
+        .then((reg) => {
+          guardReg = reg
+        })
+        .catch((error) => {
+          console.warn("[perm-guard] 注册失败:", error instanceof Error ? error.message : error)
+        })
+    }
+
     // 事件探针（可选，默认关）：QQ_EVENT_PROBE=true 时订阅全量事件流落盘
     let probeAbort: AbortController | null = null
     if (readDotEnvField(ENV_FILE, "QQ_EVENT_PROBE") === "true") {
@@ -93,7 +125,7 @@ export default Plugin.define({
       void (async () => {
         probeAppend(JSON.stringify({ ts: new Date().toISOString(), type: "probe.started", sessionID: null }))
         try {
-          for await (const event of _ctx.event.subscribe({ signal })) {
+          for await (const event of ctx.event.subscribe({ signal })) {
             const ev = event as { type: string; data?: { sessionID?: string } }
             probeAppend(
               JSON.stringify({ ts: new Date().toISOString(), type: ev.type, sessionID: ev.data?.sessionID ?? null }),
@@ -110,6 +142,7 @@ export default Plugin.define({
     return () => {
       clearInterval(timer)
       probeAbort?.abort()
+      void guardReg?.dispose()
     }
   },
 })
