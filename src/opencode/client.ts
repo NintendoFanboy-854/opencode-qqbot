@@ -218,14 +218,15 @@ export function turnStateOf(msgs: SessionMessage[], promptId: string, baseline: 
       break
     }
   }
+  // 防线 A 修正（2026-11-07 第二版，实测早交后钉死）：下一 user 接替判 done 必须
+  // 以「本回合正文已落库」为守卫——POST /prompt 受理即建 user 行（排队消息不等
+  // 前回合结束），无守卫会把「正文未生成的进行中回合」判 done，交付
+  // (AI 未返回内容) 且丢失真实答案（11-07 10:16 实证）。正文在=回合实质已完，
+  // 接替判据才安全；正文空则继续等 idle/正文。
+  const nextTurnStarted = end < ordered.length && Boolean(text)
   return {
     anchored: true,
-    // 防线 A（2026-11-07，DEF-qqbot-20261105-P1 根因钉死）：共享会话串行执行时，
-    // 回合完成不产生 idle（idle 只在会话整体空转时产生）——桌面注入的下一回合
-    // 紧邻排队会让本回合边界内永无 idle，bot 悬挂至 30 分钟超时（11-06 实证：
-    // 15 分钟悬挂 + cancel 后 drain 死锁链 + 重启误重挂 24h）。boundary 后出现
-    // 下一 user 消息 = 本回合已被接替终结，与 idle 等价判定为 done。
-    hasIdle: boundary.some((m) => m.type === "idle") || end < ordered.length,
+    hasIdle: boundary.some((m) => m.type === "idle") || nextTurnStarted,
     text,
   }
 }
