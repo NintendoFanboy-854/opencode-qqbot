@@ -1,5 +1,6 @@
 // @input:  (none - raw HTTP to QQ Bot REST API)
-// @output: getAccessToken, apiRequest, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh
+// @output: getAccessToken, apiRequest, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh,
+//          acknowledgeInteraction, isTokenFresh, isAuthFailure, clearTokenCache, getTokenStatus
 // @pos:    qq层 - QQ Bot REST API 鉴权+请求封装 (Token singleflight + 后台刷新)
 import type { MessageContext } from "./types.js"
 
@@ -22,6 +23,31 @@ let cachedToken: { token: string; expiresAt: number; appId: string } | null = nu
 // Singleflight：防止并发获取 Token 时重复请求
 let tokenFetchPromise: Promise<string> | null = null
 
+// ★ P0 对齐（2026-11-08，官方鉴权文档）：
+//   「access_token 生命周期默认 7200 秒，**每次请求不会刷新新的 access_token**…
+//    在上一个 access_token 接近过期时间 **60 秒内**获取时，会获得新的 access_token，
+//    老的 access_token 在这 60 秒内仍然有效。」
+//   ⇒ 提前量固定 5 分钟是错的：T-5min 内反复请求拿到的仍是同一个 token，
+//     却让「缓存判定为已过期」永久为真 → 每次 API 调用都去取一次票
+//     （11-08 10:19~10:23 实测 4 分钟内取了 7 次）。改为对齐官方 60s 换发窗口。
+const TOKEN_REFRESH_AHEAD_MS = 60_000
+/** 取票超时（对齐官方 SDK 10s）——ACK 现取 token 依赖它兜底，防止把互动响应拖过 3 秒窗口。 */
+const TOKEN_FETCH_TIMEOUT_MS = 10_000
+
+/** 纯函数：缓存 token 是否仍可直接使用（now < expiresAt - 提前量）。 */
+export function isTokenFresh(expiresAt: number, now: number, aheadMs = TOKEN_REFRESH_AHEAD_MS): boolean {
+  return now < expiresAt - aheadMs
+}
+
+/**
+ * 纯函数：判定「鉴权失败」——ACK 遇到这类错误说明 token 在取用之间失效，
+ * 清缓存重取后重试是安全的（失败的 ACK 未被平台受理，不违反「同 id 只响应一次」）。
+ */
+export function isAuthFailure(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return /AccessToken无效或过期|AccessToken invalid|401 Unauthorized/i.test(msg)
+}
+
 // 债务D3：日志脱敏——Authorization/cookie/token 头含凭证，打印前掩码
 export function maskHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {}
@@ -36,7 +62,7 @@ export function maskHeaders(headers: Record<string, string>): Record<string, str
  * 当多个请求同时发现 Token 过期时，只会发起一次真实刷新请求。
  */
 export async function getAccessToken(appId: string, clientSecret: string): Promise<string> {
-  if (cachedToken && Date.now() < cachedToken.expiresAt - 5 * 60 * 1000 && cachedToken.appId === appId) {
+  if (cachedToken && isTokenFresh(cachedToken.expiresAt, Date.now()) && cachedToken.appId === appId) {
     return cachedToken.token
   }
 
@@ -73,16 +99,30 @@ async function doFetchToken(appId: string, clientSecret: string): Promise<string
   console.log("[qqbot-api] >>> Headers:", JSON.stringify(maskHeaders(requestHeaders), null, 2))
   console.log("[qqbot-api] >>> Body:", JSON.stringify({ appId, clientSecret: "***" }, null, 2))
 
+  // 取票必须有超时（P0 官方 SDK DEFAULT_TOKEN_TIMEOUT_MS=10s）：ACK 现取 token 后，
+  // 取票若无限挂起会把互动响应拖过平台 3 秒窗口 → 客户端「请求第三方失败」。
+  const controller = new AbortController()
+  const timeoutMs = TOKEN_FETCH_TIMEOUT_MS
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
   let response: Response
   try {
     response = await fetch(TOKEN_URL, {
       method: "POST",
       headers: requestHeaders,
       body: JSON.stringify(requestBody),
+      signal: controller.signal,
     })
   } catch (err) {
+    const aborted = err instanceof Error && err.name === "AbortError"
     console.error("[qqbot-api] <<< Network error:", err)
-    throw new Error(`Network error getting access_token: ${err instanceof Error ? err.message : String(err)}`)
+    throw new Error(
+      aborted
+        ? `Token fetch timeout after ${timeoutMs}ms`
+        : `Network error getting access_token: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  } finally {
+    clearTimeout(timer)
   }
 
   const responseHeaders: Record<string, string> = {}
@@ -136,7 +176,7 @@ export function getTokenStatus(): { status: "valid" | "expired" | "refreshing" |
   if (!cachedToken) {
     return { status: "none", expiresAt: null }
   }
-  const isValid = Date.now() < cachedToken.expiresAt - 5 * 60 * 1000
+  const isValid = isTokenFresh(cachedToken.expiresAt, Date.now())
   return { status: isValid ? "valid" : "expired", expiresAt: cachedToken.expiresAt }
 }
 
@@ -386,9 +426,32 @@ export async function sendGroupMessage(
  * 响应按钮互动回调（A 项 2026-10-29，端点对齐 P0 官方 SDK acknowledgeInteraction）。
  * QQ 平台要求收到 INTERACTION_CREATE 后 3 秒内响应，同 id 只能响应一次——
  * 调用方必须先 ack 再执行业务处理。
+ *
+ * ★ 2026-11-08 根因修复（「请求第三方失败」高频复现）：
+ *   ① 每次**现取** token（对齐官方 SDK `acknowledgeInteraction` 里
+ *      `tokenManager.getAccessToken(creds)` 的写法），不再传入连接期的快照；
+ *      快照会随 7200s 过期而失效——WS 长连不断时，网关侧快照永远不会被更新，
+ *      于是「消息发得出去（现取）、互动 ACK 全 401」。
+ *   ② 401/11244 时清缓存重取后**重试一次**（失败的 ACK 未被平台受理，可安全重试）。
  */
-export async function acknowledgeInteraction(accessToken: string, interactionId: string, code = 0): Promise<void> {
-  await apiRequest(accessToken, "PUT", `/interactions/${interactionId}`, { code })
+export async function acknowledgeInteraction(
+  appId: string,
+  clientSecret: string,
+  interactionId: string,
+  code = 0,
+): Promise<void> {
+  const send = async (): Promise<void> => {
+    const accessToken = await getAccessToken(appId, clientSecret)
+    await apiRequest(accessToken, "PUT", `/interactions/${interactionId}`, { code })
+  }
+  try {
+    await send()
+  } catch (error) {
+    if (!isAuthFailure(error)) throw error
+    console.warn(`[qqbot-api] 互动 ACK 鉴权失败，清缓存重取后重试一次: /interactions/${interactionId}`)
+    clearTokenCache()
+    await send()
+  }
 }
 
 // ── 媒体发送（生态观察缺口 4：bot→QQ 发图/文件，P0 参照 qqbot-nodejs protocol/api/media.ts）──

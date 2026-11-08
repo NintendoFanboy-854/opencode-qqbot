@@ -353,8 +353,10 @@ async function handleDispatchEvent(
         .catch((error) => {
           console.error("[qq-gateway] 互动业务分发失败:", error instanceof Error ? error.message : error)
         })
-      if (state.accessToken && interaction?.id) {
-        void acknowledgeInteraction(state.accessToken, interaction.id).catch((error) => {
+      if (interaction?.id) {
+        // 2026-11-08 根因修复：ACK 必须现取 token，禁止使用连接期快照 state.accessToken。
+        // 快照只在 connect() 时刷新，WS 长连跨过 7200s 后即失效 → 401 →「请求第三方失败」。
+        void acknowledgeInteraction(options.appId, options.clientSecret, interaction.id).catch((error) => {
           console.error("[qq-gateway] 互动响应失败:", error instanceof Error ? error.message : error)
         })
       }
