@@ -553,10 +553,101 @@ export function createBridge(
               void safeDeliver(pctx, text)
               return decision
             },
+            onElicitation: (userId, params) => handleElicitation(userId, params),
           },
         })
       : null
   if (acpRunner) console.log("[bridge] transport=acp（ACP 传输启用；权限由 session/request_permission 阻塞）")
+
+  // P5 健康自检（看门狗）：60s 一次，只检查 ACP 传输存活/握手，不查权限等业务接口。
+  // 失败时尝试重启传输；真正的“在途/队列”对账仍由既有启动对账负责。
+  if (acpRunner) {
+    const timer = setInterval(() => {
+      if (acpRunner.running) return
+      console.warn("[watchdog] ACP 传输不存活，尝试重启")
+      void acpRunner.start().catch((error) => {
+        console.error("[watchdog] ACP 重启失败:", error instanceof Error ? error.message : error)
+      })
+    }, 60_000)
+    timer.unref?.()
+  }
+
+  // P3 表单（ACP elicitation）：单字段表单走 QQ 文字问答；多字段按任务书回退桌面端。
+  interface PendingAcpElicitation {
+    key: string
+    options: Array<{ const?: string; title?: string }>
+    resolve: (value: unknown) => void
+    timer: ReturnType<typeof setTimeout>
+  }
+  const pendingElicitations = new Map<string, PendingAcpElicitation>()
+
+  async function handleElicitation(userId: string, params: Record<string, unknown>): Promise<unknown> {
+    type Field = { type?: string; title?: string; description?: string; oneOf?: Array<{ const?: string; title?: string }> }
+    const schema = (params.requestedSchema ?? {}) as { properties?: Record<string, Field> }
+    const props = Object.entries(schema.properties ?? {})
+    const pctx = ctxForUser(userId)
+    if (props.length === 0) {
+      void safeDeliver(pctx, "（表单没有可填字段，已取消）")
+      return { action: "cancel" }
+    }
+    if (props.length > 1) {
+      void safeDeliver(pctx, "（该表单含多个输入项，请在桌面端完成）")
+      return { action: "decline" }
+    }
+    const [key, field] = props[0] as [string, Field]
+    const options = field.oneOf ?? []
+    const lines = [`📝 ${String(params.message ?? "需要你的选择")}`, ""]
+    if (options.length) {
+      options.forEach((o, i) => lines.push(`${String.fromCharCode(65 + i)}. ${o.title ?? o.const ?? i + 1}`))
+      lines.push("", "回复选项字母；回复「取消」放弃")
+    } else {
+      lines.push(`请输入 ${field.title ?? key}`, "回复「取消」放弃")
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingElicitations.delete(userId)
+        void safeDeliver(pctx, "⏰ 选择请求已超时，已取消")
+        resolve({ action: "cancel" })
+      }, 30 * 60_000)
+      pendingElicitations.set(userId, { key, options, resolve, timer })
+      void safeDeliver(pctx, lines.join("\n"))
+    })
+  }
+
+  /** 处理用户对 ACP 表单的回复；返回 true=已消费（不再进 agent）。 */
+  function tryResolveElicitation(userId: string, content: string): boolean {
+    const pending = pendingElicitations.get(userId)
+    if (!pending) return false
+    const text = content.trim()
+    const pctx = ctxForUser(userId)
+    if (/^(取消|cancel|退出|算了|放弃)$/i.test(text)) {
+      clearTimeout(pending.timer)
+      pendingElicitations.delete(userId)
+      pending.resolve({ action: "cancel" })
+      void safeDeliver(pctx, "已取消")
+      return true
+    }
+    if (pending.options.length) {
+      const numeric = Number(text)
+      const idx = /^[A-Za-z]$/.test(text) ? text.toUpperCase().charCodeAt(0) - 65 : Number.isFinite(numeric) ? numeric - 1 : -1
+      const hit = pending.options[idx]
+      if (!hit) {
+        void safeDeliver(pctx, "没看懂，请回复选项字母（或回复「取消」）")
+        return true
+      }
+      clearTimeout(pending.timer)
+      pendingElicitations.delete(userId)
+      const value = hit.const ?? hit.title ?? text
+      pending.resolve({ action: "accept", content: { [pending.key]: value } })
+      void safeDeliver(pctx, `已选择：${hit.title ?? value}`)
+      return true
+    }
+    clearTimeout(pending.timer)
+    pendingElicitations.delete(userId)
+    pending.resolve({ action: "accept", content: { [pending.key]: text } })
+    void safeDeliver(pctx, "已提交")
+    return true
+  }
 
   async function interactionTick(): Promise<void> {
     try {
@@ -570,14 +661,16 @@ export function createBridge(
           }
         }
       }
-      // 表单按会话列表（GET /api/form 是 location 维度，bot cwd 不在会话项目会漏）
-      for (const entry of sessions.all()) {
-        const forms = (await client.form.list({ sessionID: entry.sessionId }).catch(() => undefined))?.data ?? []
-        for (const form of forms) {
-          // 会话级列表返回 Form.Info（无 state）；带 state 时只推 pending
-          const state = (form as { state?: { status?: string } }).state
-          if (state && state.status !== "pending") continue
-          formBridge.pushForm(entry.userId, ctxForUser(entry.userId), form)
+      // ACP 模式下表单由 elicitation/create 实时承接；轮询只留 REST 兼容路径。
+      if (TRANSPORT !== "acp") {
+        for (const entry of sessions.all()) {
+          const forms = (await client.form.list({ sessionID: entry.sessionId }).catch(() => undefined))?.data ?? []
+          for (const form of forms) {
+            // 会话级列表返回 Form.Info（无 state）；带 state 时只推 pending
+            const state = (form as { state?: { status?: string } }).state
+            if (state && state.status !== "pending") continue
+            formBridge.pushForm(entry.userId, ctxForUser(entry.userId), form)
+          }
         }
       }
     } catch (error) {
@@ -823,6 +916,16 @@ export function createBridge(
     ledger: ledgerApi,
     progress: progressApi,
     stopAll: stopAllForUser,
+    ...(acpRunner
+      ? {
+          acp: {
+            newSession: (userId: string) => acpRunner.newSession(userId),
+            setModel: (userId: string, providerId: string, modelId: string) => acpRunner.setModel(userId, providerId, modelId),
+            setAgent: (userId: string, agentId: string) => acpRunner.setAgent(userId, agentId),
+            cancel: (userId: string) => acpRunner.cancel(userId),
+          },
+        }
+      : {}),
   }
 
   // R2 修复批次启动项（2026-10-14）
@@ -905,6 +1008,10 @@ export function createBridge(
       // pending 曾把全部命令当答案消费，统一回「没看懂」且会话失能数分钟）。
       // 文字"允许"与表单答案的歧义：parsePermissionDecision 先行且要求存在
       // 待审权限才会消费；表单槽只消费非命令输入，互不串线。
+      // ACP 表单（elicitation）优先消费：用户回复不得再进 agent
+      if (!isCommand(content) && tryResolveElicitation(ctx.userId, content)) {
+        return
+      }
       if (!isCommand(content) && formBridge.tryResolveText(ctx.userId, content)) {
         releaseClaimed("answered")
         return

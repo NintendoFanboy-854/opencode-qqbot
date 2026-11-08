@@ -52,6 +52,8 @@ export interface CommandContext {
   config: Config
   client: OpencodeClient
   sessions: SessionManager
+  /** ACP 传输适配（transport=acp 时注入；命令面与会话/模型/agent/取消走 ACP）。 */
+  acp?: CommandAcpApi
   getAccessToken: () => Promise<string>
   pendingSelections: Map<string, PendingSelection>
   watch: WatchApi
@@ -67,6 +69,14 @@ export interface PendingSelection {
   type: "session" | "model"
   items: Array<{ id: string; label: string }>
   expiresAt: number
+}
+
+/** ACP 命令适配（与 REST 的 sessions/client 同语义的最小面）。 */
+export interface CommandAcpApi {
+  newSession: (userId: string) => Promise<string>
+  setModel: (userId: string, providerId: string, modelId: string) => Promise<void>
+  setAgent: (userId: string, agentId: string) => Promise<void>
+  cancel: (userId: string) => void
 }
 
 interface ParsedCommand {
@@ -194,12 +204,10 @@ function parseCommand(content: string): ParsedCommand | null {
 }
 
 async function handleNew(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
-  const session = await cmdCtx.sessions.createNew(ctx.userId)
-  return [
-    "已创建新会话",
-    `标题：${session.title ?? "未命名会话"}`,
-    `ID：${session.sessionId}`,
-  ].join("\n")
+  const sessionId = cmdCtx.acp
+    ? await cmdCtx.acp.newSession(ctx.userId)
+    : (await cmdCtx.sessions.createNew(ctx.userId)).sessionId
+  return ["已创建新会话", `ID：${sessionId}`].join("\n")
 }
 
 // 缺口 4：/send <路径>——把本地文件/图片发到 QQ（路径白名单内）
@@ -218,6 +226,7 @@ async function handleSend(ctx: MessageContext, args: string, cmdCtx: CommandCont
 
 async function handleStop(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
   const hadSession = !!cmdCtx.sessions.getSession(ctx.userId)
+  cmdCtx.acp?.cancel(ctx.userId)
   const { cleared, title } = await cmdCtx.stopAll(ctx.userId)
   const suffix = cleared > 0 ? `，队列中的 ${cleared} 条已清空` : ""
   if (!hadSession && !title) {
@@ -348,7 +357,8 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
   }
 
   await ensureSession(ctx.userId, cmdCtx)
-  await cmdCtx.sessions.setModel(ctx.userId, model.providerId, model.modelId)
+  if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, model.providerId, model.modelId)
+  else await cmdCtx.sessions.setModel(ctx.userId, model.providerId, model.modelId)
   return `已切换模型：${model.providerId} / ${model.modelId}`
 }
 
@@ -375,7 +385,8 @@ async function handleAgent(ctx: MessageContext, args: string, cmdCtx: CommandCon
   }
 
   await ensureSession(ctx.userId, cmdCtx)
-  await cmdCtx.sessions.setAgent(ctx.userId, matched.id)
+  if (cmdCtx.acp) await cmdCtx.acp.setAgent(ctx.userId, matched.id)
+  else await cmdCtx.sessions.setAgent(ctx.userId, matched.id)
   return `已切换 Agent：${matched.id}`
 }
 
@@ -439,6 +450,7 @@ function handleMirror(args: string, cmdCtx: CommandContext): string {
 }
 
 async function ensureSession(userId: string, cmdCtx: CommandContext): Promise<void> {
+  if (cmdCtx.acp) return // ACP 适配内部会 getOrCreate
   await cmdCtx.sessions.getOrCreate(userId)
 }
 

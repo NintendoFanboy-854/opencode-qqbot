@@ -45,7 +45,7 @@ export interface AcpSessionHandlers {
   /** 权限裁决：返回 once/always/reject；null 表示无处理（按 cancelled fail-closed）。 */
   onPermission?: (userId: string, view: AcpPermissionView) => Promise<"once" | "always" | "reject" | null>
   /** 表单/提问（P3 接入 form-bridge）；未处理时 decline。 */
-  onElicitation?: (params: Record<string, unknown>) => Promise<unknown>
+  onElicitation?: (userId: string, params: Record<string, unknown>) => Promise<unknown>
   /** 流式观察（投递层可选使用） */
   onUpdate?: (userId: string, update: AcpUpdate) => void
   onExit?: (code: number | null) => void
@@ -82,7 +82,12 @@ export class AcpSessionRunner {
         {
           onUpdate: (sessionId, update) => this.handleUpdate(sessionId, update),
           onPermission: (req) => this.handlePermission(req),
-          onElicitation: (params) => (this.handlers.onElicitation ? this.handlers.onElicitation(params) : Promise.resolve({ action: "decline" })),
+          onElicitation: (params) => {
+            const sid = String((params as { sessionId?: unknown }).sessionId ?? "")
+            const userId = this.userBySession.get(sid)
+            if (!userId || !this.handlers.onElicitation) return Promise.resolve({ action: "decline" })
+            return this.handlers.onElicitation(userId, params)
+          },
           onExit: (code) => this.handlers.onExit?.(code),
           onError: (error) => console.error("[acp-session] 传输错误:", error.message),
         },
