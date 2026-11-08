@@ -13,6 +13,7 @@ import type { OpencodeClient, SessionMessage, PermissionRequest } from "./openco
 import { collectReplyText, SupersededError, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { createAcpSessionRunner } from "./opencode/acp-session.js"
+import { readTransportSetting } from "./core/transport-setting.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
 import {
@@ -530,7 +531,7 @@ export function createBridge(
   // ACP 迁移（P2）：QQ 侧 turn 的传输选择。默认 rest；灰度验证后切 acp。
   // acp 模式下：turn 走 session/prompt，审批走 session/request_permission（引擎阻塞），
   // 常驻权限轮询停用（表单轮询保留到 P3）。
-  const TRANSPORT: "acp" | "rest" = parseTransport(process.env.QQBOT_TRANSPORT)
+  const TRANSPORT: "acp" | "rest" = parseTransport(process.env.QQBOT_TRANSPORT ?? readTransportSetting())
   const acpRunner =
     TRANSPORT === "acp"
       ? createAcpSessionRunner({
@@ -678,7 +679,7 @@ export function createBridge(
     }
   }
 
-  if (INTERACTION_WATCH_MS > 0) {
+  if (INTERACTION_WATCH_MS > 0 && TRANSPORT !== "acp") {
     setInterval(() => void interactionTick(), INTERACTION_WATCH_MS)
     console.log(`[interaction-watch] 常驻交互监听已启动（每 ${INTERACTION_WATCH_MS / 1000}s 轮询权限+表单）`)
   }
