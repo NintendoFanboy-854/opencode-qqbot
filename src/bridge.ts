@@ -556,6 +556,16 @@ export function createBridge(
               return decision
             },
             onElicitation: (userId, params) => handleElicitation(userId, params),
+            // 会话没有超时限（2026-11-08 用户口径）：满 30 分钟只通知「转后台继续」，
+            // 回合继续跑、完成即回传；串行链保持占用，队列不会提前推进。
+            onPromptNotice: (userId, sessionId) => {
+              console.log(`[bridge] 回合前台等待满 30 分钟，转后台继续 sid=${shortId(sessionId)} user=${userId.slice(0, 8)}…`)
+              const ctx = lastCtx.get(userId) ?? ctxForUser(userId)
+              void safeDeliver(
+                ctx,
+                "⏳ 本轮已执行满 30 分钟，仍在继续（前台等待结束，已转后台），完成即回传；可 /stop 中止。",
+              )
+            },
           },
         })
       : null
@@ -1318,8 +1328,8 @@ export function createBridge(
           )
           settleInflight(trackId, undefined, "error")
         } else if (isAcpPromptTimeout(error)) {
-          // 超时已在 acp-session 里 session/cancel 释放会话，这里给用户可操作交代
-          await safeDeliver(ctx, "⏱ 本轮执行超过时限，已中止并释放会话；请重新发送该请求（长任务建议拆成小步）。")
+          // 仅硬上限（6 小时）会走到这里；30 分钟只是通知，不终止回合。
+          await safeDeliver(ctx, "⏱ 回合已达硬上限（6 小时），已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
           settleInflight(trackId, undefined, "error")
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错

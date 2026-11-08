@@ -92,6 +92,12 @@ export interface AcpHandlers {
   onPermission?: (request: AcpPermissionRequest) => Promise<"once" | "always" | "reject" | null>
   /** agent → client 表单/提问；返回 ACP 的 elicitation 结果。未处理时返回 decline。 */
   onElicitation?: (params: Record<string, unknown>) => Promise<unknown>
+  /**
+   * 回合前台等待满 promptNoticeMs（默认 30 分钟）时触发一次——**只通知，不终止**。
+   * 2026-11-08 用户口径：会话没有超时限，只有弹窗才有 TTL；
+   * 超时只意味着「前台等待结束，转后台继续」，任务继续跑、完成即回传。
+   */
+  onPromptNotice?: (sessionId: string) => void
   onExit?: (code: number | null, signal: NodeJS.Signals | null) => void
   onError?: (error: Error) => void
 }
@@ -105,17 +111,23 @@ export interface AcpClientOptions {
   /** 单条请求超时（默认 10 分钟；prompt 另走 promptTimeoutMs） */
   requestTimeoutMs?: number
   /**
-   * session/prompt 回合超时（默认 30 分钟——2026-11-08 用户拍板「统一三十分钟」）。
-   * 历史：先 10 分钟（通用超时，长回合必被判死 → 11:46 出的 -32603 级联），
-   * 再 60 分钟，现按统一口径收敛到 30 分钟；与审批 30 分钟、提问 30 分钟同表。
+   * session/prompt 回合超时（默认 6 小时**硬上限**）。
+   * 分两层（2026-11-08 用户拍板「会话没有超时限，只有弹窗有超时」）：
+   *   ① promptNoticeMs（默认 30 分钟）→ 只发一次「已转后台继续」通知，**不终止回合**；
+   *   ② 本值 = 硬上限，仅用于兜住真正的死挂（正常轮次远达不到），到点才 reject + cancel。
+   * 历史：先 10 分钟（通用超时，长回合必被判死 → -32603 级联），再 30 分钟被我误当成
+   * 「会话超时」直接杀任务——那是把弹窗 TTL 的语义错搬到会话上。
    */
   promptTimeoutMs?: number
+  /** 回合前台等待多久后发「转后台继续」通知（默认 30 分钟，只通知不终止）。 */
+  promptNoticeMs?: number
 }
 
 interface Pending {
   resolve: (value: unknown) => void
   reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
+  /** 无超时请求（timeoutMs=0）没有定时器 */
+  timer?: ReturnType<typeof setTimeout>
 }
 
 export class AcpClient {
@@ -198,7 +210,7 @@ export class AcpClient {
       const entry = this.pending.get(id)
       if (!entry) return
       this.pending.delete(id)
-      clearTimeout(entry.timer)
+      if (entry.timer) clearTimeout(entry.timer)
       if ("error" in msg && msg.error) entry.reject(new Error(`${msg.error.message} (${msg.error.code})`))
       else entry.resolve((msg as JsonRpcResponse).result)
       return
@@ -259,15 +271,18 @@ export class AcpClient {
     this.child.stdin.write(JSON.stringify(msg) + "\n")
   }
 
-  /** JSON-RPC 请求（带超时）。 */
+  /** JSON-RPC 请求（带超时）；timeoutMs=0 表示**不设超时**（回合默认不设，见 prompt）。 */
   request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     const id = ++this.seq
     const timeout = timeoutMs ?? this.opts.requestTimeoutMs ?? 10 * 60_000
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`ACP 请求超时: ${method}`))
-      }, timeout)
+      const timer =
+        timeout > 0
+          ? setTimeout(() => {
+              this.pending.delete(id)
+              reject(new Error(`ACP 请求超时: ${method}`))
+            }, timeout)
+          : undefined
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer })
       this.write({ jsonrpc: "2.0", id, method, params })
     })
@@ -291,9 +306,26 @@ export class AcpClient {
   }
 
   async prompt(sessionId: string, prompt: Array<{ type: "text"; text: string } | Record<string, unknown>>): Promise<{ stopReason?: string }> {
-    // 回合走独立超时（默认 30 分钟，统一口径），不再吃 10 分钟通用超时
-    const timeoutMs = this.opts.promptTimeoutMs ?? 30 * 60_000
-    return this.request("session/prompt", { sessionId, prompt }, timeoutMs)
+    // 2026-11-08 用户口径：**会话没有超时限，只有弹窗才有 TTL**。
+    // 满 promptNoticeMs（30 分钟）只通知一次「已转后台继续」，promise 不 reject、
+    // 任务不被杀、串行链保持占用（后续消息继续排队，不会撞 -32603）；
+    // 只有 promptTimeoutMs（6 小时硬上限）才 reject，用于兜住真正的死挂。
+    const noticeMs = this.opts.promptNoticeMs ?? 30 * 60_000
+    const capMs = this.opts.promptTimeoutMs ?? 6 * 60 * 60_000
+    let noticed = false
+    const noticeTimer =
+      noticeMs > 0
+        ? setTimeout(() => {
+            if (noticed) return
+            noticed = true
+            this.handlers.onPromptNotice?.(sessionId)
+          }, noticeMs)
+        : null
+    try {
+      return await this.request("session/prompt", { sessionId, prompt }, capMs)
+    } finally {
+      if (noticeTimer) clearTimeout(noticeTimer)
+    }
   }
 
   cancel(sessionId: string): void {
@@ -330,7 +362,7 @@ export class AcpClient {
 
   private failAll(error: Error): void {
     for (const [id, entry] of this.pending) {
-      clearTimeout(entry.timer)
+      if (entry.timer) clearTimeout(entry.timer)
       entry.reject(error)
       this.pending.delete(id)
     }
