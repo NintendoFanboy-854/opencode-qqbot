@@ -161,9 +161,13 @@ export class AcpClient {
       this.handlers.onExit?.(code, signal)
     })
 
+    // 2026-11-08 根因修复：form 必须是「对象」而非布尔。ACP schema 里
+    // elicitation.form 是 `{_meta?}` 形状，写成 true 会被判为无效能力，
+    // opencode 侧 formElicitation=false → 表单/提问直接被取消，
+    // question 工具只会回 "The question couldn't be shown..."（不产生任何下发）。
     await this.request("initialize", {
       protocolVersion: 1,
-      clientCapabilities: { elicitation: { form: true } },
+      clientCapabilities: { elicitation: { form: {} } },
     })
   }
 

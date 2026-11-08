@@ -47,6 +47,7 @@ import { createDelivery } from "./core/delivery.js"
 import { createNotifySink } from "./core/notify-sink.js"
 import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approval.js"
 import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
+import { parseQuestionForm, renderQuestion, parseAnswer, toFormContent, type QuestionItem } from "./core/question-form.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
 import {
   claimInflightDetailed,
@@ -573,49 +574,62 @@ export function createBridge(
     timer.unref?.()
   }
 
-  // P3 表单（ACP elicitation）：单字段表单走 QQ 文字问答；多字段按任务书回退桌面端。
+  // P3 表单/提问（ACP elicitation）：question 工具的一道题在 schema 里会拆成
+  // q0 + q0_custom 两个属性，必须合并回一道题；多题按顺序逐条问，全部答完后一次性 accept。
+  // 2026-11-08 修复：此前「字段>1 就 decline（回退桌面）」，而 question 永远带 custom 伴生字段，
+  // 导致 question 工具在 QQ 侧 100% 不可用（用户只看到 "The question couldn't be shown…"）。
   interface PendingAcpElicitation {
-    key: string
-    options: Array<{ const?: string; title?: string }>
+    questions: QuestionItem[]
+    answers: Array<{ item: QuestionItem; value: string | string[]; custom: boolean }>
+    index: number
     resolve: (value: unknown) => void
     timer: ReturnType<typeof setTimeout>
   }
   const pendingElicitations = new Map<string, PendingAcpElicitation>()
+  // 必须小于 ACP session/prompt 的 10 分钟请求超时，否则会在作答前把整轮判超时
+  const ELICITATION_TTL_MS = 8 * 60_000
+
+  function askCurrentQuestion(userId: string, pending: PendingAcpElicitation): void {
+    const item = pending.questions[pending.index]
+    if (!item) return
+    void safeDeliver(ctxForUser(userId), renderQuestion(item, pending.index, pending.questions.length))
+  }
 
   async function handleElicitation(userId: string, params: Record<string, unknown>): Promise<unknown> {
-    type Field = { type?: string; title?: string; description?: string; oneOf?: Array<{ const?: string; title?: string }> }
-    const schema = (params.requestedSchema ?? {}) as { properties?: Record<string, Field> }
-    const props = Object.entries(schema.properties ?? {})
     const pctx = ctxForUser(userId)
-    if (props.length === 0) {
+    if (params.mode === "url") {
+      // URL 模式需要浏览器打开授权链接，QQ 侧无法承接；且我们未声明 url 能力
+      void safeDeliver(pctx, "（该请求需要在浏览器里完成授权，请在桌面端处理）")
+      return { action: "decline" }
+    }
+    const questions = parseQuestionForm(params.requestedSchema)
+    if (!questions) {
       void safeDeliver(pctx, "（表单没有可填字段，已取消）")
       return { action: "cancel" }
     }
-    if (props.length > 1) {
-      void safeDeliver(pctx, "（该表单含多个输入项，请在桌面端完成）")
-      return { action: "decline" }
+    // 同一用户已有挂起提问：旧的作废，避免答案串线
+    const stale = pendingElicitations.get(userId)
+    if (stale) {
+      clearTimeout(stale.timer)
+      pendingElicitations.delete(userId)
+      stale.resolve({ action: "cancel" })
     }
-    const [key, field] = props[0] as [string, Field]
-    const options = field.oneOf ?? []
-    const lines = [`📝 ${String(params.message ?? "需要你的选择")}`, ""]
-    if (options.length) {
-      options.forEach((o, i) => lines.push(`${String.fromCharCode(65 + i)}. ${o.title ?? o.const ?? i + 1}`))
-      lines.push("", "回复选项字母；回复「取消」放弃")
-    } else {
-      lines.push(`请输入 ${field.title ?? key}`, "回复「取消」放弃")
-    }
+    console.log(
+      `[elicitation] 推送提问 user=${userId.slice(0, 8)}… 题数=${questions.length} 首题=${questions[0]?.title ?? ""}`,
+    )
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingElicitations.delete(userId)
-        void safeDeliver(pctx, "⏰ 选择请求已超时，已取消")
+        void safeDeliver(pctx, "⏰ 提问已超时，已取消")
         resolve({ action: "cancel" })
-      }, 30 * 60_000)
-      pendingElicitations.set(userId, { key, options, resolve, timer })
-      void safeDeliver(pctx, lines.join("\n"))
+      }, ELICITATION_TTL_MS)
+      const pending: PendingAcpElicitation = { questions, answers: [], index: 0, resolve, timer }
+      pendingElicitations.set(userId, pending)
+      askCurrentQuestion(userId, pending)
     })
   }
 
-  /** 处理用户对 ACP 表单的回复；返回 true=已消费（不再进 agent）。 */
+  /** 处理用户对提问的回复；返回 true=已消费（不再进 agent）。 */
   function tryResolveElicitation(userId: string, content: string): boolean {
     const pending = pendingElicitations.get(userId)
     if (!pending) return false
@@ -628,25 +642,32 @@ export function createBridge(
       void safeDeliver(pctx, "已取消")
       return true
     }
-    if (pending.options.length) {
-      const numeric = Number(text)
-      const idx = /^[A-Za-z]$/.test(text) ? text.toUpperCase().charCodeAt(0) - 65 : Number.isFinite(numeric) ? numeric - 1 : -1
-      const hit = pending.options[idx]
-      if (!hit) {
-        void safeDeliver(pctx, "没看懂，请回复选项字母（或回复「取消」）")
-        return true
-      }
+    const item = pending.questions[pending.index]
+    if (!item) {
       clearTimeout(pending.timer)
       pendingElicitations.delete(userId)
-      const value = hit.const ?? hit.title ?? text
-      pending.resolve({ action: "accept", content: { [pending.key]: value } })
-      void safeDeliver(pctx, `已选择：${hit.title ?? value}`)
+      pending.resolve({ action: "cancel" })
+      return true
+    }
+    const parsed = parseAnswer(item, text)
+    if (!parsed.ok) {
+      void safeDeliver(pctx, "没看懂，请按提示回复（或回复「取消」）")
+      return true
+    }
+    pending.answers.push({ item, value: parsed.value, custom: parsed.custom })
+    pending.index += 1
+    if (pending.index < pending.questions.length) {
+      askCurrentQuestion(userId, pending)
       return true
     }
     clearTimeout(pending.timer)
     pendingElicitations.delete(userId)
-    pending.resolve({ action: "accept", content: { [pending.key]: text } })
-    void safeDeliver(pctx, "已提交")
+    pending.resolve({ action: "accept", content: toFormContent(pending.answers) })
+    const summary = pending.answers
+      .map((a) => `${a.item.title}=${Array.isArray(a.value) ? a.value.join("/") : a.value}`)
+      .join("；")
+    console.log(`[elicitation] 已作答 user=${userId.slice(0, 8)}… ${summary}`)
+    void safeDeliver(pctx, pending.questions.length > 1 ? "已提交全部回答" : "已提交")
     return true
   }
 
