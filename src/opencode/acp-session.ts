@@ -1,5 +1,6 @@
 // @input:  ./acp（AcpClient）, ./sessions（SessionManager）
-// @output: AcpSessionRunner, toPermissionView, textDelta, AcpPermissionView
+// @output: AcpSessionRunner, toPermissionView, textDelta, AcpPermissionView,
+//          isAcpPromptTimeout, isAcpPromptBusy
 // @pos:    opencode层 - ACP 会话运行器（P1）：QQ 用户 ↔ ACP session、prompt 流式聚合、
 //          权限请求转交上层、会话按需 load、取消与模型/agent 设置。
 //          纪律：全事件驱动，不做任何业务轮询（健康自检由上层看门狗负责）。
@@ -36,6 +37,18 @@ export function textDelta(update: AcpUpdate): string {
   return content?.type === "text" && typeof content.text === "string" ? content.text : ""
 }
 
+/** ACP 回合超时（客户端判定；服务端 turn 已由 doPrompt 显式 cancel 释放）。 */
+export function isAcpPromptTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /ACP 请求超时/.test(message)
+}
+
+/** 会话正有 active prompt（-32603，可能来自桌面端/他端或上一轮未结束）。 */
+export function isAcpPromptBusy(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /active ACP prompt|\(-32603\)|\(−32603\)/.test(message)
+}
+
 export interface AcpRunResult {
   text: string
   stopReason?: string
@@ -70,6 +83,8 @@ export class AcpSessionRunner {
   private loaded = new Set<string>()
   private userBySession = new Map<string, string>()
   private buffers = new Map<string, string[]>()
+  /** 同会话 prompt 串行链：ACP 一个会话同时只允许一个 active prompt（否则 -32603）。 */
+  private promptChain = new Map<string, Promise<unknown>>()
 
   constructor(options: AcpSessionOptions) {
     this.cwd = options.cwd
@@ -176,11 +191,41 @@ export class AcpSessionRunner {
   async run(userId: string, text: string): Promise<AcpRunResult> {
     const sessionId = await this.getOrCreate(userId)
     this.userBySession.set(sessionId, userId)
+
+    // 2026-11-08 缺陷修复：同一会话的 prompt 必须串行。此前超时/失败会把上一轮的
+    // promise 打死而服务端 turn 仍在跑，队列 drain 立刻再发 prompt →
+    // 服务端回 -32603「Session already has an active ACP prompt」，用户连吃报错直到 /stop。
+    // 这里按会话把 prompt 接成链：上一轮真正结束（成功/失败/超时）后才发下一轮。
+    const previous = this.promptChain.get(sessionId) ?? Promise.resolve()
+    const task = previous.then(
+      () => this.doPrompt(sessionId, text),
+      () => this.doPrompt(sessionId, text),
+    )
+    this.promptChain.set(
+      sessionId,
+      task.then(
+        () => undefined,
+        () => undefined,
+      ),
+    )
+    return task
+  }
+
+  private async doPrompt(sessionId: string, text: string): Promise<AcpRunResult> {
     this.buffers.set(sessionId, [])
     try {
       const result = await this.client.prompt(sessionId, [{ type: "text", text }])
       const out = (this.buffers.get(sessionId) ?? []).join("")
       return { text: out, stopReason: result?.stopReason }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/请求超时|timeout/i.test(message)) {
+        // 客户端超时 ≠ 服务端已停：必须显式 cancel 释放会话，否则 active prompt 残留
+        // 会把后续所有 prompt 顶成 -32603。
+        console.error(`[acp-session] prompt 超时，已发送 session/cancel 释放会话 sid=${sessionId}`)
+        this.client.cancel(sessionId)
+      }
+      throw error
     } finally {
       this.buffers.delete(sessionId)
     }

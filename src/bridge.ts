@@ -12,7 +12,7 @@ import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } 
 import type { OpencodeClient, SessionMessage, PermissionRequest } from "./opencode/client.js"
 import { collectReplyText, SupersededError, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
-import { createAcpSessionRunner } from "./opencode/acp-session.js"
+import { createAcpSessionRunner, isAcpPromptBusy, isAcpPromptTimeout } from "./opencode/acp-session.js"
 import { readTransportSetting } from "./core/transport-setting.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
@@ -1295,6 +1295,19 @@ export function createBridge(
             "⏳ 回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
           )
           startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId)
+        } else if (isAcpPromptBusy(error)) {
+          // 2026-11-08：会话被占用（-32603）。不再把 Internal error 原样甩给用户，
+          // 给可操作路径；acp-session 的同会话串行链已挡掉我方自撞，这条只兜他端占用。
+          console.error(`[bridge] 会话被占用（active prompt）sid=${shortId(sessionId)}: ${toErrorMessage(error)}`)
+          await safeDeliver(
+            ctx,
+            "⏳ 该会话正有回合在执行（可能是桌面端在跑，或上一轮尚未结束），本轮未重复发起。\n发 /stop 可中止当前回合后重试。",
+          )
+          settleInflight(trackId, undefined, "error")
+        } else if (isAcpPromptTimeout(error)) {
+          // 超时已在 acp-session 里 session/cancel 释放会话，这里给用户可操作交代
+          await safeDeliver(ctx, "⏱ 本轮执行超过时限，已中止并释放会话；请重新发送该请求（长任务建议拆成小步）。")
+          settleInflight(trackId, undefined, "error")
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错
           const errText = toErrorMessage(error)
