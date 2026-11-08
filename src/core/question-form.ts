@@ -1,5 +1,6 @@
 // @input:  requestSchema（ACP elicitation.create 的 requestedSchema）
-// @output: QuestionItem, parseQuestionForm, renderQuestion, parseAnswer
+// @output: QuestionItem, parseQuestionForm, renderQuestion, parseAnswer, toFormContent,
+//          timeoutOutcome, TimeoutOutcome
 // @pos:    core层 - 表单/提问的纯逻辑：把 elicitation 的 JSON-Schema 归一成「逐题问答」，
 //          并把用户文字回复映射回表单答案。不做 IO，供 bridge 与单测共用。
 //          背景（2026-11-08）：question 工具的字段是 options + custom，
@@ -21,6 +22,8 @@ export interface QuestionItem {
   multiple: boolean
   /** 自定义答案属性名，如 q0_custom；无则为 undefined */
   customKey?: string
+  /** 该题是否必填（schema.required 含此 key）——决定超时是「跳过」还是「中止」 */
+  required: boolean
   /** 数字/布尔等自由输入类型 */
   kind: "string" | "number" | "integer" | "boolean"
 }
@@ -73,6 +76,9 @@ export function parseQuestionForm(requestedSchema: unknown): QuestionItem[] | nu
   for (const [key] of props) {
     if (key.endsWith("_custom")) customKeys.set(key.slice(0, -"_custom".length), key)
   }
+  const requiredKeys = new Set(
+    asArray((requestedSchema as { required?: unknown[] } | null | undefined)?.required).map((k) => String(k)),
+  )
 
   const items: QuestionItem[] = []
   for (const [key, raw] of props) {
@@ -92,6 +98,7 @@ export function parseQuestionForm(requestedSchema: unknown): QuestionItem[] | nu
       multiple,
       ...(customKey ? { customKey } : {}),
       kind,
+      required: requiredKeys.has(key),
     })
   }
   return items.length ? items : null
@@ -119,7 +126,7 @@ export function renderQuestion(item: QuestionItem, index: number, total: number)
   } else {
     lines.push("请直接回复内容")
   }
-  lines.push("回复「取消」放弃本次提问")
+  lines.push("回复「取消」放弃；30 分钟未答：可选题自动跳过，必填题中止")
   return lines.join("\n")
 }
 
@@ -199,4 +206,25 @@ export function toFormContent(answers: Array<{ item: QuestionItem; value: string
     if (custom && item.customKey) content[item.customKey] = Array.isArray(value) ? value.join(", ") : value
   }
   return content
+}
+
+export type TimeoutOutcome =
+  | { action: "accept"; content: Record<string, unknown> }
+  | { action: "cancel" }
+
+/**
+ * 30 分钟未作答的归宿（2026-11-08 用户拍板：沉默 ≠ 拒绝，未答应跳过）。
+ * - 存在「未答的必填题」→ cancel（此时 cancel 才是真语义：任务缺必要输入，必须中止）
+ * - 否则 → accept 已收集的答案（缺的题上游会写成 Unanswered，模型按默认继续推进）
+ * 与上游 question 工具对齐：cancelled 分支会回给模型 "The user dismissed this question"
+ * （用户主动拒绝），绝不能拿来表示「用户没看见/没来得及答」。
+ */
+export function timeoutOutcome(
+  questions: readonly QuestionItem[],
+  answers: ReadonlyArray<{ item: QuestionItem; value: string | string[]; custom: boolean }>,
+): TimeoutOutcome {
+  const answeredKeys = new Set(answers.map((a) => a.item.key))
+  const missingRequired = questions.some((q) => q.required && !answeredKeys.has(q.key))
+  if (missingRequired) return { action: "cancel" }
+  return { action: "accept", content: toFormContent([...answers]) }
 }

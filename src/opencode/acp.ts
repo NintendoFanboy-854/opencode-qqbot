@@ -105,10 +105,9 @@ export interface AcpClientOptions {
   /** 单条请求超时（默认 10 分钟；prompt 另走 promptTimeoutMs） */
   requestTimeoutMs?: number
   /**
-   * session/prompt 回合超时（默认 60 分钟）。
-   * 2026-11-08 缺陷：沿用 10 分钟通用超时，长回合（考据读 235MB app.asar、多轮工具）
-   * 必被判死——11:46:12 发出、11:56:12 整超时，服务端 turn 却仍在跑，
-   * 随后队列 drain 再发 prompt 撞出 -32603。60 分钟与官方单聊被动窗口一致。
+   * session/prompt 回合超时（默认 30 分钟——2026-11-08 用户拍板「统一三十分钟」）。
+   * 历史：先 10 分钟（通用超时，长回合必被判死 → 11:46 出的 -32603 级联），
+   * 再 60 分钟，现按统一口径收敛到 30 分钟；与审批 30 分钟、提问 30 分钟同表。
    */
   promptTimeoutMs?: number
 }
@@ -292,8 +291,8 @@ export class AcpClient {
   }
 
   async prompt(sessionId: string, prompt: Array<{ type: "text"; text: string } | Record<string, unknown>>): Promise<{ stopReason?: string }> {
-    // 回合走独立超时（默认 60 分钟），不再吃 10 分钟通用超时——见 AcpClientOptions.promptTimeoutMs
-    const timeoutMs = this.opts.promptTimeoutMs ?? 60 * 60_000
+    // 回合走独立超时（默认 30 分钟，统一口径），不再吃 10 分钟通用超时
+    const timeoutMs = this.opts.promptTimeoutMs ?? 30 * 60_000
     return this.request("session/prompt", { sessionId, prompt }, timeoutMs)
   }
 

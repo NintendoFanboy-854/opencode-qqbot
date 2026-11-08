@@ -47,7 +47,7 @@ import { createDelivery } from "./core/delivery.js"
 import { createNotifySink } from "./core/notify-sink.js"
 import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approval.js"
 import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
-import { parseQuestionForm, renderQuestion, parseAnswer, toFormContent, type QuestionItem } from "./core/question-form.js"
+import { parseQuestionForm, renderQuestion, parseAnswer, toFormContent, timeoutOutcome, type QuestionItem } from "./core/question-form.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
 import {
   claimInflightDetailed,
@@ -586,8 +586,11 @@ export function createBridge(
     timer: ReturnType<typeof setTimeout>
   }
   const pendingElicitations = new Map<string, PendingAcpElicitation>()
-  // 必须小于 ACP session/prompt 的 10 分钟请求超时，否则会在作答前把整轮判超时
-  const ELICITATION_TTL_MS = 8 * 60_000
+  // 时限统一表（2026-11-08 用户拍板「统一三十分钟」）：
+  //   提问/表单 30 分钟 → 未答按「跳过」（无必填）或「中止」（有必填）
+  //   审批       30 分钟 → 自动拒绝（fail-closed，见 core/permission.ts）
+  //   prompt 回合 30 分钟 → cancel 释放会话（见 opencode/acp.ts）
+  const ELICITATION_TTL_MS = 30 * 60_000
 
   function askCurrentQuestion(userId: string, pending: PendingAcpElicitation): void {
     const item = pending.questions[pending.index]
@@ -620,8 +623,18 @@ export function createBridge(
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingElicitations.delete(userId)
-        void safeDeliver(pctx, "⏰ 提问已超时，已取消")
-        resolve({ action: "cancel" })
+        // 2026-11-08 语义修正：沉默 ≠ 用户拒绝。无必填时按「未答」继续（工具会写成
+        // Unanswered，模型自行推进），只有必填题未答才中止——与上游 question 工具
+        // 的 cancelled=「用户拒绝」语义严格区分。
+        const outcome = timeoutOutcome(pending.questions, pending.answers)
+        if (outcome.action === "accept") {
+          console.log(`[elicitation] 超时跳过 user=${userId.slice(0, 8)}… 已答 ${pending.answers.length}/${pending.questions.length}`)
+          void safeDeliver(pctx, "⏰ 30 分钟未作答，已按「未答」继续（AI 按默认推进；/history 可查看）")
+        } else {
+          console.log(`[elicitation] 超时中止 user=${userId.slice(0, 8)}… 存在未答必填题`)
+          void safeDeliver(pctx, "⏰ 30 分钟未作答，且该题为必填，已中止本次提问")
+        }
+        resolve(outcome)
       }, ELICITATION_TTL_MS)
       const pending: PendingAcpElicitation = { questions, answers: [], index: 0, resolve, timer }
       pendingElicitations.set(userId, pending)
