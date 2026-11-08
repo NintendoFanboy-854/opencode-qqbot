@@ -12,6 +12,7 @@ import { prepareQQAttachments, augmentPromptWithAttachments, purgeOldQQImages } 
 import type { OpencodeClient, SessionMessage, PermissionRequest } from "./opencode/client.js"
 import { collectReplyText, SupersededError, turnStateOf } from "./opencode/client.js"
 import { createEventStream, type V2Event } from "./opencode/eventstream.js"
+import { createAcpSessionRunner } from "./opencode/acp-session.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
 import {
@@ -73,6 +74,11 @@ import { extractSendFileMarkers, sendLocalFile } from "./core/send-media.js"
 import type { InteractionEvent } from "./qq/types.js"
 // O7b：解析/格式化保持经 bridge 再导出——单测与既有调用方导入路径不变
 export { parsePermissionDecision, formatPermissionPrompt, formatPermissionConflictNotice } from "./core/permission.js"
+
+/** 传输选择（纯函数，灰度开关）：仅显式 acp 才走 ACP，其余一律 rest。 */
+export function parseTransport(value: string | undefined): "acp" | "rest" {
+  return /^acp$/i.test((value ?? "").trim()) ? "acp" : "rest"
+}
 
 // E 闲置回收纯函数（导出供测试，2026-10-29）：返回应回收的闲置会话 id——
 // 超过 idleMs 无活动且未被 /watch 显式盯住的会话。
@@ -521,13 +527,47 @@ export function createBridge(
     )
   }
 
+  // ACP 迁移（P2）：QQ 侧 turn 的传输选择。默认 rest；灰度验证后切 acp。
+  // acp 模式下：turn 走 session/prompt，审批走 session/request_permission（引擎阻塞），
+  // 常驻权限轮询停用（表单轮询保留到 P3）。
+  const TRANSPORT: "acp" | "rest" = parseTransport(process.env.QQBOT_TRANSPORT)
+  const acpRunner =
+    TRANSPORT === "acp"
+      ? createAcpSessionRunner({
+          cwd: process.env.QQBOT_ACP_CWD ?? process.cwd(),
+          sessions,
+          handlers: {
+            onPermission: async (userId, view) => {
+              const pctx = ctxForUser(userId)
+              const request = {
+                id: view.id,
+                sessionID: view.sessionID,
+                action: view.action,
+                resources: view.resources,
+              }
+              const decision = await perm.waitForDecision(pctx, request, view.sessionID)
+              const text =
+                decision === "reject"
+                  ? "已拒绝，该操作不会执行；AI 将继续其余步骤"
+                  : `已${DECISION_LABELS[decision]}，AI 将继续执行…`
+              void safeDeliver(pctx, text)
+              return decision
+            },
+          },
+        })
+      : null
+  if (acpRunner) console.log("[bridge] transport=acp（ACP 传输启用；权限由 session/request_permission 阻塞）")
+
   async function interactionTick(): Promise<void> {
     try {
-      const [permRes] = await Promise.all([client.permission.list()])
-      for (const req of permRes?.data ?? []) {
-        for (const uid of usersOfSession(req.sessionID)) {
-          if (perm.hasPending(uid)) continue // 单一槽：在挂起（含同 id）即跳过
-          perm.pushExternal(uid, ctxForUser(uid), req, req.sessionID)
+      // ACP 模式下权限由 session/request_permission 实时承接，轮询只留表单（P3 再移除）。
+      if (TRANSPORT !== "acp") {
+        const [permRes] = await Promise.all([client.permission.list()])
+        for (const req of permRes?.data ?? []) {
+          for (const uid of usersOfSession(req.sessionID)) {
+            if (perm.hasPending(uid)) continue // 单一槽：在挂起（含同 id）即跳过
+            perm.pushExternal(uid, ctxForUser(uid), req, req.sessionID)
+          }
         }
       }
       // 表单按会话列表（GET /api/form 是 location 维度，bot cwd 不在会话项目会漏）
@@ -993,7 +1033,10 @@ export function createBridge(
       let trackId = "" // R 项：在途台账跟踪键（try/catch 跨块可见）
       let promptId = "" // 修复⑧：本回合 user 消息 id（直答归属锚点）
       try {
-        const session = await sessions.getOrCreate(ctx.userId)
+        const session =
+          TRANSPORT === "acp" && acpRunner
+            ? { sessionId: await acpRunner.getOrCreate(ctx.userId) }
+            : await sessions.getOrCreate(ctx.userId)
         sessionId = session.sessionId
         sessionLastActivity.set(sessionId, Date.now())
 
@@ -1030,7 +1073,15 @@ export function createBridge(
         recordInflight({ msgId: trackId, userId: ctx.userId, sessionId, text: content.slice(0, 300), at: Date.now() })
         markInflightStage(trackId, "dispatched", { sessionId })
         console.log(`[journal] dispatch user=${ctx.userId.slice(0, 8)}… msg=${shortId(trackId)} sid=${shortId(sessionId)}`)
-        const replyText = await client.promptAndWait(sessionId, promptText, {
+        let replyText: string
+        if (TRANSPORT === "acp" && acpRunner && files.length === 0) {
+          // ACP 主路径：session/prompt 驱动；权限由 request_permission 在回合内阻塞。
+          markInflightStage(trackId, "running", { sessionId })
+          const run = await acpRunner.run(ctx.userId, promptText)
+          replyText = run.text.trim() || (run.stopReason === "cancelled" ? "（操作已取消）" : "(AI 未返回内容)")
+        } else {
+          if (TRANSPORT === "acp") console.log("[bridge] acp 附件回合回退 REST（P2.5 再接 ACP 附件）")
+          replyText = await client.promptAndWait(sessionId, promptText, {
           files: files.length ? files : undefined,
           // 修复⑧：受领即落台账锚点 + 本地闭合变量（前台超时转后台等待要带上）
           onAccepted: (info) => {
@@ -1075,7 +1126,8 @@ export function createBridge(
               })()
             }, 10 * 60_000).unref?.()
           },
-        })
+          })
+        }
 
         if (replyText.trim()) {
           // 缺口 4：AI 主动发文件——QQ_SEND_FILE 标记行拦截发送文件，剩余文本照送
