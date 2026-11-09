@@ -104,7 +104,7 @@ function formatDefault(value: unknown): string {
 }
 
 function fieldHint(field: FieldLike): string {
-  if (field.type === "multiselect") return '回复字母（多选用逗号，如 "A,C"）'
+  if (field.type === "multiselect") return "点按钮多选，选完点「完成」；也可回复字母（多选用逗号）"
   if (field.type === "boolean") return "回复 是 / 否"
   if (field.type === "number" || field.type === "integer") {
     const min = typeof field.minimum === "number" ? `最小 ${field.minimum}` : ""
@@ -130,6 +130,7 @@ export function renderFieldPrompt(
   field: FieldLike,
   position: number,
   total: number,
+  selected?: string[],
 ): string {
   const lines = [`需要你的选择：${redactSecrets(form.title)}`]
   if (total > 1) lines.push(`（第 ${position}/${total} 题）`)
@@ -137,13 +138,17 @@ export function renderFieldPrompt(
   if (field.description) lines.push(redactSecrets(field.description))
   if (field.type === "external") {
     if (field.url) lines.push(`外部表单：${field.url}`)
-    lines.push("（该字段在浏览器中完成；回复「跳过」继续）")
+    lines.push("（点「打开外部表单」，完成后点「继续」）")
     return lines.join("\n")
   }
   if ((field.type === "multiselect" || field.type === "string") && field.options?.length) {
     field.options.slice(0, LETTERS.length).forEach((opt, i) => {
       lines.push(`${LETTERS[i]}) ${redactSecrets(opt.label)}`)
     })
+    if (field.type === "multiselect" && selected?.length) {
+      const labels = selected.map((value) => field.options?.find((opt) => opt.value === value)?.label ?? value)
+      lines.push(`已选：${labels.join("、")}`)
+    }
     lines.push(fieldHint(field))
   } else {
     lines.push(fieldHint(field))
@@ -284,6 +289,10 @@ export interface FormButtonData {
   v: string
   /** true=该按钮是“跳过”而非选项值 */
   s?: boolean
+  /** true=多选切换按钮 */
+  m?: boolean
+  /** true=多选完成按钮 */
+  d?: boolean
   i?: string
 }
 
@@ -308,6 +317,8 @@ export function decodeFormButton(raw: string | undefined): FormButtonData | unde
         k: parsed.k,
         v: parsed.v,
         ...(parsed.s === true ? { s: true } : {}),
+        ...(parsed.m === true ? { m: true } : {}),
+        ...(parsed.d === true ? { d: true } : {}),
         ...(interactionId ? { i: interactionId } : {}),
       }
     }
@@ -322,8 +333,13 @@ function clipButtonLabel(text: string): string {
   return s.length > BUTTON_LABEL_MAX ? s.slice(0, BUTTON_LABEL_MAX - 1) + "…" : s
 }
 
-/** 为单个字段生成按钮键盘：字符串选项/布尔；多选与自由文本走文字。 */
-export function buildFieldKeyboard(form: FormInfo, field: FieldLike, _ownerOpenid: string): InlineKeyboard | null {
+/** 为单个字段生成按钮键盘：字符串选项/布尔/多选/外部链接；自由文本与数字走文字。 */
+export function buildFieldKeyboard(
+  form: FormInfo,
+  field: FieldLike,
+  _ownerOpenid: string,
+  selected: string[] = [],
+): InlineKeyboard | null {
   const buttons: KeyboardButton[] = []
   if (field.type === "string" && field.options?.length) {
     if (field.options.length > 24) return null
@@ -338,6 +354,33 @@ export function buildFieldKeyboard(form: FormInfo, field: FieldLike, _ownerOpeni
         },
       })
     }
+  } else if (field.type === "multiselect" && field.options?.length) {
+    if (field.options.length > 22) return null
+    for (const opt of field.options) {
+      const picked = selected.includes(opt.value)
+      buttons.push({
+        id: `form-${form.id}-${field.key}-${opt.value}`.slice(0, 64),
+        render_data: {
+          label: clipButtonLabel(opt.label),
+          visited_label: clipButtonLabel(picked ? `已选 ${opt.label}` : opt.label),
+          style: picked ? 1 : 0,
+        },
+        action: {
+          type: 1,
+          permission: { type: 2 },
+          data: encodeFormButton({ t: "form", f: form.id, k: field.key, v: opt.value, m: true }),
+        },
+      })
+    }
+    buttons.push({
+      id: `form-${form.id}-${field.key}-done`.slice(0, 64),
+      render_data: { label: "完成", visited_label: "已提交", style: 1 },
+      action: {
+        type: 1,
+        permission: { type: 2 },
+        data: encodeFormButton({ t: "form", f: form.id, k: field.key, v: "", d: true }),
+      },
+    })
   } else if (field.type === "boolean") {
     for (const [label, value] of [["是", "true"], ["否", "false"]] as const) {
       buttons.push({
@@ -350,10 +393,25 @@ export function buildFieldKeyboard(form: FormInfo, field: FieldLike, _ownerOpeni
         },
       })
     }
+  } else if (field.type === "external" && field.url) {
+    buttons.push({
+      id: `form-${form.id}-${field.key}-open`.slice(0, 64),
+      render_data: { label: "打开外部表单", visited_label: "打开外部表单", style: 1 },
+      action: { type: 0, permission: { type: 2 }, data: field.url },
+    })
+    buttons.push({
+      id: `form-${form.id}-${field.key}-continue`.slice(0, 64),
+      render_data: { label: "继续", visited_label: "已继续", style: 0 },
+      action: {
+        type: 1,
+        permission: { type: 2 },
+        data: encodeFormButton({ t: "form", f: form.id, k: field.key, v: "", s: true }),
+      },
+    })
   } else {
     return null
   }
-  if (!field.required) {
+  if (!field.required && field.type !== "external" && !buttons.some((button) => button.render_data.label === "跳过")) {
     buttons.push({
       id: `form-${form.id}-${field.key}-skip`.slice(0, 64),
       render_data: { label: "跳过", visited_label: "已跳过", style: 0 },
@@ -522,15 +580,9 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     }
     const { field, index } = current
     const { position, total } = fieldProgress(entry, index)
-    const text = renderFieldPrompt(entry.form, field, position, total)
-    if (field.type === "external") {
-      await deps.sendReply(entry.ctx, text).catch((error) => {
-        console.error("[form-bridge] 外部表单提示发送失败:", error instanceof Error ? error.message : error)
-      })
-      await advance(entry, field, { skip: true })
-      return
-    }
-    const keyboard = buildFieldKeyboard(entry.form, field, entry.userId)
+    const selected = Array.isArray(entry.answers?.[field.key]) ? (entry.answers?.[field.key] as string[]) : []
+    const text = renderFieldPrompt(entry.form, field, position, total, selected)
+    const keyboard = buildFieldKeyboard(entry.form, field, entry.userId, selected)
     if (keyboard && deps.sendFormCard) {
       const passive = position === 1
       const sent = await deps.sendFormCard(entry.ctx, entry.form, keyboard, text, passive).catch(() => false)
@@ -539,6 +591,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     await deps.sendReply(entry.ctx, text).catch((error) => {
       console.error("[form-bridge] 字段提示发送失败:", error instanceof Error ? error.message : error)
     })
+    if (field.type === "external") await advance(entry, field, { skip: true })
   }
 
   async function advance(entry: InternalPendingForm, field: FieldLike, parsed: ParsedFieldValue): Promise<void> {
@@ -854,12 +907,54 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     const interactionId = button.i ?? event.data?.resolved?.button_id ?? event.id
     if (interactionId) entry.interactionId = interactionId
 
+    if (button.d) {
+      if (field.type !== "multiselect") {
+        rejectButton(ctx)
+        return true
+      }
+      const selected = Array.isArray(entry.answers?.[field.key]) ? (entry.answers?.[field.key] as string[]) : []
+      if (selected.length === 0) {
+        if (!field.required) {
+          void track(advance(entry, field, { skip: true }))
+          return true
+        }
+        void deliver(ctx, `该题必填。${fieldHint(field)}`)
+        return true
+      }
+      if (field.minItems !== undefined && selected.length < field.minItems) {
+        void deliver(ctx, `至少选择 ${field.minItems} 项。${fieldHint(field)}`)
+        return true
+      }
+      if (field.maxItems !== undefined && selected.length > field.maxItems) {
+        void deliver(ctx, `最多选择 ${field.maxItems} 项。${fieldHint(field)}`)
+        return true
+      }
+      void track(advance(entry, field, { value: selected }))
+      return true
+    }
+
     if (button.s) {
-      if (field.required) {
+      if (field.required && field.type !== "external") {
         void deliver(ctx, `该题必填。${fieldHint(field)}`)
         return true
       }
       void track(advance(entry, field, { skip: true }))
+      return true
+    }
+
+    if (field.type === "multiselect") {
+      const option = field.options?.find((candidate) => candidate.value === button.v)
+      if (!option) {
+        rejectButton(ctx)
+        return true
+      }
+      const selected = Array.isArray(entry.answers?.[field.key]) ? [...(entry.answers?.[field.key] as string[])] : []
+      const idx = selected.indexOf(option.value)
+      if (idx >= 0) selected.splice(idx, 1)
+      else selected.push(option.value)
+      entry.answers = { ...(entry.answers ?? {}), [field.key]: selected }
+      persist(entry)
+      void track(sendCurrentField(entry))
       return true
     }
 
@@ -877,13 +972,6 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
         return true
       }
       value = option.value
-    } else if (field.type === "multiselect") {
-      const option = field.options?.find((candidate) => candidate.value === button.v)
-      if (!option) {
-        rejectButton(ctx)
-        return true
-      }
-      value = [option.value]
     } else {
       rejectButton(ctx)
       return true

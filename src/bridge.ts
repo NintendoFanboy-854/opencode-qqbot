@@ -541,18 +541,40 @@ export function createBridge(
     sendReply,
     safeDeliver,
     sendFormCard: async (ctx, _form, keyboard, text, passive) => {
+      let token: string
       try {
-        const token = await getAccessToken(config.qq.appId, config.qq.clientSecret)
-        // 第一题用被动回复；后续题改用主动消息，避免单条消息 4 次被动回复上限。
-        const replyTo = passive ? ctx.msgId || undefined : undefined
+        token = await getAccessToken(config.qq.appId, config.qq.clientSecret)
+      } catch (error) {
+        console.error("[bridge] 表单卡片获取 token 失败:", error instanceof Error ? error.message : error)
+        return false
+      }
+      const send = async (usePassive: boolean, withKeyboard: boolean, markdown: boolean): Promise<void> => {
+        const replyTo = usePassive ? ctx.msgId || undefined : undefined
         if (ctx.type === "group" && ctx.groupId) {
-          await sendGroupMessage(token, ctx.groupId, text, replyTo, undefined, true, keyboard)
+          await sendGroupMessage(token, ctx.groupId, text, replyTo, undefined, markdown, withKeyboard ? keyboard : undefined)
         } else {
-          await sendC2CMessage(token, ctx.userId, text, replyTo, undefined, true, keyboard)
+          await sendC2CMessage(token, ctx.userId, text, replyTo, undefined, markdown, withKeyboard ? keyboard : undefined)
         }
+      }
+      if (passive && ctx.msgId) {
+        try {
+          await send(true, true, true)
+          return true
+        } catch (error) {
+          console.error("[bridge] 表单卡片被动发送失败，改主动重试:", error instanceof Error ? error.message : error)
+        }
+      }
+      try {
+        await send(false, true, true)
         return true
       } catch (error) {
-        console.error("[bridge] 表单卡片发送失败，降级文字:", error instanceof Error ? error.message : error)
+        console.error("[bridge] 表单卡片主动发送失败，降级主动文本:", error instanceof Error ? error.message : error)
+      }
+      try {
+        await send(false, false, true)
+        return true
+      } catch (error) {
+        console.error("[bridge] 表单主动文本发送失败:", error instanceof Error ? error.message : error)
         return false
       }
     },

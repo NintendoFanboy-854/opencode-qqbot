@@ -90,7 +90,8 @@ export interface CardApprovalDeps {
   clientSecret: string
 }
 
-/** 发送审批卡片；成功=true。失败由调用方降级文字菜单（本函数不外抛）。 */
+/** 发送审批卡片；成功=true。失败由调用方降级文字菜单（本函数不外抛）。
+ *  被动 msg_id 过期/次数用尽时自动改用主动消息；桌面端回合直接走主动。 */
 export async function sendApprovalCard(
   deps: CardApprovalDeps,
   ctx: MessageContext,
@@ -98,20 +99,59 @@ export async function sendApprovalCard(
   mainSessionId: string,
   origin?: PermOrigin,
 ): Promise<boolean> {
+  let token: string
   try {
-    const token = await getAccessToken(deps.appId, deps.clientSecret)
-    const keyboard = buildApprovalKeyboard(request, ctx.userId)
-    // 正文复用现有格式化（用户看到的字段与文字菜单完全一致）；origin 标注发起来源
-    const text = formatPermissionPrompt(request, mainSessionId, origin)
+    token = await getAccessToken(deps.appId, deps.clientSecret)
+  } catch (error) {
+    console.error("[card-approval] 获取 token 失败:", error instanceof Error ? error.message : error)
+    return false
+  }
+  const keyboard = buildApprovalKeyboard(request, ctx.userId)
+  // 正文复用现有格式化（用户看到的字段与文字菜单完全一致）；origin 标注发起来源
+  const text = formatPermissionPrompt(request, mainSessionId, origin)
+
+  const send = async (passive: boolean, withKeyboard: boolean, markdown: boolean): Promise<void> => {
+    const msgId = passive ? ctx.msgId || undefined : undefined
     if (ctx.type === "group" && ctx.groupId) {
-      await sendGroupMessage(token, ctx.groupId, text, ctx.msgId, undefined, true, keyboard)
+      await sendGroupMessage(token, ctx.groupId, text, msgId, undefined, markdown, withKeyboard ? keyboard : undefined)
     } else {
-      await sendC2CMessage(token, ctx.userId, text, ctx.msgId, undefined, true, keyboard)
+      await sendC2CMessage(token, ctx.userId, text, msgId, undefined, markdown, withKeyboard ? keyboard : undefined)
     }
-    console.log(`[card-approval] 审批卡片已发送 user=${ctx.userId.slice(0, 8)}… request=${request.id}`)
+  }
+
+  // 桌面端/外部回合没有可用的被动窗口；直接主动，避免陈旧 msg_id。
+  if (origin !== "external" && ctx.msgId) {
+    try {
+      await send(true, true, true)
+      console.log(`[card-approval] 审批卡片已发送（被动）user=${ctx.userId.slice(0, 8)}… request=${request.id}`)
+      return true
+    } catch (error) {
+      console.error("[card-approval] 被动卡片发送失败，改主动重试:", error instanceof Error ? error.message : error)
+    }
+  }
+
+  try {
+    await send(false, true, true)
+    console.log(`[card-approval] 审批卡片已发送（主动）user=${ctx.userId.slice(0, 8)}… request=${request.id}`)
     return true
   } catch (error) {
-    console.error("[card-approval] 审批卡片发送失败，将降级文字菜单:", error instanceof Error ? error.message : error)
+    console.error("[card-approval] 主动卡片发送失败，降级主动纯文本:", error instanceof Error ? error.message : error)
+  }
+
+  try {
+    await send(false, false, true)
+    console.log(`[card-approval] 审批已降级为主动文本（无按钮）user=${ctx.userId.slice(0, 8)}… request=${request.id}`)
+    return true
+  } catch (error) {
+    console.error("[card-approval] 审批主动文本发送失败:", error instanceof Error ? error.message : error)
+  }
+
+  try {
+    await send(false, false, false)
+    console.log(`[card-approval] 审批已降级为主动纯文本 user=${ctx.userId.slice(0, 8)}… request=${request.id}`)
+    return true
+  } catch (error) {
+    console.error("[card-approval] 审批纯文本发送失败:", error instanceof Error ? error.message : error)
     return false
   }
 }
