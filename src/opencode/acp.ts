@@ -110,6 +110,8 @@ export interface AcpClientOptions {
   env?: NodeJS.ProcessEnv
   /** 单条请求超时（默认 10 分钟；prompt 另走 promptTimeoutMs） */
   requestTimeoutMs?: number
+  /** initialize 握手超时（默认 30 秒；握手失败即清理子进程，可再次 start） */
+  handshakeTimeoutMs?: number
   /**
    * session/prompt 回合超时（默认 6 小时**硬上限**）。
    * 分两层（2026-11-08 用户拍板「会话没有超时限，只有弹窗有超时」）：
@@ -152,7 +154,7 @@ export class AcpClient {
     return !!this.child && !this.stopped
   }
 
-  /** 启动子进程并完成 ACP initialize。 */
+  /** 启动子进程并完成 ACP initialize。可重入：子进程退出后 child 置空，可再次拉起。 */
   async start(): Promise<void> {
     if (this.child) return
     const cmd = this.opts.command ?? (process.platform === "win32" ? ["cmd", "/c", "opencode"] : ["opencode"])
@@ -172,9 +174,12 @@ export class AcpClient {
     child.stderr.on("data", () => {
       // ACP 的 stdout 只承载协议；stderr 是日志。此处不落正文，避免噪声/泄密。
     })
-    child.on("error", (error) => this.failAll(error instanceof Error ? error : new Error(String(error))))
+    child.on("error", (error) => {
+      this.teardown()
+      this.failAll(error instanceof Error ? error : new Error(String(error)))
+    })
     child.on("exit", (code, signal) => {
-      this.stopped = true
+      this.teardown()
       this.failAll(new Error(`ACP 进程退出 code=${code} signal=${signal ?? ""}`))
       this.handlers.onExit?.(code, signal)
     })
@@ -183,10 +188,23 @@ export class AcpClient {
     // elicitation.form 是 `{_meta?}` 形状，写成 true 会被判为无效能力，
     // opencode 侧 formElicitation=false → 表单/提问直接被取消，
     // question 工具只会回 "The question couldn't be shown..."（不产生任何下发）。
-    await this.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: { elicitation: { form: {} } },
-    })
+    // 2026-11-09 加固：initialize 独立握手超时（默认 30s，不再吃 10 分钟通用超时）；
+    // 握手失败立即清理子进程，下次 start() 可干净重试。
+    try {
+      await this.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      }, this.opts.handshakeTimeoutMs ?? 30_000)
+    } catch (error) {
+      this.teardown()
+      throw error
+    }
+  }
+
+  /** 清理子进程引用（不杀进程——exit/error 路径进程已不在；stop() 先杀再调）。 */
+  private teardown(): void {
+    this.stopped = true
+    this.child = null
   }
 
   private consume(chunk: string): void {
@@ -271,8 +289,13 @@ export class AcpClient {
     this.child.stdin.write(JSON.stringify(msg) + "\n")
   }
 
-  /** JSON-RPC 请求（带超时）；timeoutMs=0 表示**不设超时**（回合默认不设，见 prompt）。 */
+  /** JSON-RPC 请求（带超时）；timeoutMs=0 表示**不设超时**（回合默认不设，见 prompt）。
+   *  2026-11-09 加固：传输未连接（子进程退出/未启动）时立即失败，
+   *  不再把请求写进死 stdin 后干等 10 分钟/6 小时超时。 */
   request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+    if (!this.child || this.stopped) {
+      return Promise.reject(new Error(`ACP 传输未连接: ${method}`))
+    }
     const id = ++this.seq
     const timeout = timeoutMs ?? this.opts.requestTimeoutMs ?? 10 * 60_000
     return new Promise<T>((resolve, reject) => {

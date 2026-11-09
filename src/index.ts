@@ -120,6 +120,19 @@ async function main(): Promise<void> {
   touchHeartbeat()
   const heartbeatTimer = setInterval(touchHeartbeat, 60_000)
   heartbeatTimer.unref?.()
+  // 事件循环漂移遥测（2026-11-09 心跳停滞事故）：预期每 30s 触发一次，
+  // 实际延迟 = 定时器被事件循环推迟了多少。漂移 >5s 说明 loop 被卡住，
+  // 心跳/审批 TTL 等所有定时器都会被同步推迟——直接输出证据。
+  let lastTick = Date.now()
+  const lagTimer = setInterval(() => {
+    const now = Date.now()
+    const drift = now - lastTick - 30_000
+    lastTick = now
+    if (drift > 5_000) {
+      console.warn(`[loop-lag] 事件循环漂移 ${Math.round(drift / 1000)}s（定时器被推迟，心跳可能失新鲜）`)
+    }
+  }, 30_000)
+  lagTimer.unref?.()
 
   let client: OpencodeClient
   try {
@@ -127,6 +140,7 @@ async function main(): Promise<void> {
   } catch (error) {
     // 启动失败立即交还锁，缩短下一次接管的等待（否则锁要等 30s 过期才回收）
     clearInterval(heartbeatTimer)
+    clearInterval(lagTimer)
     instanceLock?.release()
     throw error
   }
@@ -176,6 +190,7 @@ async function main(): Promise<void> {
     shuttingDown = true
     console.log(`[index] 收到 ${signal}，开始退出...`)
     clearInterval(heartbeatTimer)
+    clearInterval(lagTimer)
     instanceLock?.release()
     linkWatch.stop()
     gateway.stop()

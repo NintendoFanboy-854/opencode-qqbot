@@ -121,7 +121,12 @@ export class AcpSessionRunner {
             const userId = this.userBySession.get(sid)
             if (userId) this.handlers.onPromptNotice?.(userId, sid)
           },
-          onExit: (code) => this.handlers.onExit?.(code),
+          onExit: (code) => {
+            // 传输死亡后必须放行 start() 重试，否则看门狗重启永落空（2026-11-09 事故实证）
+            this.ready = null
+            this.loaded.clear()
+            this.handlers.onExit?.(code)
+          },
           onError: (error) => console.error("[acp-session] 传输错误:", error.message),
         },
       )
