@@ -384,6 +384,21 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
     let killedPid: number | null = null
     if (action.kind === "grace-kill-spawn" && action.killPid !== process.pid) {
       const pid = action.killPid
+      // —— 杀前复核（2026-11-09 加固红线）：decide 与执行之间 bot 可能刚恢复心跳
+      //（事件循环解堵/冷启动落盘延迟），此时直接杀=误杀良民（合法杀掉干活中的 bot）。
+      // 复核前先给 bot 的心跳写入一个短暂到达窗口（300ms）：读健康度与动刀之间
+      // 若有心跳落盘必须被看见；随后重读一次，转新鲜即改判 ok、放弃本轮，全程审计留痕。
+      // 心跳「缺失」不豁免（语义同 decide：缺失视为未恢复，维持原判）。——
+      await sleep(300)
+      const recheck = readBotHealth(deps.paths, Date.now())
+      const recheckFresh =
+        recheck.heartbeatAgeMs !== null && recheck.heartbeatAgeMs <= HEARTBEAT_STALE_MS
+      if (recheck.pidAlive !== false && recheckFresh) {
+        const ageSec = Math.round((recheck.heartbeatAgeMs ?? 0) / 1000)
+        audit(`杀前复核改判 ok：pid=${pid} 心跳已恢复（年龄 ${ageSec}s），放弃误杀`)
+        log(`[supervisor] 杀前复核改判 ok：心跳已恢复（${ageSec}s），放弃杀 pid=${pid}`)
+        return { action: "ok", detail: `杀前复核：心跳已恢复，放弃误杀 pid=${pid}`, killedPid: null, spawnedPid: null }
+      }
       // 升级杀（fleet-guard）：TERM → 宽限轮询 → KILL。
       // Windows 上 Node 的 SIGTERM≈立即终止（无 handler 语义），宽限主要服务 posix；
       // 但轮询仍统一：确认死亡后才拉起，绝不「边杀边拉」。
@@ -417,7 +432,9 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
       log("[supervisor] 强度账落盘失败（不影响本次拉起）")
     }
     const detail = `${action.reason}；${killedPid ? `已优雅停 pid=${killedPid}；` : ""}已拉起 pid=${spawnedPid}`
-    audit(`restart：${detail}`)
+    // 审计分家（2026-11-09 加固红线）：「主动杀」与「验尸拉新」必须在日志里一眼可辨——
+    // 历史上两者同文案导致无声死亡无法归因（2026-11-09 他杀排查实证：审计缺陷遮蔽真凶）。
+    audit(killedPid ? `主动杀：${detail}` : `验尸拉新：${detail}`)
     return { action: "restart", detail, killedPid, spawnedPid }
   } finally {
     release()

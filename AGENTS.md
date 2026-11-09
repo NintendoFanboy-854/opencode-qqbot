@@ -46,3 +46,25 @@
 
 - `src/core/discovery.ts` 的 `netstat`/`ss` 端口枚举：已有 Windows/Linux/macOS 三分支 + 失败降级，
   属「OS 命令不可完全避免」的既有例外；新增 OS 依赖必须按同一标准给出分支与降级。
+
+## 5. 进程处置红线（2026-11-09 加固，违反即事故复盘）
+
+背景：2026-11-09 一日 ≥6 次「无声死亡」（无退出日志），排查实证全部非自监控所为——
+真凶是**外部裸杀**（另一会话自认「反复在回合进行中 kill 重启 bot」）。自监控侧已加固
+（杀前复核 + 审计分家：`主动杀`/`验尸拉新` 在 watchdog.log 一眼可辨），操作侧红线如下：
+
+1. **禁止裸杀**：不得 `taskkill`/`Stop-Process`/任务管理器结束 bot（`bun.exe` 运行
+   `openqq-bot.js` 的实例）。Windows 下进程被杀无退出日志、在途审批/回合随之中断，
+   事后无法归因。
+2. **重启唯一入口**：`node <plugin>/dist/openqq-cli.js restart --force`（走锁交接，
+   30s 僵尸锁宽限后由自愈链拉新）。执行前必须查在途：
+   `node <plugin>/dist/openqq-cli.js queue` 或读 `~/.openqq/inflight.json`——
+   有 inflight 回合时先告知用户「将中断当前回合」或等待其完成。
+3. **改码/部署窗口纪律**：部署 bundle 后若需立即生效，优先等回合自然结束或 Heartbeat
+   间隙再 restart；禁止在 bot 处理长回合（>5min）时反复 restart（心跳陈旧会触发看门狗
+   优雅杀，与人工重启叠加成连环死亡）。
+4. **归因义务**：任何 bot 死亡后，先查 `~/.openqq/watchdog.log`——
+   `主动杀` = 看门狗合法动刀（附原因）；`验尸拉新` = 死因为外部/系统级，结合
+   死亡时刻的操作记录（谁跑了 kill/restart）归因，不得复归为「又掉线了」了事。
+5. **多会话协同**：两个 opencode 会话同仓工作时，动手前 `git status` + 查在途 +
+   看 watchdog.log 尾部三件套，避免一方重启 bot 打断另一方正在服务的用户回合。
