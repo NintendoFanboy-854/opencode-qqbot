@@ -279,7 +279,10 @@ export function createBridge(
   // SSE execution.succeeded 即时触发 + 5 分钟轮询兜底（防 SSE 断连漏事件），
   // 上限 24 小时。用户在同一会话发起新回合时被取代（避免同一结果投递两次）。
   const BG_WAIT_MAX_MS = 24 * 60 * 60 * 1000
-  const BG_POLL_MS = 5 * 60 * 1000
+  // P0-1（2026-11-09 69 分钟答案丢失事故）：完成检测 = SSE 即时 + 轮询兜底。
+  // 轮询从 5min 收紧到 1min——SSE 断连窗口内完成判定最坏延迟 5min→1min，
+  // 与「新输入接管（cancel）」竞态的丢失窗口同步收窄。
+  const BG_POLL_MS = 60_000
 
   // H2（2026-10-30，昨晚卡死事故复盘）：桌面审批/选择弹窗对 bot 无通道（V2 无
   // question API，C 项已证伪）——共享会话会被"桌面弹窗挂起"传导性卡死，且静默。
@@ -311,8 +314,36 @@ export function createBridge(
       // 被新回合取代（cancel 路径）时结清旧账——否则后台空账永久残留：安全重启
       // 永远等不到空闲、重启恢复会误重挂/补投旧答案（2026-11-05 实证两条僵尸账）。
       // finish 路径会先置 finished=true 并按 answered/expired 结清，此处不再覆盖。
-      if (!finished && trackId) settleInflight(trackId, undefined, "superseded")
-      // 后台等待结束（完成/被新回合取代）→ 延迟解锁摘要镜像
+      if (!finished && trackId) {
+        // P0-1（2026-11-09 69 分钟答案丢失事故根修）：接管前必须先核实旧回合是否
+        // 「已完成未投递」——旧实现直接 superseded 销账，完成于竞态窗口内的答案
+        //（如长报告）会被无声丢弃（用户侧=卡在在途后永远无回复）。
+        void rescueThenSettle(trackId)
+      } else {
+        mirror.scheduleUnlock(sessionId)
+      }
+    }
+
+    /** 接管前抢救：旧回合已有产出 → 先投递结果再按 answered 销账；否则 superseded。 */
+    async function rescueThenSettle(tid: string): Promise<void> {
+      try {
+        const probe = await client.session.messages({ path: { id: sessionId } })
+        if (finished) return // 探测期间 finish 已赢 race（已结算/已投递），不得双投
+        const turn = turnStateOf(probe?.data ?? [], promptId, baseline)
+        if (turn.text) {
+          finished = true
+          settleInflight(tid, undefined, "answered")
+          mirror.scheduleUnlock(sessionId)
+          void drainQueue(ctx.userId)
+          // 投递失败不得上抛：账已结清，补投失败由 deliver 层自己的重试/降级负责
+          await safeDeliver(ctx, `📤 你发来新消息前，上一回合已完成，结果如下：\n\n${turn.text}`).catch(() => {})
+          console.log(`[bridge] 接管前抢救：后台回合已完成且未投递，结果已补投 session=${sessionId}`)
+          return
+        }
+      } catch {
+        /* 探测失败落到 superseded 结算（原语义） */
+      }
+      settleInflight(tid, undefined, "superseded")
       mirror.scheduleUnlock(sessionId)
     }
 
@@ -372,7 +403,7 @@ export function createBridge(
           text
             ? `📤 后台任务完成，结果如下：\n\n${text}`
             : "📤 后台任务完成（无文本产出），详情可用 /history 查看",
-        )
+        ).catch((error) => console.error("[bridge] 后台完成结果投递失败（账已结清）:", error))
         console.log(`[bridge] 会话 ${sessionId} 后台等待已交付`)
       } catch (error) {
         console.error("[bridge] 后台完成结果获取失败:", error)
