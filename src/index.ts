@@ -155,7 +155,8 @@ async function main(): Promise<void> {
   // 告警走主动消息（allowlist 首个用户），markdown 失败回退纯文本；
   // 去重由 linkwatch 状态机保证（每事故 open + fixed 各 ≤1 条）。
   const alarm = async (text: string): Promise<void> => {
-    const uid = config.allowedUsers[0]
+    // 通配符全开时不能把 "*" 当 openid 发消息；取第一个真实 openid，没有就跳过告警。
+    const uid = config.allowedUsers.find((u) => u !== "*" && u.toLowerCase() !== "all")
     if (!uid) return
     const token = await getAccessToken(config.qq.appId, config.qq.clientSecret)
     const seq = getNextMsgSeq("")

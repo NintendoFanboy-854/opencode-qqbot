@@ -20,7 +20,7 @@
 | **权限审批** | opencode 发起权限请求 → QQ 收 🔐 四键卡片（允许一次/总是允许/拒绝/忽略），点按钮静默生效（点击后该按钮回显 ✓/✗，其余按钮保持原样），也可文字回复"允许/总是/拒绝" |
 | **选择弹窗桥接** | opencode 的 Form（选择/多选/布尔/文本）→ QQ 📝 卡片，点按钮或回字母（A/B/C）作答；桌面端回合发起的审批/表单**同样**推送（常驻监听，12s 轮询，bot 空闲也收得到） |
 | 远程指令 | `/new /stop /status /sessions /history /model /agent /rename /watch /mirror /progress /queue /ledger /send` |
-| 富媒体 | 收图（原生附件给 AI 看图）；**收语音**（QQ 内置 ASR 免费转文字进 prompt）；**发图/发文件**（AI 回复含 `QQ_SEND_FILE: <路径>` 标记或 `/send <路径>` 指令，20MB 上限） |
+| 富媒体 | 收图（原生附件给 AI 看图）；**收文件**（普通文件落盘到 Downloads / ~/.openqq/files，路径给 AI 读取）；**收语音**（QQ 内置 ASR 免费转文字进 prompt）；**发图/发文件**（AI 回复含 `QQ_SEND_FILE: <路径>` 标记或 `/send <路径>` 指令，20MB 上限） |
 | 引用上下文 | 长按引用某条消息提问，AI 能感知被引用的内容（我方回复也会入索引缓存） |
 | 长任务不丢 | 前台 30min 超时 → 后台等待（SSE + 轮询，最长 24h）；停滞 30min 主动提醒（带「已停滞/状态不明/已终结未回传」状态位 + 最近工具动作 + 无进展时长） |
 | 投递幂等 | 双层去重：同 msgId 跨进程原子占位 + 同内容在途指纹（窗口=并发在途；已完成消息的重发按重发处理）；同文长回复 24h 出站去重；「已收到」受理回执默认关（`QQ_ACK_RECEIPT=1` 调试召回） |
@@ -62,11 +62,43 @@ npx @linjz/opencode-qqbot setup
 ```ini
 QQ_APP_ID=你的AppID
 QQ_APP_SECRET=你的AppSecret
-ALLOWED_USERS=你的QQ openid   # fail-closed：必填，非名单用户一律拒绝
+ALLOWED_USERS=你的QQ openid   # fail-closed：必填；* 或 all = 允许所有人（高风险）
 OPENCODE_BASE_URL=http://127.0.0.1:<端口>/api   # opencode 桌面服务地址（2.1.x 端口动态；失联时 bot 启动会自动发现）
 OPENCODE_PASSWORD=opencode 服务密码（桌面端服务配置的 Basic auth 密码）
 QQ_SANDBOX=false
+# QQ_AGENT=qqbot   # 可选：QQ 会话默认 agent（先按下方说明安装 qqbot agent）
 ```
+
+### QQ 专用 agent（可选，推荐）
+
+把仓库里的 `docs/agents/qqbot.md` 复制到 OpenCode 的全局 agent 目录：
+
+```bash
+mkdir -p ~/.config/opencode/agents
+cp docs/agents/qqbot.md ~/.config/opencode/agents/qqbot.md
+```
+
+Windows PowerShell：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\agents" | Out-Null
+Copy-Item docs\agents\qqbot.md "$env:USERPROFILE\.config\opencode\agents\qqbot.md"
+```
+
+然后在 `~/.openqq/.env` 里设置：
+
+```ini
+QQ_AGENT=qqbot
+```
+
+行为：
+
+- 新建 QQ 会话会直接使用 `qqbot` agent
+- 旧会话如果没有绑定过 agent，下一条消息会自动补上
+- 已显式 `/agent` 过的会话保持原选择，不覆盖
+- `qqbot` 的模型/提示词由 `~/.config/opencode/agents/qqbot.md` 独立控制，不影响本机 `build` agent
+
+`docs/agents/qqbot.md` 里的 `model:` 只是示例（DeepSeek 1017 max）；换成你自己的 provider/model 即可。
 
 ### 启动
 
@@ -166,6 +198,7 @@ launchctl load ~/Library/LaunchAgents/net.opencode-qqbot.plist
 | `QQ_DIGEST_ANSWER_MAX_CHARS` | 0（全文） | 摘要卡答案截断上限 |
 | `QQ_HISTORY_USER_CLIP` / `QQ_HISTORY_TEXT_CLIP` | 500 / 1200 | /history 用户/AI 行截断 |
 | `QQ_SEND_EXTRA_ROOTS` | — | `/send` 额外允许目录（逗号分隔） |
+| `QQ_AGENT` | — | QQ 会话默认 agent；新会话直接使用，旧会话未绑定 agent 时下一条消息补上 |
 
 ## 架构
 

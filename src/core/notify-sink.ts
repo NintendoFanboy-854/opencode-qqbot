@@ -78,12 +78,13 @@ export function createNotifySink(options: NotifySinkOptions): NotifySink {
   }
 }
 
-/** CLI 端收件人解析：ALLOWED_USERS 唯一项缺省生效；显式 user 必须命中名单（fail-closed）。 */
+/** CLI 端收件人解析：ALLOWED_USERS 唯一项缺省生效；显式 user 必须命中名单（fail-closed）。
+ *  通配符（`*` / `all`）只用于入站鉴权，不能作为投递收件人，先剔除。 */
 export function resolveNotifyRecipients(
   configured: readonly string[],
   explicit?: string,
 ): string {
-  const users = [...configured]
+  const users = configured.filter((u) => u !== "*" && u.toLowerCase() !== "all")
   if (explicit) return users.includes(explicit) ? explicit : ""
   return users.length === 1 ? users[0] : ""
 }

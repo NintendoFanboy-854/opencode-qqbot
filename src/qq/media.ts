@@ -1,8 +1,8 @@
 // @input:  ./api (getAccessToken), ./types (MessageAttachment), node:fs/os/path
-// @output: extForImageMime, isAllowedDownloadHost, MAX_IMAGE_BYTES, imageDir,
-//          downloadQQAttachment, prepareQQAttachments, groupOutcomes,
+// @output: extForImageMime, isAllowedDownloadHost, MAX_IMAGE_BYTES, MAX_FILE_BYTES,
+//          imageDir, fileDir, downloadQQAttachment, prepareQQAttachments, groupOutcomes,
 //          augmentPromptWithAttachments, purgeOldQQImages
-// @pos:    qq层 - QQ 图片下载落盘 + prompt 文本/附件合成（原生附件接入 2026-10-14）
+// @pos:    qq层 - QQ 图片/文件下载落盘 + prompt 文本/附件合成（原生附件接入 2026-10-14）
 //
 // QQ 图片消息到网关只有 URL（MessageAttachment.url）；本模块下载落盘成文件，
 // 再转成 prompt body 的 files（{uri, name}，v2 PromptInput schema 内字段）。
@@ -11,7 +11,7 @@
 
 import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import type { MessageAttachment } from "./types.js"
 
 export interface PromptFile {
@@ -26,7 +26,7 @@ export interface PreparedAttachments {
 
 /** 下载结果（纯数据，便于单测分组逻辑） */
 export type AttachmentOutcome =
-  | { path: string; name: string }
+  | { path: string; name: string; kind?: "file" }
   | { failed: string }
   | { unsupported: string }
   /** 语音消息：QQ 内置 ASR 免费给 asr_refer_text，零下载零 STT 调用直接转文字（生态观察缺口 2） */
@@ -40,6 +40,8 @@ export function extForImageMime(mime: string): string | null {
 }
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+/** 普通文件上限（QQ 文件消息下载落盘；比图片宽松，仍做内存熔断） */
+export const MAX_FILE_BYTES = 20 * 1024 * 1024
 const ALLOWED_HOST_SUFFIXES = [".qpic.cn", ".qq.com", ".qq.com.cn"]
 
 /** 下载域白名单（R2-P1-2）：只信 QQ 自家 CDN 且必须 https——在 fetch 之前
@@ -58,6 +60,36 @@ export function isAllowedDownloadHost(url: string): boolean {
 
 export function imageDir(): string {
   return join(tmpdir(), "opencode", "qq-images")
+}
+
+/** 普通文件落盘目录：Windows 直接进 Downloads；其它平台回退到 ~/.openqq/files。 */
+export function fileDir(): string {
+  if (process.platform === "win32") return join(homedir(), "Downloads")
+  return join(homedir(), ".openqq", "files")
+}
+
+/** 清洗 QQ 提供的文件名：去路径、去 Windows 非法字符、去开头点，保留中文。 */
+function sanitizeFileName(name: string | undefined): string {
+  const base = (String(name || "").split(/[\\/]/).pop() ?? "").trim()
+  const cleaned = base.replace(/[<>:"|?*\u0000-\u001f]/g, "_").replace(/^\.+/, "").trim()
+  return cleaned || "qq-file.bin"
+}
+
+/** 同名文件不覆盖：依次尝试 name-1.ext、name-2.ext…… */
+function uniqueFilePath(dir: string, name: string): string {
+  const dot = name.lastIndexOf(".")
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ""
+  let full = join(dir, name)
+  for (let i = 1; i < 1000; i += 1) {
+    try {
+      statSync(full)
+    } catch {
+      return full
+    }
+    full = join(dir, `${stem}-${i}${ext}`)
+  }
+  return join(dir, `${stem}-${Date.now()}${ext}`)
 }
 
 async function fetchWithTimeout(url: string, ms: number, auth?: string): Promise<Response> {
@@ -93,17 +125,25 @@ export async function downloadQQAttachment(
     return { voice: att.asr_refer_text.trim() }
   }
   const ext = extForImageMime(att.content_type || "")
-  if (!ext) return { unsupported: att.content_type || att.filename || "未知类型" }
+  // 普通文件（2026-11-10）：QQ 文件消息 content_type 为 "file"；部分场景只有 filename。
+  // 仍走同一套域白名单/鉴权重试/流式大小熔断，只是落盘目录和上限不同。
+  const isFile = !ext && !!att.url && (ctype === "file" || ctype === "application/octet-stream" || !!att.filename)
+  if (!ext && !isFile) return { unsupported: att.content_type || att.filename || "未知类型" }
   if (!isAllowedDownloadHost(att.url)) return { failed: "下载域不在白名单" }
+  const maxBytes = ext ? MAX_IMAGE_BYTES : MAX_FILE_BYTES
+  const limitText = `${Math.floor(maxBytes / 1024 / 1024)}MB`
   try {
-    const dir = imageDir()
+    const dir = ext ? imageDir() : fileDir()
     mkdirSync(dir, { recursive: true })
-    const name = `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
-    let res = await fetchWithTimeout(att.url, 15000)
+    const originalName = ext ? "" : sanitizeFileName(att.filename)
+    const name = ext ? `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}` : originalName
+    const full = ext ? join(dir, name) : uniqueFilePath(dir, name)
+    const timeoutMs = ext ? 15000 : 30000
+    let res = await fetchWithTimeout(att.url, timeoutMs)
     if ((res.status === 401 || res.status === 403) && getAuth) {
       try {
         const tok = await getAuth()
-        res = await fetchWithTimeout(att.url, 15000, tok)
+        res = await fetchWithTimeout(att.url, timeoutMs, tok)
       } catch {
         /* 鉴权兜底失败：保持原状态，走下方 !res.ok 归 failed */
       }
@@ -112,10 +152,10 @@ export async function downloadQQAttachment(
       console.log("[media] 下载失败:", res.status, att.url) // 原始 URL 只进本机日志（B7 校准）
       return { failed: `HTTP ${res.status}` }
     }
-    // R2-P1-2：10MB 上限——Content-Length 预检 + 流式逐块计数熔断
+    // 大小上限——Content-Length 预检 + 流式逐块计数熔断
     //（无 Content-Length 的分块响应同样有界；超限即 cancel，内存不涨）
     const len = Number(res.headers.get("content-length") || 0)
-    if (len > MAX_IMAGE_BYTES) return { failed: "超过10MB" }
+    if (len > maxBytes) return { failed: `超过${limitText}` }
     const reader = res.body?.getReader()
     if (!reader) return { failed: "无响应体" }
     const chunks: Uint8Array[] = []
@@ -124,16 +164,17 @@ export async function downloadQQAttachment(
       const { done, value } = await reader.read()
       if (done) break
       total += value.byteLength
-      if (total > MAX_IMAGE_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel()
-        return { failed: "超过10MB" }
+        return { failed: `超过${limitText}` }
       }
       chunks.push(value)
     }
     if (total === 0) return { failed: "空响应" }
-    const full = join(dir, name)
     writeFileSync(full, Buffer.concat(chunks))
-    return { path: full, name }
+    if (ext) return { path: full, name }
+    console.log(`[media] 文件已保存: ${full} (${total} bytes)`)
+    return { path: full, name: originalName, kind: "file" }
   } catch (e) {
     // 原始错误只进本机日志；回给用户的备注是脱敏短语（R2-P3）
     console.log("[media] 下载失败:", att.url, e instanceof Error ? e.message : e)
@@ -158,6 +199,11 @@ export function groupOutcomes(outcomes: AttachmentOutcome[]): PreparedAttachment
   const notes: string[] = []
   for (const o of outcomes) {
     if ("path" in o) {
+      // 普通文件不喂 data: URL（会被当图片），只把本地路径写进备注，AI 用读取工具打开。
+      if (o.kind === "file") {
+        notes.push(`（用户通过 QQ 发来文件「${o.name}」，已保存到本地路径：${o.path}，可直接读取）`)
+        continue
+      }
       // 桌面 TUI 预览实证通道：≤2MB 的图片用 data: URL（opencode 对 data: 内嵌预览友好）；
       // 大图/非图保留 file:// 路径（避免 base64 膨胀）。
       const dataUrl = tryImageDataUrl(o.path, 2 * 1024 * 1024)
@@ -165,7 +211,7 @@ export function groupOutcomes(outcomes: AttachmentOutcome[]): PreparedAttachment
     } else if ("voice" in o) {
       notes.push(`（语音转写：${o.voice}）`)
     } else if ("failed" in o) {
-      notes.push(`（图片下载失败：${o.failed}）`)
+      notes.push(`（附件下载失败：${o.failed}）`)
     } else {
       notes.push(`（暂不支持的附件类型：${o.unsupported}）`)
     }
@@ -189,7 +235,7 @@ function tryImageDataUrl(path: string, maxBytes: number): string | null {
  * 把附件合成进 prompt（纯函数，供单测）：
  * - 有文字：文字保留，失败/不支持备注附在其后
  * - 纯图（无文字）：占位文字，模型经 files 直接看到图
- * - 纯失败（图没下下来）：备注即正文，QQ 端可见而不是静默
+ * - 纯文件/纯失败（无文字）：备注即正文，QQ 端可见而不是静默
  */
 export function augmentPromptWithAttachments(
   rawContent: string,
@@ -199,7 +245,7 @@ export function augmentPromptWithAttachments(
   const { files, notes } = prepared
   let text = base
   if (!text && files.length > 0) text = "（用户通过 QQ 发来了图片，未附文字）"
-  if (!text && notes.length > 0) text = "（用户通过 QQ 发来了内容，但无法处理）"
+  if (!text && notes.length > 0) text = "（用户通过 QQ 发来了附件，未附文字）"
   if (notes.length > 0) text = text ? `${text}\n\n${notes.join("\n")}` : notes.join("\n")
   return { text, files }
 }

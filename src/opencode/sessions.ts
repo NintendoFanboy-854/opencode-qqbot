@@ -58,13 +58,21 @@ export class SessionManager {
 
   async getOrCreate(userId: string): Promise<UserSession> {
     const existing = this.sessions.get(userId)
-    if (existing) return existing
+    if (existing) {
+      await this.ensureDefaultAgent(userId)
+      return existing
+    }
 
     const directory = this.peekInheritDirectory(userId)
-    const result = await this.client.session.create({ location: { directory } })
+    const agent = this.defaultAgent()
+    const result = await this.client.session.create({
+      location: { directory },
+      ...(agent ? { agent } : {}),
+    })
     const session: UserSession = {
       sessionId: result.data!.id,
       title: result.data!.title,
+      ...(agent ? { agentId: agent } : {}),
     }
     this.sessions.set(userId, session)
     this.saveSessions()
@@ -78,8 +86,11 @@ export class SessionManager {
     // 切换已有会话永不继承——见 switchSession）。
     const prev = this.sessions.get(userId)
     const inheritedModel = prev?.providerId && prev.modelId ? { providerID: prev.providerId, id: prev.modelId } : undefined
-    const inheritedAgent = prev?.agentId
-    const result = await this.client.session.create({ location: { directory } })
+    const inheritedAgent = prev?.agentId || this.defaultAgent() || undefined
+    const result = await this.client.session.create({
+      location: { directory },
+      ...(inheritedAgent ? { agent: inheritedAgent } : {}),
+    })
     const session: UserSession = {
       sessionId: result.data!.id,
       title: result.data!.title,
@@ -244,6 +255,25 @@ export class SessionManager {
   // （2026-11-09 移除 applySettings：切换即重放已被 owner 裁定废除——
   //   模型/Agent 是会话级状态，覆盖目标会话=破坏其归属；显式 /model /agent 命令
   //   仍直接写当前会话（setModel/setAgent），/new 的继承走 createNew 内置路径。）
+  // 2026-11-10：QQ_AGENT 只作为「默认 agent」用于新会话/尚未绑定 agent 的旧会话；
+  // 已显式选择过 agent 的会话不覆盖（尊重 /agent 与目标会话自身设置）。
+  private defaultAgent(): string {
+    return process.env.QQ_AGENT?.trim() ?? ""
+  }
+
+  private async ensureDefaultAgent(userId: string): Promise<void> {
+    const agent = this.defaultAgent()
+    const s = this.sessions.get(userId)
+    if (!agent || !s || s.agentId) return
+    try {
+      await this.client.session.setAgent({ path: { id: s.sessionId }, body: { agent } })
+      s.agentId = agent
+      this.saveSessions()
+      console.log(`[sessions] 已应用默认 agent=${agent} session=${s.sessionId}`)
+    } catch (error) {
+      console.error("[sessions] 应用默认 agent 失败（不影响聊天）:", error)
+    }
+  }
 
   getModel(userId: string): { providerId?: string; modelId?: string } {
     const s = this.sessions.get(userId)

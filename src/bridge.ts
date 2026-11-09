@@ -1059,9 +1059,11 @@ export function createBridge(
       : {}),
   }
 
-  // R2 修复批次启动项（2026-10-14）
+  // R2 修复批次启动项（2026-10-14）；2026-11-10 增加通配符全开模式
   if (config.allowedUsers.length === 0) {
     console.warn("[security] ALLOWED_USERS 为空 → 所有消息将被拒绝（fail-closed）；请在 ~/.openqq/.env 配置白名单")
+  } else if (config.allowedUsers.includes("*") || config.allowedUsers.some((u) => u.toLowerCase() === "all")) {
+    console.warn("[security] ALLOWED_USERS 包含通配符 → 已允许所有人使用（高风险）")
   }
   // R2-P1-3：恢复持久化的 /watch 订阅（里程碑已改 /watch 专属，重启不得静默丢）
   {
@@ -1637,8 +1639,10 @@ async function maybeHandlePendingSelection(
 
 // R2-P1-1（2026-10-14）：空名单 fail-closed——配置缺失时宁可全拒，不静默
 // 全开（首轮 P0-2 只闭了配置层，本次闭结构层）。
+// 2026-11-10：`*` / `all` 为显式全开（高风险）；精确 openid 仍按原逻辑匹配。
 export function isAllowedUser(userId: string, allowedUsers: string[]): boolean {
   if (allowedUsers.length === 0) return false
+  if (allowedUsers.includes("*") || allowedUsers.some((u) => u.toLowerCase() === "all")) return true
   return allowedUsers.includes(userId)
 }
 
