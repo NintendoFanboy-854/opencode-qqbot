@@ -277,8 +277,35 @@ async function handleLedger(ctx: MessageContext, args: string, cmdCtx: CommandCo
   return cmdCtx.ledger.view(ctx.userId, args)
 }
 
+/**
+ * /status 会话行标题解析（2026-11-09 陈旧缓存显示缺陷修复）：
+ * 实证「/status 显示 QQBot开发、/sessions 显示 [当前]近三日任务与设计评估」——
+ * 桌面端/TUI 改名后 sessions.json 缓存不跟随（SessionManager 只在创建与 /rename 时写 title）。
+ * 修复：/status 输出前用 session.get 取实时标题并回写缓存（同 id 不触发设置重放）；
+ * OpenCode 不可达时回落缓存标题，不阻断 /status。
+ */
+export async function resolveStatusSessionTitle(
+  sessions: SessionManager,
+  client: OpencodeClient,
+  userId: string,
+): Promise<{ title?: string; sessionId?: string }> {
+  const session = sessions.getSession(userId)
+  if (!session) return {}
+  try {
+    const detail = await client.session.get({ path: { id: session.sessionId } })
+    const liveTitle = detail?.data?.title
+    if (liveTitle && liveTitle !== session.title) {
+      sessions.switchSession(userId, session.sessionId, liveTitle, session.directory)
+      return { title: liveTitle, sessionId: session.sessionId }
+    }
+  } catch {
+    /* OpenCode 不可达：回落缓存标题 */
+  }
+  return { title: session.title, sessionId: session.sessionId }
+}
+
 async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
-  const session = cmdCtx.sessions.getSession(ctx.userId)
+  const sessionInfo = await resolveStatusSessionTitle(cmdCtx.sessions, cmdCtx.client, ctx.userId)
   const { providerId, modelId } = cmdCtx.sessions.getModel(ctx.userId)
   const agentId = cmdCtx.sessions.getAgent(ctx.userId)
 
@@ -297,7 +324,7 @@ async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promis
     "OpenCode 状态",
     `服务器：${openCodeStatus}`,
     `QQ 鉴权：${qqStatus}`,
-    `会话：${session ? `${session.title ?? "未命名会话"} (${session.sessionId})` : "未创建"}`,
+    `会话：${sessionInfo.sessionId ? `${sessionInfo.title ?? "未命名会话"} (${sessionInfo.sessionId})` : "未创建"}`,
     `模型：${providerId && modelId ? `${providerId} / ${modelId}` : "默认"}`,
     `Agent：${agentId ?? "默认"}`,
     cmdCtx.queue.summary(ctx.userId),
