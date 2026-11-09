@@ -491,9 +491,9 @@ export function createBridge(
     // 2026-11-05 举一反三：审批槽清空（裁决/TTL）即唤醒该用户队列——否则挂起期间
     // 入队的消息要等用户再发一条才会动（drainQueue 的 pendingPerm 守卫无人解除）。
     onDecision: (userId) => void drainQueue(userId),
-    // A 项：审批卡片发送（失败自动降级文字菜单，permission 域内处理）
-    sendApprovalPrompt: (ctx, request, mainSessionId) =>
-      sendApprovalCard({ appId: config.qq.appId, clientSecret: config.qq.clientSecret }, ctx, request, mainSessionId),
+    // A 项：审批卡片发送（失败自动降级文字菜单，permission 域内处理）；origin 穿透到卡片正文
+    sendApprovalPrompt: (ctx, request, mainSessionId, origin) =>
+      sendApprovalCard({ appId: config.qq.appId, clientSecret: config.qq.clientSecret }, ctx, request, mainSessionId, origin),
   })
 
   // O7d：摘要镜像域门面（订阅/回合标记/延迟解锁/摘要投递全在 core/mirror.ts）
@@ -781,6 +781,13 @@ export function createBridge(
   // bot 原先只靠 12s 轮询，取到时请求常已被引擎自行放行。这里复用同一条 SSE：
   // 事件到达即推 QQ 卡，12s 轮询保留为断线兜底（双防线）。
   eventStream.subscribeAll((ev) => {
+    if (ev.type === "permission.replied") {
+      // 联动清槽（2026-11-09）：源头（桌面端/引擎/账号规则）已解决该请求 →
+      // 同步撤销 QQ 挂起槽并回执，消除「桌面板了 QQ 卡悬空/TTL 误杀」的双通道孤岛。
+      const d = (ev.data ?? {}) as { sessionID?: string; requestID?: string; reply?: unknown }
+      if (d?.requestID) perm.clearIfResolved(d.sessionID, d.requestID, d.reply)
+      return
+    }
     if (ev.type !== "permission.asked") return
     const req = ev.data as unknown as PermissionRequest | undefined
     if (!req?.id || !req.sessionID) return

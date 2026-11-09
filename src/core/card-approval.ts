@@ -14,7 +14,7 @@
 import { getAccessToken, sendC2CMessage, sendGroupMessage, type InlineKeyboard, type KeyboardButton } from "../qq/api.js"
 import type { InteractionEvent, MessageContext } from "../qq/types.js"
 import type { PermissionDecision, PermissionRequest } from "../opencode/client.js"
-import { formatPermissionPrompt, type PendingPermission } from "./permission.js"
+import { formatPermissionPrompt, type PendingPermission, type PermOrigin } from "./permission.js"
 
 /** QQ 按钮 label 长度限制（dsh P0 实证） */
 export const BUTTON_LABEL_MAX = 10
@@ -96,12 +96,13 @@ export async function sendApprovalCard(
   ctx: MessageContext,
   request: PermissionRequest,
   mainSessionId: string,
+  origin?: PermOrigin,
 ): Promise<boolean> {
   try {
     const token = await getAccessToken(deps.appId, deps.clientSecret)
     const keyboard = buildApprovalKeyboard(request, ctx.userId)
-    // 正文复用现有格式化（用户看到的字段与文字菜单完全一致）
-    const text = formatPermissionPrompt(request, mainSessionId)
+    // 正文复用现有格式化（用户看到的字段与文字菜单完全一致）；origin 标注发起来源
+    const text = formatPermissionPrompt(request, mainSessionId, origin)
     if (ctx.type === "group" && ctx.groupId) {
       await sendGroupMessage(token, ctx.groupId, text, ctx.msgId, undefined, true, keyboard)
     } else {

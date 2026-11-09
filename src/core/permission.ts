@@ -19,7 +19,11 @@ export interface PendingPermission {
   ctx: MessageContext // O2：落盘快照，跨重启直答用
   createdAt: number // O2：TTL 基准（落盘与恢复共用）
   restored?: boolean // O2：启动恢复条目（无活 waiter，走直连 reply）
+  origin?: PermOrigin // 2026-11-09：回合归属标注——bot=机器人 ACP 回合，external=桌面端发起（镜像推送）
 }
+
+/** 审批发起来源（卡片/文字菜单标注 + 联动清槽决策用） */
+export type PermOrigin = "bot" | "external"
 
 export const PERM_PROMPT_TTL_MS = 30 * 60 * 1000
 
@@ -63,6 +67,7 @@ type PersistedPermission = {
   mainSessionId: string
   createdAt: number
   ctx: MessageContext
+  origin?: PermOrigin
 }
 
 function loadPendingPermMap(): Record<string, PersistedPermission> {
@@ -90,7 +95,13 @@ function savePendingPermMap(m: ReadonlyMap<string, PendingPermission>): void {
     const out: Record<string, PersistedPermission> = {}
     for (const [uid, e] of m) {
       if (!e.ctx) continue
-      out[uid] = { request: e.request, mainSessionId: e.mainSessionId, createdAt: e.createdAt, ctx: e.ctx }
+      out[uid] = {
+        request: e.request,
+        mainSessionId: e.mainSessionId,
+        createdAt: e.createdAt,
+        ctx: e.ctx,
+        ...(e.origin ? { origin: e.origin } : {}),
+      }
     }
     writeFileSync(PENDING_PERM_FILE, JSON.stringify(out))
   } catch (error) {
@@ -103,7 +114,12 @@ export interface PermissionGateDeps {
   sendReply: (ctx: MessageContext, text: string) => Promise<void>
   safeDeliver: (ctx: MessageContext, text: string) => Promise<void>
   /** A 项（2026-10-29）：卡片按钮审批发送通道；返回 false 时本域自动降级文字菜单 */
-  sendApprovalPrompt?: (ctx: MessageContext, request: PermissionRequest, mainSessionId: string) => Promise<boolean>
+  sendApprovalPrompt?: (
+    ctx: MessageContext,
+    request: PermissionRequest,
+    mainSessionId: string,
+    origin?: PermOrigin,
+  ) => Promise<boolean>
   /** 槽位清空的唤醒钩子（用户裁决/TTL 自动拒绝均触发）：审批挂起期间 drainQueue 被守卫
    *  挡回，裁决后须由调用方重新放行队列——否则挂起期间入队的消息要等用户再发一条才动
    *  （2026-11-05 举一反三：permission 域的"终态无人唤醒"漏洞）。 */
@@ -123,6 +139,10 @@ export interface PermissionGate {
   // L 项（2026-10-30）：常驻监听器发现的外部审批（如桌面端回合发起）——注册
   // "无活 waiter"槽（restored 语义：裁决走直连 reply），推卡片/文字菜单
   pushExternal: (userId: string, ctx: MessageContext, request: PermissionRequest, mainSessionId: string) => void
+  /** 联动清槽（2026-11-09）：SSE permission.replied={sessionID,requestID,reply} 到达时，
+   *  若该 requestID 在挂起槽中（无论来源 bot/external），清槽 + QQ 回执「源头已处理」，
+   *  并唤醒队列。返回 true=确有槽被清。无匹配槽返回 false（正常：QQ 已先裁决）。 */
+  clearIfResolved: (sessionID: string | undefined, requestID: string, reply: unknown) => boolean
 }
 
 // 审批域门面：挂起槽 + 等待/裁决 + 跨重启恢复。所有状态与文件读写收在本域。
@@ -165,16 +185,17 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
         timer,
         ctx,
         createdAt: Date.now(),
+        origin: "bot", // ACP 自有回合的权限（bridge onPermission 直答路径）
       })
       savePendingPermMap(pendingPermissions) // O2：落盘，重启不丢
       // A 项（2026-10-29）：卡片按钮优先，发送失败降级文字菜单；两者都失败
       // 不 reject promise（用户仍可能稍后主动回复）
       void (async () => {
         const sentByCard = deps.sendApprovalPrompt
-          ? await deps.sendApprovalPrompt(ctx, request, mainSessionId).catch(() => false)
+          ? await deps.sendApprovalPrompt(ctx, request, mainSessionId, "bot").catch(() => false)
           : false
         if (!sentByCard) {
-          await sendReply(ctx, formatPermissionPrompt(request, mainSessionId)).catch((error) => {
+          await sendReply(ctx, formatPermissionPrompt(request, mainSessionId, "bot")).catch((error) => {
             console.error("[bridge] 发送审批请求失败:", error)
           })
         }
@@ -250,6 +271,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
         ctx: e.ctx,
         createdAt: e.createdAt,
         restored: true,
+        ...(e.origin ? { origin: e.origin } : {}),
       })
       console.log(`[perm] 恢复重启前挂起的审批 ${uid.slice(0, 8)}… request=${e.request.id}`)
       // 恢复即重推审批卡片（卡片优先，失败降级文字）——重启后用户必须能重新
@@ -257,10 +279,10 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
       // 按钮丢失事故：重启后只剩文字重发路径，按钮再也出不来）。
       void (async () => {
         const sentByCard = deps.sendApprovalPrompt
-          ? await deps.sendApprovalPrompt(e.ctx, e.request, e.mainSessionId).catch(() => false)
+          ? await deps.sendApprovalPrompt(e.ctx, e.request, e.mainSessionId, e.origin).catch(() => false)
           : false
         if (!sentByCard) {
-          await sendReply(e.ctx, formatPermissionPrompt(e.request, e.mainSessionId)).catch((error) => {
+          await sendReply(e.ctx, formatPermissionPrompt(e.request, e.mainSessionId, e.origin)).catch((error) => {
             console.error("[bridge] 恢复审批推送失败:", error)
           })
         }
@@ -301,23 +323,54 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
       ctx,
       createdAt: Date.now(),
       restored: true,
+      origin: "external", // 常驻监听发现的外部审批（桌面端回合发起）
     })
     savePendingPermMap(pendingPermissions)
     console.log(`[perm] 外部审批已推送 user=${userId.slice(0, 8)}… request=${request.id} action=${request.action}`)
     // 推送失败不撤槽（用户仍可能文字裁决）
     void (async () => {
       const sentByCard = deps.sendApprovalPrompt
-        ? await deps.sendApprovalPrompt(ctx, request, mainSessionId).catch(() => false)
+        ? await deps.sendApprovalPrompt(ctx, request, mainSessionId, "external").catch(() => false)
         : false
       if (!sentByCard) {
-        await sendReply(ctx, formatPermissionPrompt(request, mainSessionId)).catch((error) => {
+        await sendReply(ctx, formatPermissionPrompt(request, mainSessionId, "external")).catch((error) => {
           console.error("[bridge] 发送审批请求失败:", error)
         })
       }
     })()
   }
 
-  return { hasPending, getPending, waitForDecision, resolve, restore, pushExternal: pushExternalImpl }
+  // 联动清槽（2026-11-09）：SSE permission.replied={sessionID,requestID,reply} 到达时，
+  // 若该 requestID 在挂起槽中（无论来源 bot/external），清槽 + QQ 回执「源头已处理」，
+  // 并唤醒队列。返回 true=确有槽被清；无匹配槽返回 false（正常：QQ 已先裁决 兜底 TTL 已走）。
+  function clearIfResolved(sessionID: string | undefined, requestID: string, reply: unknown): boolean {
+    for (const [uid, entry] of pendingPermissions) {
+      if (entry.request.id !== requestID) continue
+      if (sessionID && entry.request.sessionID && sessionID !== entry.request.sessionID) continue
+      const e = entry
+      if (e.timer) clearTimeout(e.timer)
+      pendingPermissions.delete(uid)
+      savePendingPermMap(pendingPermissions)
+      deps.onDecision?.(uid) // 槽清空即唤醒该用户队列（与裁决/TTL 同口径）
+      const label =
+        reply === "allow" || reply === "once"
+          ? "允许（本次）"
+          : reply === "always"
+            ? "总是允许"
+            : reply === "reject"
+              ? "拒绝"
+              : `已处理（${String(reply ?? "未知")}）`
+      console.log(`[perm] 联动清槽（源头已解决）：uid=${uid.slice(0, 8)}… request=${requestID} reply=${String(reply)}`)
+      void safeDeliver(
+        e.ctx,
+        `🔄 审批 ${requestID.slice(-8)} 已由${e.origin === "bot" ? "机器人回合侧" : "桌面端"}处理（${label}），QQ 审批自动关闭`,
+      ).catch(() => {})
+      return true
+    }
+    return false
+  }
+
+  return { hasPending, getPending, waitForDecision, resolve, restore, pushExternal: pushExternalImpl, clearIfResolved }
 }
 
 // 解析用户的审批回复（自然语言或 /allow /always /deny 命令式）。
@@ -342,8 +395,17 @@ export function parsePermissionDecision(content: string): PermissionDecision | n
   return null
 }
 
-export function formatPermissionPrompt(request: PermissionRequest, mainSessionId?: string): string {
+export function formatPermissionPrompt(
+  request: PermissionRequest,
+  mainSessionId?: string,
+  origin?: PermOrigin,
+): string {
   const lines = ["🔐 需要权限审批", `动作：${request.action || "(未知)"}`]
+  if (origin === "external") {
+    // 2026-11-09 联动修复：桌面端发起的回合经事件流镜像到 QQ——标注来源，
+    // 用户一眼知道这卡是桌面 AI 的活；QQ 与桌面审批等效（先到先解）。
+    lines.push("来源：桌面端回合（bot 镜像推送；QQ 与桌面放行等效）")
+  }
   // 债务D1：子会话（subagent）发起的审批要标注来源，用户知道批的是谁
   if (mainSessionId && request.sessionID && request.sessionID !== mainSessionId) {
     lines.push(`来源：子会话 ${request.sessionID}（subagent 发起）`)
