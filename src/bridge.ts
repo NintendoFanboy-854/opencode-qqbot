@@ -136,6 +136,21 @@ export function stallNudgeDecision(
   return now - base >= need ? "nudge" : "wait"
 }
 
+// 停滞提醒数据快照（2026-11-09 立规，导出供测试）：一次取齐「展示用」执行/空闲分钟，
+// 再返回下一次间隔的基准。顺序错乱会产出「执行 69 分钟｜已 0 分钟无进展」这类假数据
+//（2026-11-09 事故实证：先置 lastProgressAt=now 再计算 idleMin）。
+export function stallSnapshot(
+  now: number,
+  lastProgressAt: number,
+  turnStartedAt: number,
+): { idleMin: number; execMin: number; nextProgressAt: number } {
+  return {
+    idleMin: Math.max(0, Math.round((now - lastProgressAt) / 60_000)),
+    execMin: Math.max(0, Math.round((now - turnStartedAt) / 60_000)),
+    nextProgressAt: now,
+  }
+}
+
 interface Bridge {
   handleMessage: (ctx: MessageContext) => Promise<void>
   // HC2（2026-10-26）：暴露事件流句柄，index 侧链路自愈巡检需对其热换基
@@ -272,12 +287,16 @@ export function createBridge(
   const STALL_NUDGE_INTERVAL_MS = 30 * 60 * 1000
   const STALL_NUDGE_MAX = 3
 
-  function startBackgroundWait(sessionId: string, ctx: MessageContext, baseline: number, trackId?: string, promptId = ""): void {
+  function startBackgroundWait(sessionId: string, ctx: MessageContext, baseline: number, trackId?: string, promptId = "", turnStartedAt?: number): void {
     // 同会话只允许一个后台等待：恢复多条在途账/超时重挂不得留下多个完成回调重复投递。
     bgWaits.get(sessionId)?.cancel()
     let cancelled = false
     let finished = false
     const startedAt = Date.now()
+    // 2026-11-09 修正：执行时长按「回合真实起点」展示（跨重启用台账 at），
+    // 重启不再把 69 分钟的任务显示成 30 分钟；停滞提醒的调度仍从本次挂起算起，
+    // 避免重启后立刻对健康回合误报停滞。
+    const execStartAt = turnStartedAt && turnStartedAt > 0 ? turnStartedAt : startedAt
     let lastProgressAt = startedAt
     let nudges = 0
     let lastMarker = ""
@@ -382,16 +401,19 @@ export function createBridge(
           stallNudgeDecision(startedAt, lastProgressAt, nudges, now, STALL_FIRST_NUDGE_MS, STALL_NUDGE_INTERVAL_MS, STALL_NUDGE_MAX) === "nudge"
         ) {
           nudges += 1
-          lastProgressAt = now
+          // 2026-11-09 修数据错：原实现先把 lastProgressAt 置为 now 再算 idleMin，
+          // 导致提醒恒为「已 0 分钟无进展」。先取快照再重置（重置只用于下次间隔）。
+          const snap = stallSnapshot(now, lastProgressAt, execStartAt)
+          lastProgressAt = snap.nextProgressAt
           const st = turnStats.get(sessionId)
           const lastAction = st?.lastTool && st?.lastAt ? `${st.lastTool}（${agoLabel(st.lastAt)}）` : undefined
-          console.log(`[bridge] 后台任务状态通告 #${nudges} session=${sessionId} anchored=${turn.anchored}`)
+          console.log(`[bridge] 后台任务状态通告 #${nudges} session=${sessionId} anchored=${turn.anchored} idleMin=${snap.idleMin}`)
           void safeDeliver(
             ctx,
-            stallNudgeText(Math.round((now - startedAt) / 60000), {
+            stallNudgeText(snap.execMin, {
               anchored: turn.anchored,
               roundRunning: turn.anchored && !turn.hasIdle,
-              idleMin: Math.round((now - lastProgressAt) / 60000),
+              idleMin: snap.idleMin,
               lastAction,
             }),
           ).catch(() => {})
@@ -1317,7 +1339,7 @@ export function createBridge(
             ctx,
             "⏳ 回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
           )
-          startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId)
+          startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId, turnStart)
         } else if (isAcpPromptBusy(error)) {
           // 2026-11-08：会话被占用（-32603）。不再把 Internal error 原样甩给用户，
           // 给可操作路径；acp-session 的同会话串行链已挡掉我方自撞，这条只兜他端占用。
@@ -1449,7 +1471,7 @@ export function createBridge(
           // 跨重启也要保持 QQ 回合同一身份：后台直答完成时，镜像不得再投摘要。
           mirror.beginTurn(entry.sessionId)
           // 不单独发“仍在执行”通知；完成时统一回传最终答案，避免通知也占一条回复。
-          startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId, entry.promptId ?? "")
+          startBackgroundWait(entry.sessionId, ctx, entry.at, entry.msgId, entry.promptId ?? "", entry.at)
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
           settleInflight(entry.msgId, undefined, "redispatch") // 旧账结清，重派回合走新账（合成 trackId）
