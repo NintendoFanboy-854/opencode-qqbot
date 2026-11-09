@@ -27,17 +27,17 @@
   - `openqq restart [--force]`
   - `openqq service install|uninstall|status`
 
-## 3. 待迁移清单（未完成前禁止新增任何 OS 脚本）
+## 3. 迁移清单（2026-11-09 已完成）
 
-- [ ] `src/core/watchdog.ts`：判活（锁 mtime + 心跳 + pid 存在）与重启决策，纯函数优先、可测
-- [ ] `src/cli/watchdog-main.ts` → `dist/openqq-watchdog.js`：单次/循环巡检入口
-- [ ] `src/cli/restart-main.ts` → `dist/openqq-cli.js`：`safe-restart.ps1` 的 TS 跨平台等价物（等空闲→停→拉）
-- [ ] `src/cli/service-main.ts`：三平台自启注册/注销/状态
-- [ ] 插件引导器内联 watchdog 巡检（OpenCode 在线时即看门狗）
-- [ ] 下线并删除：`~/.openqq/start-openqq.ps1`、`~/.openqq/watchdog.ps1`、`~/.openqq/launch-hidden.vbs`、
+- [x] `src/core/watchdog.ts`：判活（锁 mtime + 心跳 + pid 存在）与重启决策，纯函数优先、可测
+- [x] `src/cli/watchdog-main.ts` → `dist/openqq-watchdog.js`：单次/循环巡检入口
+- [x] `src/core/bot-control.ts` + `src/cli/openqq-main.ts` → `dist/openqq-cli.js`：`safe-restart.ps1` 的 TS 跨平台等价物（等空闲→停→拉）
+- [x] `src/cli/service-main.ts`：三平台自启注册/注销/状态
+- [x] 插件引导器内联 watchdog 巡检（OpenCode 在线时即看门狗）
+- [x] 下线并删除：`~/.openqq/start-openqq.ps1`、`~/.openqq/watchdog.ps1`、`~/.openqq/launch-hidden.vbs`、
       计划任务 `OpenQQ-Bot`、`OpenQQ-Bot-Watchdog`
-- [ ] 删除仓库 `deploy/*.ps1`、`deploy/launch-hidden.vbs`、`scripts/safe-restart.ps1`
-- [ ] `README.md` 安装/排障章节同步为 TS 入口
+- [x] 删除仓库 `deploy/*.ps1`、`deploy/launch-hidden.vbs`、`scripts/safe-restart.ps1`
+- [x] `README.md` 安装/排障章节同步为 TS 入口
 
 ## 4. 已有的跨平台例外（保留，不得扩大）
 
