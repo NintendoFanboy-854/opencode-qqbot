@@ -41,8 +41,19 @@ else {
 
 if ($reason) {
   Log "触发重启：$reason"
-  Start-ScheduledTask -TaskName "OpenQQ-Bot"
-  Log "已发送 Start-ScheduledTask OpenQQ-Bot"
+  # 2026-11-09 加固：原实现 Start-ScheduledTask "OpenQQ-Bot"，但该任务早已
+  # Disabled（退役备查）——恢复动作长期空转，事故里 13:51 那次触发实际无效。
+  # 改为直接调用启动器（同一单实例锁、同一日志轮转、已内置环境剥离）。
+  $launcher = Join-Path $env:USERPROFILE ".openqq\start-openqq.ps1"
+  if (Test-Path $launcher) {
+    Start-Process -FilePath "powershell.exe" `
+      -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcher `
+      -WindowStyle Hidden
+    Log "已拉起 start-openqq.ps1（直连启动器，不经计划任务）"
+  }
+  else {
+    Log "FATAL: 启动器缺失 $launcher"
+  }
 }
 # 健康时静默（每 10 分钟一行会膨胀日志；需要审计时放开下行）
 # else { Log "健康检查通过" }

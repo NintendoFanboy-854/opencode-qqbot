@@ -71,6 +71,10 @@ $procs = Get-CimInstance Win32_Process -Filter "Name='bun.exe'" |
 Write-Output ("[safe-restart] 停止实例：" + (($procs | ForEach-Object { $_.ProcessId }) -join ","))
 $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
+# 2026-11-09 掉线事故立规：调用方 shell 残留的 OPENCODE_*/QQ_* 会覆盖 ~/.openqq/.env
+# （bot 侧「继承环境优先于 .env」）→ 新实例带错密码 401。服务通道只认 .env。
+Get-ChildItem Env: | Where-Object { $_.Name -match '^(OPENCODE_|QQ_|ALLOWED_USERS$)' } |
+  ForEach-Object { Remove-Item -Path ("Env:" + $_.Name) -ErrorAction SilentlyContinue }
 $env:QQ_LOG_FILE = $logFile
 $p = Start-Process -FilePath $bun -ArgumentList "run", $entry -WindowStyle Hidden -PassThru
 Write-Output "[safe-restart] 已启动 pid=$($p.Id)（日志 $logFile）"

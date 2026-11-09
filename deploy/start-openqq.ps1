@@ -22,6 +22,21 @@ if (-not (Test-Path "C:\Users\linjz\.openqq\.env")) {
   exit 1
 }
 
+# --- 配置单点保护（2026-11-09 掉线事故立规）---
+# 事故：另一会话的部署脚本在带 OPENCODE_* 残留环境的 shell 里调用本启动器，
+# bot 侧规则是「继承环境优先于 .env」（config.ts loadEnvFile 仅补缺键），
+# 结果新实例带着别人的密码连 OpenCode，连续 401 13 分钟（锁在、心跳无 → 判僵尸）。
+# 本启动器是服务通道，语义是「只认 ~/.openqq/.env」；显式用环境覆盖请走
+# `bun run src/index.ts` 的开发者路径。插件拉起通道已在 buildLaunchPlan 剥离同类变量。
+$stripped = @()
+Get-ChildItem Env: | Where-Object { $_.Name -match '^(OPENCODE_|QQ_|ALLOWED_USERS$)' } | ForEach-Object {
+  $stripped += $_.Name
+  Remove-Item -Path ("Env:" + $_.Name) -ErrorAction SilentlyContinue
+}
+if ($stripped.Count -gt 0) {
+  Write-Output ("[launcher] 已剥离调用方环境覆盖：" + ($stripped -join ", ") + "（以 .env 为单点）")
+}
+
 # --- 日志编号轮转：取最大号 +1；清理 10 份以前的旧日志 ---
 $nums = @()
 Get-ChildItem "$logDir\openqq*.log" -ErrorAction SilentlyContinue | ForEach-Object {

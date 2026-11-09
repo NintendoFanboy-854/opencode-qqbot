@@ -29,15 +29,31 @@ async function waitForOpencode(
   let attempt = 0
   let url = initialUrl
   let client = clientFactory(url)
+  // 2026-11-09 掉线事故：凭据失配（401）是确定性错误，重试 15 分钟毫无意义
+  //（事故实测：401 连刷 34 次，锁在、无心跳，整机判僵尸 15 分钟）。连续 N 次
+  // 认证失败即快速退出，把锁交还，交给插件引导器/看门狗用干净环境重拉。
+  const AUTH_FAIL_LIMIT = 3
+  let authFails = 0
   for (;;) {
     try {
       await healthCheck(client)
       return client
     } catch (error) {
       attempt++
+      const msg = error instanceof Error ? error.message : String(error)
+      if (/\b401\b|Unauthorized/i.test(msg)) {
+        authFails++
+        if (authFails >= AUTH_FAIL_LIMIT) {
+          throw new Error(
+            `${msg}（连续 ${authFails} 次认证被拒）—— 请核对 ~/.openqq/.env 的 OPENCODE_PASSWORD 是否与当前 OpenCode 服务一致；本实例退出，等待外部拉起`,
+          )
+        }
+      } else {
+        authFails = 0
+      }
       if (Date.now() >= deadline) throw error
       console.log(
-        `[index] OpenCode 未就绪（第 ${attempt} 次）：${error instanceof Error ? error.message : error} —20s 后重试`,
+        `[index] OpenCode 未就绪（第 ${attempt} 次）：${msg} —20s 后重试`,
       )
       if (attempt === 1 || attempt % 3 === 0) {
         const found = await discoverOpencode({ password: process.env.OPENCODE_PASSWORD })
@@ -88,7 +104,32 @@ async function main(): Promise<void> {
     throw new Error("缺少 OPENCODE_BASE_URL，指向 OpenCode 桌面版 API（如 http://127.0.0.1:<端口>/api；2.1.x 端口动态，失联时启动流程会自动发现）")
   }
 
-  const client = await waitForOpencode((u) => createClient(u), config.opencode.baseUrl)
+  // E4 心跳：每 60 秒写一次时间戳 = 事件循环存活证明。
+  // 2026-11-09 加固：提前到「抢锁后、连 OpenCode 前」——启动阶段（等 OpenCode /
+  // 发现端口）同样可能持续数分钟，原先这段空白会让看门狗把健康启动判成
+  // 「心跳陈旧」而杀掉。锁活性另由 instance-lock 的 mtime 心跳承担，两者互不替代。
+  const heartbeatFile = join(homedir(), ".openqq", "heartbeat")
+  const touchHeartbeat = (): void => {
+    try {
+      mkdirSync(join(homedir(), ".openqq"), { recursive: true })
+      writeFileSync(heartbeatFile, String(Date.now()))
+    } catch (error) {
+      console.error("[index] 心跳写入失败:", error)
+    }
+  }
+  touchHeartbeat()
+  const heartbeatTimer = setInterval(touchHeartbeat, 60_000)
+  heartbeatTimer.unref?.()
+
+  let client: OpencodeClient
+  try {
+    client = await waitForOpencode((u) => createClient(u), config.opencode.baseUrl)
+  } catch (error) {
+    // 启动失败立即交还锁，缩短下一次接管的等待（否则锁要等 30s 过期才回收）
+    clearInterval(heartbeatTimer)
+    instanceLock?.release()
+    throw error
+  }
 
   startBackgroundTokenRefresh(config.qq.appId, config.qq.clientSecret)
 
@@ -128,20 +169,6 @@ async function main(): Promise<void> {
   // R 项（2026-10-30）：启动对账——恢复重启窗口内"已派发未回答"的在途回合
   //（补投答案/重挂后台等待/重派丢失消息）。异步执行不阻塞心跳建立。
   void bridge.recoverInflightRounds()
-
-  // E4 心跳：每 60 秒写一次时间戳 = 事件循环存活证明。
-  // 看门狗据此识别"进程在但僵死"的静默僵尸（2-day silent zombie 教训）。
-  const heartbeatFile = join(homedir(), ".openqq", "heartbeat")
-  const touchHeartbeat = (): void => {
-    try {
-      mkdirSync(join(homedir(), ".openqq"), { recursive: true })
-      writeFileSync(heartbeatFile, String(Date.now()))
-    } catch (error) {
-      console.error("[index] 心跳写入失败:", error)
-    }
-  }
-  touchHeartbeat()
-  const heartbeatTimer = setInterval(touchHeartbeat, 60_000)
 
   let shuttingDown = false
   const shutdown = (signal: string): void => {

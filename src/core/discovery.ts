@@ -8,7 +8,7 @@
 // 仅匹配 `${port}/api/info`：bot 的 V2 端点契约即 base=.../api（见 client.ts），
 // 无 /api 前缀的形态与本契约不符，不采用。
 // @input:  127.0.0.1 监听口（netstat -ano -p tcp）、/api/info 端点
-// @output: discoverOpencode, probeOpencodeEndpoint, parseListenPorts, isOpencodeInfo, persistDiscovery
+// @output: discoverOpencode, probeOpencodeEndpoint, parseListenPorts, isOpencodeInfo, persistDiscovery, getLastScanUnauthorized
 // @pos:    core - 端口发现（HC1，Windows only）
 import { exec } from "node:child_process"
 import { promisify } from "node:util"
@@ -17,6 +17,16 @@ import { join } from "path"
 import { homedir } from "os"
 
 const execAsync = promisify(exec)
+
+// 最近一次扫描里返回 401 的端口数（凭据不匹配诊断）。
+// 2026-11-09 掉线事故：密码失配时每个端口都 401 → 签名全不命中，日志只剩
+// 「无签名命中」，看起来像"服务不存在"，排障要多绕很久。计数器让调用方能把
+// 「服务不在」和「服务在但密码错」区分开。
+let lastScanUnauthorized = 0
+
+export function getLastScanUnauthorized(): number {
+  return lastScanUnauthorized
+}
 
 export interface OpencodeDiscovery {
   baseUrl: string
@@ -99,7 +109,10 @@ export async function probeOpencodeEndpoint(
       headers.Authorization = `Basic ${Buffer.from(`opencode:${opts.password}`).toString("base64")}`
     }
     const res = await fetch(url, { headers, signal: ac.signal, redirect: "manual" })
-    if (!res.ok) return null
+    if (!res.ok) {
+      if (res.status === 401) lastScanUnauthorized++
+      return null
+    }
     const body: unknown = JSON.parse(await res.text())
     if (!isOpencodeInfo(body)) return null
     return (body as InfoPayload).version as string
@@ -121,6 +134,7 @@ export async function discoverOpencode(opts?: {
   if (ports.length === 0) return null
   const started = Date.now()
   let probed = 0
+  lastScanUnauthorized = 0
   for (const port of ports) {
     probed++
     const version = await probeOpencodeEndpoint(`http://127.0.0.1:${port}/api/info`, opts)
@@ -132,7 +146,9 @@ export async function discoverOpencode(opts?: {
       return hit
     }
   }
-  console.log(`[discovery] 扫描 ${ports.length} 个监听口（${Date.now() - started}ms），无签名命中`)
+  const unauth = lastScanUnauthorized
+  const hint = unauth > 0 ? `（其中 ${unauth} 个返回 401：凭据不匹配，检查 OPENCODE_PASSWORD / OPENCODE_BASE_URL）` : ""
+  console.log(`[discovery] 扫描 ${ports.length} 个监听口（${Date.now() - started}ms），无签名命中${hint}`)
   return null
 }
 
