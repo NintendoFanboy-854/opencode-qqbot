@@ -11,8 +11,7 @@ import { Plugin } from "@opencode/plugin"
 import { join } from "path"
 import { homedir } from "os"
 import { appendFileSync, existsSync, renameSync, statSync } from "fs"
-import { fileURLToPath } from "url"
-import { botWatchdogPaths, superviseOnce } from "./core/watchdog.js"
+import { appendWatchdogLog, botWatchdogPaths, superviseOnce } from "./core/watchdog.js"
 import { startBot } from "./core/bot-control.js"
 import { runNotifyCli } from "./cli/notify.js"
 import { readDotEnvField } from "./core/bot-launcher.js"
@@ -52,6 +51,16 @@ export default Plugin.define({
       lastBlocker = key
       console.warn(message)
     }
+    // 2026-11-10：拉起失败必须落盘。此前只进 console，而插件 console 不写
+    // opencode.log——巡检每 5 分钟失败一次，外部却完全无痕，造成长时间静默失联。
+    const reportFailure = (phase: string, error: unknown): void => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[opencode-qqbot] ${phase}:`, message)
+      const key = `fail:${phase}:${message}`
+      if (lastBlocker === key) return
+      lastBlocker = key
+      appendWatchdogLog(`引导器${phase}：${message}`)
+    }
     const ensure = (): void => {
       try {
         const appId = readDotEnvField(ENV_FILE, "QQ_APP_ID")
@@ -66,7 +75,9 @@ export default Plugin.define({
         // 优雅杀/冷却/重启强度超限 give-up 并告警，杜绝裸「杀旧拉新」循环。
         void superviseOnce({
           paths: botWatchdogPaths(appId),
-          spawn: () => startBot(fileURLToPath(import.meta.url), (line) => console.log(line)),
+          // 必须传 URL 本身：resolveInstalledBotEntry 内部做 fileURLToPath。
+          // 2026-11-10 事故根因：这里先转成路径，下游再转一次 → 必抛。
+          spawn: () => startBot(import.meta.url, (line) => console.log(line)),
           log: (line) => console.log(line),
           alert: (message) => {
             console.warn(message)
@@ -80,11 +91,11 @@ export default Plugin.define({
             if (result.action === "ok" || result.action === "restart") lastBlocker = null
           })
           .catch((error) => {
-            console.error("[opencode-qqbot] 巡检失败:", error instanceof Error ? error.message : error)
+            reportFailure("巡检失败", error)
           })
       } catch (error) {
         // 引导器永不阻断宿主
-        console.error("[opencode-qqbot] 拉起失败:", error instanceof Error ? error.message : error)
+        reportFailure("拉起失败", error)
       }
     }
     ensure()

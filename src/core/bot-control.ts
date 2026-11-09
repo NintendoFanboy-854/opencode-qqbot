@@ -16,9 +16,18 @@ import {
 } from "./bot-launcher.js"
 import { botWatchdogPaths, readBotHealth, isPidAlive } from "./watchdog.js"
 
+/**
+ * 入参归一化：CLI 传 import.meta.url（file: URL），插件引导器传的是已解析路径。
+ * 两种都接受——2026-11-10 复盘：引导器对路径再调一次 fileURLToPath 抛
+ * ERR_INVALID_URL_SCHEME，插件每 5 分钟巡检全部静默拉起失败，QQ 整段失联。
+ */
+function toFilePath(fromUrlOrPath: string): string {
+  return /^file:/i.test(fromUrlOrPath) ? fileURLToPath(fromUrlOrPath) : fromUrlOrPath
+}
+
 /** 从任意入口文件定位同包内的 bot 产物：dist 同目录 → 包根 dist → dev 源码 */
 export function resolveInstalledBotEntry(fromUrl: string, exists: (p: string) => boolean = existsSync): string | null {
-  const here = dirname(fileURLToPath(fromUrl))
+  const here = dirname(toFilePath(fromUrl))
   const candidates = [
     join(here, "openqq-bot.js"), // 打包后：dist/ 同级
     join(here, "..", "dist", "openqq-bot.js"), // src/cli/ → 包根 dist/
