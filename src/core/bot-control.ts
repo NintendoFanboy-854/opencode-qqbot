@@ -4,7 +4,7 @@
 //
 // 2026-11-09 架构红线：重启是运维代码，必须随插件包分发且跨平台。
 // 单实例真相=锁文件 pid（不再按命令行正则枚举进程，避免 OS 命令与误杀）。
-import { existsSync, readFileSync } from "fs"
+import { existsSync, readFileSync, unlinkSync } from "fs"
 import { dirname, join } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "url"
@@ -85,6 +85,25 @@ export async function waitUntilIdle(opts?: {
   }
 }
 
+/**
+ * 清理已死实例的残留锁（2026-11-10 重启空窗修复）。
+ * restart 是「杀→拉」同步链路：旧 bot 刚被 TERM 时锁 mtime 仍然新鲜（<30s），
+ * 新实例以 QQ_INSTANCE_LOCK=try 启动会判「已有实例」自杀退出，形成最长 5 分钟
+ * 的失联空窗。这里仅在「锁内 pid 已确认死亡」时删锁——活进程的锁绝不碰。
+ */
+function clearDeadLock(appId: string, deadPid?: number): void {
+  const { lockPath } = botWatchdogPaths(appId)
+  try {
+    const raw = JSON.parse(readFileSync(lockPath, "utf-8")) as { pid?: unknown }
+    if (typeof raw.pid !== "number" || !Number.isInteger(raw.pid)) return
+    if (deadPid !== undefined && raw.pid !== deadPid) return
+    if (isPidAlive(raw.pid)) return
+    unlinkSync(lockPath)
+  } catch {
+    /* 无锁 / 半写 / 已被删除：无需处理 */
+  }
+}
+
 /** 停掉锁文件里的 bot（单实例真相）；返回被停的 pid 或 null */
 export function stopLockedBot(appId: string, opts?: { waitMs?: number }): number | null {
   const health = readBotHealth(botWatchdogPaths(appId))
@@ -147,6 +166,8 @@ export async function restartBot(opts: RestartOptions): Promise<RestartResult> {
   }
   const killed = stopLockedBot(appId, { waitMs: 5_000 })
   if (killed !== null) log(`[bot-control] 已停止 pid=${killed}`)
+  // 杀后交还锁：旧锁 mtime 仍新鲜，try 模式新实例会误判「已有实例」直接退出
+  clearDeadLock(appId, killed ?? undefined)
   const spawned = startBot(opts.spawnFromUrl, log)
   return { action: "restarted", killedPid: killed, spawnedPid: spawned, reason: opts.force ? "force" : "idle" }
 }
