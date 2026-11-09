@@ -98,6 +98,10 @@ export interface OpencodeClient {
   session: {
     create(body?: Record<string, unknown>): Promise<{ data?: { id: string; title?: string } }>
     list(): Promise<{ data?: unknown[] }>
+    /** 会话详情（含 location.directory——项目归属，新建会话继承链与补写校验用） */
+    get(opts: { path: { id: string } }): Promise<{ data?: { id?: string; title?: string; location?: { directory?: string } } }>
+    /** 设置会话项目归属（POST /session/{id}/move；directory=绝对路径） */
+    move(opts: { path: { id: string }; body: { directory: string } }): Promise<unknown>
     abort(opts: { path: { id: string } }): Promise<unknown>
     messages(opts: {
       path: { id: string }
@@ -318,6 +322,12 @@ export function createClient(baseUrl: string): OpencodeClient {
       },
       async list() {
         return json(await req("/session"))
+      },
+      async get(opts) {
+        return json(await req(`/session/${opts.path.id}`))
+      },
+      async move(opts) {
+        return json(await req(`/session/${opts.path.id}/move`, { method: "POST", body: JSON.stringify(opts.body) }))
       },
       async abort(opts) {
         return json(await req(`/session/${opts.path.id}/interrupt`, { method: "POST", body: "{}" }))

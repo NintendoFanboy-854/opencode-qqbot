@@ -67,7 +67,7 @@ export interface CommandContext {
 
 export interface PendingSelection {
   type: "session" | "model"
-  items: Array<{ id: string; label: string }>
+  items: Array<{ id: string; label: string; directory?: string }>
   expiresAt: number
 }
 
@@ -87,6 +87,8 @@ interface ParsedCommand {
 interface ListedSession {
   id: string
   title: string
+  /** location.directory（官方 ACP session/list 语义：每条会话自带 cwd，load 必须用它） */
+  directory?: string
 }
 
 interface ListedModel {
@@ -171,7 +173,7 @@ export async function handlePendingSelection(
   cmdCtx.pendingSelections.delete(userId)
 
   if (pending.type === "session") {
-    cmdCtx.sessions.switchSession(userId, item.id, item.label)
+    cmdCtx.sessions.switchSession(userId, item.id, item.label, item.directory)
     return `已切换到会话：${item.label}`
   }
 
@@ -312,7 +314,7 @@ async function handleSessions(ctx: MessageContext, cmdCtx: CommandContext): Prom
   const currentSessionId = cmdCtx.sessions.getSession(ctx.userId)?.sessionId
   cmdCtx.pendingSelections.set(ctx.userId, {
     type: "session",
-    items: sessions.map((session) => ({ id: session.id, label: session.title })),
+    items: sessions.map((session) => ({ id: session.id, label: session.title, directory: session.directory })),
     expiresAt: Date.now() + SELECTION_TTL_MS,
   })
 
@@ -401,7 +403,7 @@ async function handleRename(ctx: MessageContext, args: string, cmdCtx: CommandCo
     return "当前还没有会话可重命名"
   }
 
-  cmdCtx.sessions.switchSession(ctx.userId, session.sessionId, title)
+  cmdCtx.sessions.switchSession(ctx.userId, session.sessionId, title, session.directory)
   return `已重命名当前会话：${title}`
 }
 
@@ -483,10 +485,12 @@ async function listSessions(client: OpencodeClient): Promise<ListedSession[]> {
       if (!id) {
         return null
       }
-
+      const location = extractProperty(item, "location")
+      const directory = location ? getString(location, "directory") : undefined
       return {
         id,
         title: getString(item, "title") ?? id,
+        ...(directory !== undefined ? { directory } : {}),
       }
     })
     .filter((item): item is ListedSession => item !== null)

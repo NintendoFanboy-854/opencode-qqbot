@@ -560,6 +560,16 @@ export function createBridge(
       ? createAcpSessionRunner({
           cwd: process.env.QQBOT_ACP_CWD ?? process.cwd(),
           sessions,
+          // 会话归属目录解析（对齐官方 ACP getSession 校验）：load 前从服务端详情取
+          // location.directory，缓存缺失/目录漂移时按真实目录重试，避免 -32602 后误新建
+          resolveDirectory: async (sessionId) => {
+            try {
+              const detail = await client.session.get({ path: { id: sessionId } })
+              return detail?.data?.location?.directory ?? undefined
+            } catch {
+              return undefined
+            }
+          },
           handlers: {
             onPermission: async (userId, view) => {
               const pctx = ctxForUser(userId)

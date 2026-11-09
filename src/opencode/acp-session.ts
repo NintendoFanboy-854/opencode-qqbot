@@ -77,6 +77,13 @@ export interface AcpSessionOptions {
   client?: AcpClient
   command?: string[]
   args?: string[]
+  /**
+   * 从服务端详情解析会话归属目录（REST session.get → location.directory）。
+   * 2026-11-09 对齐官方 ACP 语义（cli/src/acp/service.ts getSession）：
+   * session/load 必须携带会话自己的目录，缓存缺失/漂移时经此解析后再重试，
+   * 解析不到才判「会话不可加载」走新建。
+   */
+  resolveDirectory?: (sessionId: string) => Promise<string | undefined>
 }
 
 export class AcpSessionRunner {
@@ -84,6 +91,7 @@ export class AcpSessionRunner {
   private readonly sessions: SessionManager
   private readonly handlers: AcpSessionHandlers
   private readonly cwd: string
+  private readonly resolveDirectory?: (sessionId: string) => Promise<string | undefined>
   private ready: Promise<void> | null = null
   private loaded = new Set<string>()
   private userBySession = new Map<string, string>()
@@ -95,6 +103,7 @@ export class AcpSessionRunner {
     this.cwd = options.cwd
     this.sessions = options.sessions
     this.handlers = options.handlers ?? {}
+    this.resolveDirectory = options.resolveDirectory
     this.client =
       options.client ??
       createAcpClient(
@@ -158,10 +167,10 @@ export class AcpSessionRunner {
     }
   }
 
-  private async ensureLoaded(sessionId: string): Promise<void> {
+  private async ensureLoaded(sessionId: string, cwd: string): Promise<void> {
     if (this.loaded.has(sessionId)) return
     try {
-      await this.client.loadSession(sessionId, this.cwd)
+      await this.client.loadSession(sessionId, cwd)
       this.loaded.add(sessionId)
     } catch (error) {
       // 会话不存在/不可加载：上抛，由调用方决定新建
@@ -169,30 +178,62 @@ export class AcpSessionRunner {
     }
   }
 
-  /** 取该用户的 ACP 会话；旧 REST 会话通过 session/load 接管，失败则新建。 */
+  /** 取该用户的 ACP 会话；旧 REST 会话通过 session/load 接管，失败则新建。
+   *  2026-11-09 对齐官方语义：load 必须携带会话自己的 location.directory——
+   *  缓存优先，缺失时先经 resolveDirectory 解析再加载；解析失败才降级新建。 */
   async getOrCreate(userId: string): Promise<string> {
     await this.start()
     const existing = this.sessions.getSession(userId)
     if (existing?.sessionId) {
+      let cwd = existing.directory ?? this.cwd
+      if (!existing.directory && this.resolveDirectory) {
+        // 映射无目录缓存（旧数据/切会话未带）：加载前先从服务端解析，避免无谓的 -32602
+        const resolved = await this.resolveDirectory(existing.sessionId).catch(() => undefined)
+        if (resolved) {
+          cwd = resolved
+          this.sessions.cacheDirectory(userId, existing.sessionId, resolved)
+        }
+      }
       try {
-        await this.ensureLoaded(existing.sessionId)
+        await this.ensureLoaded(existing.sessionId, cwd)
         return existing.sessionId
       } catch (error) {
-        console.warn("[acp-session] 旧会话不可加载，改为新建:", error instanceof Error ? error.message : error)
+        // 目录漂移兜底（如服务端 move 过/缓存过期）：按服务端真实 location 再试一次
+        const message = error instanceof Error ? error.message : String(error)
+        const retryable = this.resolveDirectory && /does not belong to cwd|Invalid params/.test(message)
+        const resolved = retryable
+          ? await this.resolveDirectory(existing.sessionId).catch(() => undefined)
+          : undefined
+        if (resolved && resolved !== cwd) {
+          try {
+            await this.ensureLoaded(existing.sessionId, resolved)
+            this.sessions.cacheDirectory(userId, existing.sessionId, resolved)
+            console.log(`[acp-session] 目录漂移已校正 sid=${existing.sessionId.slice(0, 12)}… → ${resolved}`)
+            return existing.sessionId
+          } catch {
+            /* fallthrough 新建 */
+          }
+        }
+        console.warn("[acp-session] 旧会话不可加载，改为新建:", message)
       }
     }
-    const sessionId = await this.client.newSession(this.cwd)
+    // 项目归属继承：直接在目标目录创建（与官方 session/new 语义一致，消除 create/move 不一致）
+    const inherit = this.sessions.peekInheritDirectory(userId)
+    const sessionId = await this.client.newSession(inherit)
     this.sessions.adopt(userId, sessionId)
     this.loaded.add(sessionId)
+    await this.sessions.enforceLocation(userId, sessionId, inherit)
     return sessionId
   }
 
-  /** 新建会话（/new 迁移前由上层调用）。 */
+  /** 新建会话（/new）：在继承目录下创建。 */
   async newSession(userId: string): Promise<string> {
     await this.start()
-    const sessionId = await this.client.newSession(this.cwd)
+    const inherit = this.sessions.peekInheritDirectory(userId)
+    const sessionId = await this.client.newSession(inherit)
     this.sessions.adopt(userId, sessionId)
     this.loaded.add(sessionId)
+    await this.sessions.enforceLocation(userId, sessionId, inherit)
     return sessionId
   }
 
