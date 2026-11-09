@@ -74,13 +74,30 @@ export class SessionManager {
 
   async createNew(userId: string): Promise<UserSession> {
     const directory = this.peekInheritDirectory(userId)
+    // owner 裁定 2026-11-09：/new 继承「当前会话」的模型/Agent（仅新建这一次性代入；
+    // 切换已有会话永不继承——见 switchSession）。
+    const prev = this.sessions.get(userId)
+    const inheritedModel = prev?.providerId && prev.modelId ? { providerID: prev.providerId, id: prev.modelId } : undefined
+    const inheritedAgent = prev?.agentId
     const result = await this.client.session.create({ location: { directory } })
     const session: UserSession = {
       sessionId: result.data!.id,
       title: result.data!.title,
+      ...(inheritedModel ? { providerId: inheritedModel.providerID, modelId: inheritedModel.id } : {}),
+      ...(inheritedAgent ? { agentId: inheritedAgent } : {}),
     }
     this.sessions.set(userId, session)
     this.saveSessions()
+    if (inheritedModel) {
+      void this.client.session
+        .setModel({ path: { id: session.sessionId }, body: { model: inheritedModel } })
+        .catch((error) => console.error("[sessions] 新会话继承模型失败（映射已存）:", error))
+    }
+    if (inheritedAgent) {
+      void this.client.session
+        .setAgent({ path: { id: session.sessionId }, body: { agent: inheritedAgent } })
+        .catch((error) => console.error("[sessions] 新会话继承 Agent 失败（映射已存）:", error))
+    }
     await this.enforceLocation(userId, session.sessionId, directory)
     return session
   }
@@ -100,10 +117,37 @@ export class SessionManager {
       directory,
     })
     this.saveSessions()
-    // 切到别的会话时，把本用户记住的模型/Agent 重放到目标会话
-    //（v2 模型是 session 级设置，不跟随 prompt）。
+    // 2026-11-09 owner 裁定（反转 2026-10-29 设计）：切换**不继承**——模型/Agent
+    // 是会话级状态（桌面端同语义），不得用本用户在此前会话的偏好覆盖目标会话；
+    // 反向从目标会话回读真实设置写回映射（/status 与后续 /model 以目标为准）。
     if (changed) {
-      void this.applySettings(userId)
+      void this.refreshSettingsFromServer(userId)
+    }
+  }
+
+  /** 切换后回读目标会话的会话级设置（model/agent）写回映射；服务端未设则清空（显示「默认」）。 */
+  private async refreshSettingsFromServer(userId: string): Promise<void> {
+    const s = this.sessions.get(userId)
+    if (!s) return
+    try {
+      const detail = await this.client.session.get({ path: { id: s.sessionId } })
+      const model = detail?.data?.model
+      const agent = detail?.data?.agent
+      const cur = detail?.data
+      if (!cur) return
+      if (model?.providerID && model?.id) {
+        s.providerId = model.providerID
+        s.modelId = model.id
+      } else {
+        delete s.providerId
+        delete s.modelId
+      }
+      if (typeof agent === "string" && agent) s.agentId = agent
+      else delete s.agentId
+      this.saveSessions()
+    } catch (error) {
+      // 回读失败保留旧显示（不阻断切换主操作）
+      console.error("[sessions] 回读目标会话设置失败（保留旧映射）:", error)
     }
   }
 
@@ -197,24 +241,9 @@ export class SessionManager {
     this.saveSessions()
   }
 
-  private async applySettings(userId: string): Promise<void> {
-    const s = this.sessions.get(userId)
-    if (!s) return
-    try {
-      if (s.providerId && s.modelId) {
-        await this.client.session.setModel({
-          path: { id: s.sessionId },
-          body: { model: { providerID: s.providerId, id: s.modelId } },
-        })
-      }
-      if (s.agentId) {
-        await this.client.session.setAgent({ path: { id: s.sessionId }, body: { agent: s.agentId } })
-      }
-    } catch (error) {
-      // 切会话是主操作，设置重放失败只记日志（目标会话用其自身/默认设置）
-      console.error("[sessions] 重放模型/Agent 设置失败:", error)
-    }
-  }
+  // （2026-11-09 移除 applySettings：切换即重放已被 owner 裁定废除——
+  //   模型/Agent 是会话级状态，覆盖目标会话=破坏其归属；显式 /model /agent 命令
+  //   仍直接写当前会话（setModel/setAgent），/new 的继承走 createNew 内置路径。）
 
   getModel(userId: string): { providerId?: string; modelId?: string } {
     const s = this.sessions.get(userId)

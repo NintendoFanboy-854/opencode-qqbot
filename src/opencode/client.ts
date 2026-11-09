@@ -98,8 +98,16 @@ export interface OpencodeClient {
   session: {
     create(body?: Record<string, unknown>): Promise<{ data?: { id: string; title?: string } }>
     list(): Promise<{ data?: unknown[] }>
-    /** 会话详情（含 location.directory——项目归属，新建会话继承链与补写校验用） */
-    get(opts: { path: { id: string } }): Promise<{ data?: { id?: string; title?: string; location?: { directory?: string } } }>
+    /** 会话详情（location.directory=项目归属；model/agent=会话级设置，切换回读/显示锚点用） */
+    get(opts: { path: { id: string } }): Promise<{
+      data?: {
+        id?: string
+        title?: string
+        location?: { directory?: string }
+        model?: { id?: string; providerID?: string; variant?: string }
+        agent?: string
+      }
+    }>
     /** 设置会话项目归属（POST /session/{id}/move；directory=绝对路径） */
     move(opts: { path: { id: string }; body: { directory: string } }): Promise<unknown>
     abort(opts: { path: { id: string } }): Promise<unknown>
