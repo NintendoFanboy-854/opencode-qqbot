@@ -278,6 +278,8 @@ export interface SuperviseDeps {
   alert?: (message: string) => void
   statePath?: string
   claimPath?: string
+  /** 监督动作审计日志路径（测试注入临时文件，避免污染真实 watchdog.log） */
+  auditLogPath?: string
 }
 
 export interface SuperviseResult {
@@ -317,6 +319,17 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
   const isAlive = deps.isAlive ?? isPidAlive
   const statePath = deps.statePath ?? join(homedir(), ".openqq", "supervisor.json")
   const claimPath = deps.claimPath ?? join(homedir(), ".openqq", "supervisor.lock")
+  const audit = (line: string): void => {
+    if (deps.auditLogPath) {
+      try {
+        writeFileSync(deps.auditLogPath, `${new Date().toISOString()} ${line}\n`, { flag: "a" })
+        return
+      } catch {
+        /* fallthrough 到默认日志 */
+      }
+    }
+    appendWatchdogLog(line)
+  }
 
   // —— 监督者认领（进程内互斥；持锁者崩溃后 claimTtlMs 可被接管）——
   const claim = readJson<{ pid: number; ts: number }>(claimPath, { pid: 0, ts: 0 })
@@ -351,7 +364,7 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
     }
     if (action.kind === "give-up") {
       const message = `⚠️ QQBot 看门狗已放弃：${action.restarts} 次重启/${Math.round(policy.windowMs / 60_000)} 分钟仍不健康。继续自动重启没有意义（同因反复死亡），请人工检查 %TEMP%\\opencode 下 bot.out.log 与 ~/.openqq/watchdog.log。`
-      appendWatchdogLog(`give-up：${message}`)
+      audit(`give-up：${message}`)
       log(`[supervisor] give-up：${action.restarts} 次重启仍异常，停止循环并上报`)
       // 告警去抖：30 分钟内只报一次（计划任务每 10 分钟一轮，防止轰炸）
       const lastAlert = state.alertedAt ?? 0
@@ -390,7 +403,7 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
         }
       }
       if (alive) {
-        appendWatchdogLog(`give-up-kill：pid=${pid} 无法终止（权限/系统级），本次不拉起`)
+        audit(`give-up-kill：pid=${pid} 无法终止（权限/系统级），本次不拉起`)
         return { action: "give-up", detail: `pid=${pid} 无法终止`, killedPid: null, spawnedPid: null }
       }
       killedPid = pid
@@ -404,7 +417,7 @@ export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResul
       log("[supervisor] 强度账落盘失败（不影响本次拉起）")
     }
     const detail = `${action.reason}；${killedPid ? `已优雅停 pid=${killedPid}；` : ""}已拉起 pid=${spawnedPid}`
-    appendWatchdogLog(`restart：${detail}`)
+    audit(`restart：${detail}`)
     return { action: "restart", detail, killedPid, spawnedPid }
   } finally {
     release()
