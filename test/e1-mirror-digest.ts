@@ -36,7 +36,7 @@ const normal = mk([
 ])
 const d1 = buildDigest(normal)
 check("正常一轮出卡", !!d1, d1?.split("\n")[0] ?? "null")
-check("含最新用户问题", d1?.includes("🧑 问一个问题") ?? false)
+check("含最新用户问题", d1?.includes("用户：问一个问题") ?? false)
 check("含最新答案、不含旧轮", (d1?.includes("答案是42") ?? false) && !(d1?.includes("旧答案") ?? false))
 
 // 2. 无 assistant 正文（纯工具轮）→ null

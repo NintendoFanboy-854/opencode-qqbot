@@ -99,17 +99,17 @@
 
 ```
 received
-   │ claimInflight
-   ▼
-claimed ──push──▶ queued ──drain──▶ dispatched ──promptId──▶ running
-   │                 │                    │                      │
-   │                 │ drop/clear         │ 失败                  ├─ idle ─▶ settled(answered)
-   │                 ▼                    ▼                      └─ 超时 ─▶ background ─▶ settled(answered)
-   │            rejected(dropped/     rejected(error)
-   │             cancelled)
-   │ age>90s 且无人认领
-   ▼
-orphan ──/ledger settle──▶ rejected(manual)
+   | claimInflight
+   v
+claimed --push--> queued --drain--> dispatched --promptId--> running
+   |                 |                    |                      |
+   |                 | drop/clear         | 失败                  |-- idle --> settled(answered)
+   |                 v                    v                      |-- 超时 --> background --> settled(answered)
+   |            rejected(dropped/     rejected(error)
+   |             cancelled)
+   | age>90s 且无人认领
+   v
+orphan --/ledger settle--> rejected(manual)
 ```
 
 **规则**：每一次转换必须同时做三件事——写台账 `stage`/`settleReason`、打一条结构化日志、给用户一条可读回执（回执可配置开关）。
@@ -185,7 +185,7 @@ deriveQueueView(input: {
 ```
 当前任务：空闲
 队列：0/20 · 台账在途：19 条
-⚠️ 孤儿 19 条（已受理，未入队/未派发，超 90s）
+注意：孤儿 19 条（已受理，未入队/未派发，超 90s）
   · 队列测试1 · 38m 前 · msg …pYgaf · att …u14b
   · 队列测试2 · 38m 前 · msg …nE! · att …h060
   · …（最多 8 条，发 /queue all 看全部）
@@ -332,7 +332,7 @@ deriveQueueView(input: {
 ```
 
 - 日志落点：`~/.openqq/openqq-<pid>.log`，启动时轮转（保留 7 个）。
-- `/status` 增加：`日志：<路径> · 最后写入 Ns 前`；>5min 无写入显示 `⚠️ 日志停滞`。
+- `/status` 增加：`日志：<路径> · 最后写入 Ns 前`；>5min 无写入显示 `注意：日志停滞`。
 - `/ledger check` 结论同步写日志，便于事后取证。
 
 ---

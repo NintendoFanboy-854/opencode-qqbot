@@ -29,7 +29,7 @@ export interface NotifyCliResult {
 }
 
 /** 保守截断：默认 1500 字（主动消息日配额 100/天——长输出拆几十条会吃光）；0=不截断。 */
-export const NOTIFY_DEFAULT_MAX_CHARS = 1500
+export const NOTIFY_DEFAULT_MAX_CHARS = 0
 
 interface ParsedArgs {
   text?: string
@@ -101,7 +101,7 @@ export async function runNotifyCli(
       "用法：openqq notify --text \"…\" | --file <路径> | --stdin",
       "  --user <openid>      收件人；缺省取 ALLOWED_USERS 唯一项（多用户必须显式指定）",
       "  --id <key>           幂等键（同 key 不重复投递）",
-      "  --max-chars <n>      截断上限，默认 1500，0 不截断",
+      "  --max-chars <n>      截断上限，默认 0（不截断）",
       "  --ttl-hours <n>      队列等待上限，默认 24（env QQ_NOTIFY_TTL_HOURS 兜底）",
       "  --dry-run / --json   不入队 / 机器可读输出",
     ].join("\n")

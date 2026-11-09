@@ -108,20 +108,18 @@ export interface AcpClientOptions {
   args?: string[]
   cwd: string
   env?: NodeJS.ProcessEnv
-  /** 单条请求超时（默认 10 分钟；prompt 另走 promptTimeoutMs） */
+  /** 单条请求超时（默认 0=不超时；prompt 另走 promptTimeoutMs） */
   requestTimeoutMs?: number
   /** initialize 握手超时（默认 30 秒；握手失败即清理子进程，可再次 start） */
   handshakeTimeoutMs?: number
   /**
-   * session/prompt 回合超时（默认 6 小时**硬上限**）。
-   * 分两层（2026-11-08 用户拍板「会话没有超时限，只有弹窗有超时」）：
-   *   ① promptNoticeMs（默认 30 分钟）→ 只发一次「已转后台继续」通知，**不终止回合**；
-   *   ② 本值 = 硬上限，仅用于兜住真正的死挂（正常轮次远达不到），到点才 reject + cancel。
-   * 历史：先 10 分钟（通用超时，长回合必被判死 → -32603 级联），再 30 分钟被我误当成
-   * 「会话超时」直接杀任务——那是把弹窗 TTL 的语义错搬到会话上。
+   * session/prompt 回合硬上限（默认 0=不设上限）。
+   * 分两层：
+   *   ① promptNoticeMs（默认 0=不通知）→ 只发「已转后台继续」通知，不终止回合；
+   *   ② 本值 = 硬上限，0 表示不设；需要兜死挂时再显式配置。
    */
   promptTimeoutMs?: number
-  /** 回合前台等待多久后发「转后台继续」通知（默认 30 分钟，只通知不终止）。 */
+  /** 回合前台等待多久后发「转后台继续」通知（默认 0=不通知）。 */
   promptNoticeMs?: number
 }
 
@@ -307,7 +305,7 @@ export class AcpClient {
       return Promise.reject(new Error(`ACP 传输未连接: ${method}`))
     }
     const id = ++this.seq
-    const timeout = timeoutMs ?? this.opts.requestTimeoutMs ?? 10 * 60_000
+    const timeout = timeoutMs ?? this.opts.requestTimeoutMs ?? 0
     return new Promise<T>((resolve, reject) => {
       const timer =
         timeout > 0
@@ -343,8 +341,8 @@ export class AcpClient {
     // 满 promptNoticeMs（30 分钟）只通知一次「已转后台继续」，promise 不 reject、
     // 任务不被杀、串行链保持占用（后续消息继续排队，不会撞 -32603）；
     // 只有 promptTimeoutMs（6 小时硬上限）才 reject，用于兜住真正的死挂。
-    const noticeMs = this.opts.promptNoticeMs ?? 30 * 60_000
-    const capMs = this.opts.promptTimeoutMs ?? 6 * 60 * 60_000
+    const noticeMs = this.opts.promptNoticeMs ?? 0
+    const capMs = this.opts.promptTimeoutMs ?? 0
     let noticed = false
     const noticeTimer =
       noticeMs > 0

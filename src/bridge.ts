@@ -31,7 +31,7 @@ import { createMirror } from "./core/mirror.js"
 import { MessageQueue, previewText, agoLabel, intentKeyOf } from "./core/message-queue.js"
 import { classifyProviderError, rescueText } from "./core/error-rescue.js"
 
-const QUEUE_MAX = 20 // Q1：忙碌队列上限（学习 pi-qqbot queue.max 默认）
+const QUEUE_MAX = Number.POSITIVE_INFINITY // 不再限制排队条数；仅作为 /queue 显示上限（非有限值时不显示分母）
 // 2026-11-05：队列完成回执（"队列 #N 完成（剩余 M 条）"）默认关闭——批量排空时
 // 会放大主动消息配额消耗；排障/验收期设 QQ_QUEUE_RECEIPTS=1 打开。
 const QUEUE_RECEIPTS_ENABLED = /^(1|true|on)$/i.test(process.env.QQ_QUEUE_RECEIPTS ?? "")
@@ -117,7 +117,7 @@ export function stallNudgeText(
         ? "已停滞（回合尚未终结，可能被桌面端审批/选择弹窗阻塞）"
         : "已终结但未回传（异常）"
   const action = s.lastAction ? `｜最近动作：${s.lastAction}` : ""
-  return `⚠️ 后台任务执行超过 ${minsExec} 分钟｜状态：${status}｜已 ${s.idleMin} 分钟无进展${action}\n桌面端确实空闲请忽略本提醒；或回复 /stop 中止该回合后重发。`
+  return `警告：后台任务执行超过 ${minsExec} 分钟｜状态：${status}｜已 ${s.idleMin} 分钟无进展${action}\n桌面端确实空闲请忽略本提醒；或回复 /stop 中止该回合后重发。`
 }
 
 // H2 停滞提醒决策（导出供测试，2026-10-30）：bgWait 零进展时提醒用户处置桌面弹窗。
@@ -200,7 +200,7 @@ export function createBridge(
   const activeWatches = new Map<string, string>()      // userId -> sessionID（/watch 显式订阅）
   const lastCtx = new Map<string, MessageContext>()    // userId -> 最近消息 ctx（推送通道选择依据）
   const bgWaits = new Map<string, { cancel: () => void }>() // 会话 -> 后台等待
-  const callCache = new Map<string, string>()              // callID -> 命令摘要（⚠️ 上下文用）
+  const callCache = new Map<string, string>()              // callID -> 命令摘要（警告：上下文用）
   // Q2：会话工具统计（/progress 手动查询用，本地事件源，零模型成本）
   const turnStats = new Map<string, { tools: number; failed: number; lastTool: string; lastAt: number }>()
 
@@ -269,7 +269,7 @@ export function createBridge(
     const line = formatMilestone(ev, callCache)
     if (!line) return
     // 2026-10-14 用户拍板：里程碑只投 /watch 显式订阅者——自身回合回显与
-    // 会话订阅表的其他来源一律不再隐式携带（镜像只发📋摘要卡）。
+    // 会话订阅表的其他来源一律不再隐式携带（镜像只发摘要卡）。
     for (const userId of milestoneTargets(activeWatches, sessionID)) enqueuePush(userId, line)
   }
 
@@ -278,7 +278,7 @@ export function createBridge(
   // ===== 后台等待：前台超时后不放弃，任务完成时回传结果 =====
   // SSE execution.succeeded 即时触发 + 5 分钟轮询兜底（防 SSE 断连漏事件），
   // 上限 24 小时。用户在同一会话发起新回合时被取代（避免同一结果投递两次）。
-  const BG_WAIT_MAX_MS = 24 * 60 * 60 * 1000
+  const BG_WAIT_MAX_MS = 0 // 0=不设后台等待上限；完成/取消时自然结束
   // P0-1（2026-11-09 69 分钟答案丢失事故）：完成检测 = SSE 即时 + 轮询兜底。
   // 轮询从 5min 收紧到 1min——SSE 断连窗口内完成判定最坏延迟 5min→1min，
   // 与「新输入接管（cancel）」竞态的丢失窗口同步收窄。
@@ -309,7 +309,7 @@ export function createBridge(
       cancelled = true
       unsub()
       clearInterval(pollTimer)
-      clearTimeout(giveupTimer)
+      if (giveupTimer) clearTimeout(giveupTimer)
       bgWaits.delete(sessionId)
       // 被新回合取代（cancel 路径）时结清旧账——否则后台空账永久残留：安全重启
       // 永远等不到空闲、重启恢复会误重挂/补投旧答案（2026-11-05 实证两条僵尸账）。
@@ -336,7 +336,7 @@ export function createBridge(
           mirror.scheduleUnlock(sessionId)
           void drainQueue(ctx.userId)
           // 投递失败不得上抛：账已结清，补投失败由 deliver 层自己的重试/降级负责
-          await safeDeliver(ctx, `📤 你发来新消息前，上一回合已完成，结果如下：\n\n${turn.text}`).catch(() => {})
+          await safeDeliver(ctx, `你发来新消息前，上一回合已完成，结果如下：\n\n${turn.text}`).catch(() => {})
           console.log(`[bridge] 接管前抢救：后台回合已完成且未投递，结果已补投 session=${sessionId}`)
           return
         }
@@ -386,11 +386,11 @@ export function createBridge(
         // DEF-qqbot-20261107-P2：后台等到的回合已被同会话新输入接管——任务已死，
         // 明确交代而非沉默到 24 小时 giveup。
         console.log(`[bridge] 后台回合被同会话新输入接管（superseded）session=${sessionId}`)
-        await safeDeliver(ctx, "⚠️ 后台任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+        await safeDeliver(ctx, "警告：后台任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
         return
       }
       if (kind === "giveup") {
-        await safeDeliver(ctx, "⚠️ 后台任务 24 小时仍未完成，停止自动跟进；结果可随时用 /history 查询")
+        await safeDeliver(ctx, "警告：后台任务 24 小时仍未完成，停止自动跟进；结果可随时用 /history 查询")
         return
       }
       // SSE 完成事件后给最终消息落库留 2 秒余量，避免读到半截
@@ -401,8 +401,8 @@ export function createBridge(
         await safeDeliver(
           ctx,
           text
-            ? `📤 后台任务完成，结果如下：\n\n${text}`
-            : "📤 后台任务完成（无文本产出），详情可用 /history 查看",
+            ? `后台任务完成，结果如下：\n\n${text}`
+            : "后台任务完成（无文本产出），详情可用 /history 查看",
         ).catch((error) => console.error("[bridge] 后台完成结果投递失败（账已结清）:", error))
         console.log(`[bridge] 会话 ${sessionId} 后台等待已交付`)
       } catch (error) {
@@ -466,10 +466,10 @@ export function createBridge(
       if (ev.type === "session.execution.succeeded") void finish("done")
     })
     const pollTimer = setInterval(() => void tick(), BG_POLL_MS)
-    const giveupTimer = setTimeout(() => void finish("giveup"), BG_WAIT_MAX_MS)
+    const giveupTimer = BG_WAIT_MAX_MS > 0 ? setTimeout(() => void finish("giveup"), BG_WAIT_MAX_MS) : null
     bgWaits.set(sessionId, { cancel: cleanup })
     if (trackId) markInflightStage(trackId, "background", { sessionId })
-    console.log(`[bridge] 会话 ${sessionId} 转入后台等待（最长 ${BG_WAIT_MAX_MS / 3_600_000} 小时）`)
+    console.log(`[bridge] 会话 ${sessionId} 转入后台等待（${BG_WAIT_MAX_MS > 0 ? `最长 ${BG_WAIT_MAX_MS / 3_600_000} 小时` : "无上限"}）`)
   }
 
   const watchApi: WatchApi = {
@@ -481,7 +481,7 @@ export function createBridge(
       subscribeSession(sessionID, userId)
       saveWatchedMap(activeWatches) // R2-P1-3：落盘，重启恢复
       return [
-        `👁 已开启观察：${sessionID}`,
+        `已开启观察：${sessionID}`,
         "该会话的工具调用/执行完成会实时推送摘要，/watch off 停止。",
         "（≥2 秒节流合并；QQ 主动消息有日配额，被动窗口内不受限）",
       ].join("\n")
@@ -496,7 +496,7 @@ export function createBridge(
     },
     status(userId) {
       const sid = activeWatches.get(userId)
-      return sid ? `👁 观察中：${sid}` : "未开启观察"
+      return sid ? `观察中：${sid}` : "未开启观察"
     },
   }
 
@@ -627,7 +627,7 @@ export function createBridge(
               const ctx = lastCtx.get(userId) ?? ctxForUser(userId)
               void safeDeliver(
                 ctx,
-                "⏳ 本轮已执行满 30 分钟，仍在继续（前台等待结束，已转后台），完成即回传；可 /stop 中止。",
+                "本轮已执行满 30 分钟，仍在继续（前台等待结束，已转后台），完成即回传；可 /stop 中止。",
               )
             },
           },
@@ -672,14 +672,14 @@ export function createBridge(
     answers: Array<{ item: QuestionItem; value: string | string[]; custom: boolean }>
     index: number
     resolve: (value: unknown) => void
-    timer: ReturnType<typeof setTimeout>
+    timer: ReturnType<typeof setTimeout> | null
   }
   const pendingElicitations = new Map<string, PendingAcpElicitation>()
   // 时限统一表（2026-11-08 用户拍板「统一三十分钟」）：
   //   提问/表单 30 分钟 → 未答按「跳过」（无必填）或「中止」（有必填）
   //   审批       30 分钟 → 自动拒绝（fail-closed，见 core/permission.ts）
   //   prompt 回合 30 分钟 → cancel 释放会话（见 opencode/acp.ts）
-  const ELICITATION_TTL_MS = 30 * 60_000
+  const ELICITATION_TTL_MS = 0 // 0=不自动跳过/中止；由用户或 OpenCode 侧决定
 
   function askCurrentQuestion(userId: string, pending: PendingAcpElicitation): void {
     const item = pending.questions[pending.index]
@@ -702,7 +702,7 @@ export function createBridge(
     // 同一用户已有挂起提问：旧的作废，避免答案串线
     const stale = pendingElicitations.get(userId)
     if (stale) {
-      clearTimeout(stale.timer)
+      if (stale.timer) clearTimeout(stale.timer)
       pendingElicitations.delete(userId)
       stale.resolve({ action: "cancel" })
     }
@@ -710,7 +710,7 @@ export function createBridge(
       `[elicitation] 推送提问 user=${userId.slice(0, 8)}… 题数=${questions.length} 首题=${questions[0]?.title ?? ""}`,
     )
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
+      const timer = ELICITATION_TTL_MS > 0 ? setTimeout(() => {
         pendingElicitations.delete(userId)
         // 2026-11-08 语义修正：沉默 ≠ 用户拒绝。无必填时按「未答」继续（工具会写成
         // Unanswered，模型自行推进），只有必填题未答才中止——与上游 question 工具
@@ -718,13 +718,13 @@ export function createBridge(
         const outcome = timeoutOutcome(pending.questions, pending.answers)
         if (outcome.action === "accept") {
           console.log(`[elicitation] 超时跳过 user=${userId.slice(0, 8)}… 已答 ${pending.answers.length}/${pending.questions.length}`)
-          void safeDeliver(pctx, "⏰ 30 分钟未作答，已按「未答」继续（AI 按默认推进；/history 可查看）")
+          void safeDeliver(pctx, "提醒：30 分钟未作答，已按「未答」继续（AI 按默认推进；/history 可查看）")
         } else {
           console.log(`[elicitation] 超时中止 user=${userId.slice(0, 8)}… 存在未答必填题`)
-          void safeDeliver(pctx, "⏰ 30 分钟未作答，且该题为必填，已中止本次提问")
+          void safeDeliver(pctx, "提醒：30 分钟未作答，且该题为必填，已中止本次提问")
         }
         resolve(outcome)
-      }, ELICITATION_TTL_MS)
+      }, ELICITATION_TTL_MS) : null
       const pending: PendingAcpElicitation = { questions, answers: [], index: 0, resolve, timer }
       pendingElicitations.set(userId, pending)
       askCurrentQuestion(userId, pending)
@@ -738,7 +738,7 @@ export function createBridge(
     const text = content.trim()
     const pctx = ctxForUser(userId)
     if (/^(取消|cancel|退出|算了|放弃)$/i.test(text)) {
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       pendingElicitations.delete(userId)
       pending.resolve({ action: "cancel" })
       void safeDeliver(pctx, "已取消")
@@ -746,7 +746,7 @@ export function createBridge(
     }
     const item = pending.questions[pending.index]
     if (!item) {
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       pendingElicitations.delete(userId)
       pending.resolve({ action: "cancel" })
       return true
@@ -762,7 +762,7 @@ export function createBridge(
       askCurrentQuestion(userId, pending)
       return true
     }
-    clearTimeout(pending.timer)
+    if (pending.timer) clearTimeout(pending.timer)
     pendingElicitations.delete(userId)
     pending.resolve({ action: "accept", content: toFormContent(pending.answers) })
     const summary = pending.answers
@@ -1006,7 +1006,7 @@ export function createBridge(
           console.log(`[queue] orphan-scan user=${uid.slice(0, 8)}… count=${view.counts.orphan}`)
           void safeDeliver(
             ctxForUser(uid),
-            `⚠️ 台账发现 ${view.counts.orphan} 条孤儿消息（受理后未入队/未派发）。发 /queue 查看；/ledger settle <尾号> confirm 可人工结清。`,
+            `警告：台账发现 ${view.counts.orphan} 条孤儿消息（受理后未入队/未派发）。发 /queue 查看；/ledger settle <尾号> confirm 可人工结清。`,
           ).catch(() => {})
         }
       } catch (error) {
@@ -1229,7 +1229,7 @@ export function createBridge(
         const queued = msgQueue.push(ctx.userId, ctx)
         if (!queued) {
           if (claimedMsgId) settleInflight(claimedMsgId, undefined, "queue-full") // 已满回执即终态，不能留账让启动对账再次执行
-          console.log(`[queue] reject user=${ctx.userId.slice(0, 8)}… msg=${shortId(ctx.msgId)} reason=full size=${msgQueue.size(ctx.userId)}/${QUEUE_MAX}`)
+          console.log(`[queue] reject user=${ctx.userId.slice(0, 8)}… msg=${shortId(ctx.msgId)} reason=full size=${msgQueue.size(ctx.userId)}`)
           await notifyUser(ctx, `排队已满（${QUEUE_MAX} 条），本条未入队；请稍候再试或 /cancel 中止当前任务`)
           return
         }
@@ -1256,7 +1256,7 @@ export function createBridge(
   // 通知——这三处都不进本分支，同一 intent 不重复点头。
   // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
       if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
-        await notifyUser(ctx, "✅ 已收到，正在处理，完成后自动回复你")
+        await notifyUser(ctx, "已收到，正在处理，完成后自动回复你")
       }
 
       // B3（2026-10-29 同步升级）：C2C typing 指示——长回合处理中给用户
@@ -1357,7 +1357,7 @@ export function createBridge(
                   if (!progressed) {
                     await safeDeliver(
                       ctx,
-                      "⚠️ 该审批请求状态不明（可能在桌面端处理或已超时），且任务长时间无进展。如命令未执行，请重新发起原操作",
+                      "警告：该审批请求状态不明（可能在桌面端处理或已超时），且任务长时间无进展。如命令未执行，请重新发起原操作",
                     )
                   }
                 } catch {
@@ -1377,9 +1377,9 @@ export function createBridge(
               const done = await sendLocalFile(ctx, p, {
                 getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
               })
-              await safeDeliver(ctx, `📎 ${done}`)
+              await safeDeliver(ctx, `${done}`)
             } catch (error) {
-              await safeDeliver(ctx, `⚠️ 发送文件失败（${p}）：${error instanceof Error ? error.message : error}`)
+              await safeDeliver(ctx, `警告：发送文件失败（${p}）：${error instanceof Error ? error.message : error}`)
             }
           }
           // 超长回合可能已超被动窗口：deliver 被动失败自动降级主动，答案不丢
@@ -1395,7 +1395,7 @@ export function createBridge(
           // superseded 销账：不转后台（任务已死，「继续执行」是谎言）、不占位符、
           // 不挂 30 分钟超时。账本结清后 finally 正常 drain 队列。
           console.log(`[bridge] 回合被同会话新输入接管（superseded）msg=${shortId(trackId)} sid=${shortId(sessionId)}`)
-          await safeDeliver(ctx, "⚠️ 上一条任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+          await safeDeliver(ctx, "警告：上一条任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
           settleInflight(trackId, undefined, "superseded")
         } else if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
           // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 5 分钟轮询兜底，
@@ -1403,7 +1403,7 @@ export function createBridge(
           // R 项：不销账——bgWait 完成投递时才销（完成前死亡由启动对账接管）。
           await safeDeliver(
             ctx,
-            "⏳ 回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
+            "回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
           )
           startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId, turnStart)
         } else if (isAcpPromptBusy(error)) {
@@ -1412,12 +1412,12 @@ export function createBridge(
           console.error(`[bridge] 会话被占用（active prompt）sid=${shortId(sessionId)}: ${toErrorMessage(error)}`)
           await safeDeliver(
             ctx,
-            "⏳ 该会话正有回合在执行（可能是桌面端在跑，或上一轮尚未结束），本轮未重复发起。\n发 /stop 可中止当前回合后重试。",
+            "该会话正有回合在执行（可能是桌面端在跑，或上一轮尚未结束），本轮未重复发起。\n发 /stop 可中止当前回合后重试。",
           )
           settleInflight(trackId, undefined, "error")
         } else if (isAcpPromptTimeout(error)) {
           // 仅硬上限（6 小时）会走到这里；30 分钟只是通知，不终止回合。
-          await safeDeliver(ctx, "⏱ 回合已达硬上限（6 小时），已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
+          await safeDeliver(ctx, "回合已达硬上限（6 小时），已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
           settleInflight(trackId, undefined, "error")
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错
@@ -1500,7 +1500,7 @@ export function createBridge(
           )
           await deliver(
             ctxForUser(userId),
-            `🔄 重启恢复：${restored} 条排队消息已恢复（发 /queue 查看；/queue clear 可清空）`,
+            `重启恢复：${restored} 条排队消息已恢复（发 /queue 查看；/queue clear 可清空）`,
           )
         }
       }
@@ -1521,7 +1521,7 @@ export function createBridge(
         settleInflight(entry.msgId, undefined, "expired")
         await deliver(
           ctx,
-          `⚠️ 重启前队列里有一条消息超过恢复窗口未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免执行陈旧意图未自动重派，需要的话请重发一次`,
+          `警告：重启前队列里有一条消息超过恢复窗口未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免执行陈旧意图未自动重派，需要的话请重发一次`,
         )
         console.log(`[bridge] 启动对账：超窗排队空账已通知销账 msgId=${entry.msgId}`)
         continue
@@ -1530,7 +1530,7 @@ export function createBridge(
         const listJson = { data: await fetchRecoveryMessages(client, entry.sessionId) }
         const cls = classifyInflight(entry, listJson.data)
         if (cls.kind === "answered") {
-          await deliver(ctx, `🔄 重启补投：你之前的消息已有答案\n\n${cls.answer}`)
+          await deliver(ctx, `重启补投：你之前的消息已有答案\n\n${cls.answer}`)
           settleInflight(entry.msgId, undefined, "answered")
           console.log(`[bridge] 启动对账：已补投答案 msgId=${entry.msgId}`)
         } else if (cls.kind === "running") {
@@ -1548,11 +1548,11 @@ export function createBridge(
           console.log(`[bridge] 启动对账：在途任务已重挂后台等待 msgId=${entry.msgId}`)
         } else if (ageMs <= redispatchMaxAgeMs()) {
           settleInflight(entry.msgId, undefined, "redispatch") // 旧账结清，重派回合走新账（合成 trackId）
-          await deliver(ctx, `🔄 重启恢复：重新处理你之前的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」`)
+          await deliver(ctx, `重启恢复：重新处理你之前的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」`)
           void handleMessage(ctx)
           console.log(`[bridge] 启动对账：丢失消息已重派 msgId=${entry.msgId}`)
         } else {
-          await deliver(ctx, `⚠️ 此前重启期间丢失一条你的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」（超过自动重派窗口未重发），需要的话请重发一次`)
+          await deliver(ctx, `警告：此前重启期间丢失一条你的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」（超过自动重派窗口未重发），需要的话请重发一次`)
           settleInflight(entry.msgId, undefined, "expired")
           console.log(`[bridge] 启动对账：超期消息仅通知 msgId=${entry.msgId}`)
         }
@@ -1722,10 +1722,10 @@ export function formatMilestone(ev: V2Event, calls?: Map<string, string>): strin
       }
       // 2026-10-14 用户反馈：纯文件类工具（read/edit/write/grep…）推送裸路径没有
       // 意义——只保留动作类里程碑（input.command 的 shell 命令，或 input 即命令串）；
-      // 文件类静默，过程内容由摘要镜像 /history 承载。⚠️失败行不受影响（走 calls 缓存）。
+      // 文件类静默，过程内容由摘要镜像 /history 承载。警告：失败行不受影响（走 calls 缓存）。
       const cmd = typeof d.input === "string" ? d.input : d.input?.command
       if (!(typeof cmd === "string" && cmd.trim())) return null
-      return `🔧 ${line}`
+      return `工具：${line}`
     }
     case "session.tool.success": {
       const exit = d.metadata?.exit
@@ -1733,12 +1733,12 @@ export function formatMilestone(ev: V2Event, calls?: Map<string, string>): strin
       const what =
         (d.id ? calls?.get(String(d.id)) : undefined) ??
         (d.input ? truncate(redactSecrets(summarizeInput(d.input)), 80) : "")
-      return what ? `⚠️ exit ${exit}：${what}` : `⚠️ exit ${exit}`
+      return what ? `警告：exit ${exit}：${what}` : `警告：exit ${exit}`
     }
     case "session.execution.succeeded":
-      return "✅ 本轮完成"
+      return "本轮完成"
     case "session.execution.failed":
-      return "❌ 执行失败"
+      return "执行失败"
     default:
       return null
   }

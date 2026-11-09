@@ -78,11 +78,11 @@ export function newInflightAttemptId(): string {
   return `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-// 启动对账年龄上限：超 24h 的在途账仍保留在文件中，但恢复时不再追溯（由恢复流程销账）。
-export const INFLIGHT_MAX_AGE_MS = 24 * 60 * 60 * 1000
-// settled 记录只保留 24h 内、按 at 最新的 20 条；inflight 不受年龄或数量限制。
+// 启动对账年龄上限：0/不设上限，恢复时不再按年龄丢弃。
+export const INFLIGHT_MAX_AGE_MS = Number.POSITIVE_INFINITY
+// settled 记录不按年龄/数量裁剪。
 export const SETTLED_RETENTION_MS = INFLIGHT_MAX_AGE_MS
-export const SETTLED_RETENTION_LIMIT = 20
+export const SETTLED_RETENTION_LIMIT = Number.POSITIVE_INFINITY
 
 /**
  * 台账保留策略（纯函数）：保留全部 inflight；settled 先按 24h 过滤，再按 at 取最新 20 条。
@@ -107,8 +107,10 @@ export function pruneInflightEntries(entries: InflightEntry[], now = Date.now())
 // 可调；0=关闭自动重派一律通知）。窗口内视为"意图仍然新鲜"自动重派；超期只通知请用户
 // 重发——防"陈旧意图"在重启时被意外执行。
 export function redispatchMaxAgeMs(): number {
-  const n = Number(process.env.QQ_REDISPATCH_MAX_AGE_MS ?? "7200000")
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7_200_000
+  const raw = process.env.QQ_REDISPATCH_MAX_AGE_MS
+  if (raw === undefined || raw.trim() === "") return Number.POSITIVE_INFINITY
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : Number.POSITIVE_INFINITY
 }
 
 // 测试可经 QQ_INFLIGHT_FILE 指向临时文件

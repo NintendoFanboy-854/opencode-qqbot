@@ -110,7 +110,7 @@ export function startLinkWatch(deps: LinkWatchDeps): LinkWatch {
           console.log(`[linkwatch] 链路恢复（中断约 ${durMin} 分钟，共 ${open.attempts} 次巡检失败）`)
           if (!open.rebasedTo) {
             // rebase 恢复路径在切换时已发过 fixed 告警；只有自然恢复才发恢复通知
-            await fire(`✅ OpenCode 链路恢复（中断约 ${durMin} 分钟，共 ${open.attempts} 次巡检失败）`)
+            await fire(` OpenCode 链路恢复（中断约 ${durMin} 分钟，共 ${open.attempts} 次巡检失败）`)
           }
           saveIncident(file, { ...open, state: "closed", lastCheck: nowIso() })
           rec = null
@@ -121,7 +121,7 @@ export function startLinkWatch(deps: LinkWatchDeps): LinkWatch {
         const msg = error instanceof Error ? error.message : String(error)
         if (!rec) {
           rec = { state: "open", since: nowIso(), lastCheck: nowIso(), lastError: msg, attempts: 0 }
-          console.error(`[linkwatch] ⚠️ 链路失联开始（${msg}），转入自愈巡检`)
+          console.error(`[linkwatch] 警告：链路失联开始（${msg}），转入自愈巡检`)
         }
         const inc = rec
         inc.attempts++
@@ -132,7 +132,7 @@ export function startLinkWatch(deps: LinkWatchDeps): LinkWatch {
         if (!alarmOpenSent) {
           alarmOpenSent = true
           await fire(
-            `⚠️ OpenCode 链路失联（自 ${inc.since.slice(11, 16)} 起，错误：${msg.length > 80 ? `${msg.slice(0, 80)}…` : msg}）。已转入自动自愈：发现新端口会自动切换并通知。`,
+            `警告：OpenCode 链路失联（自 ${inc.since.slice(11, 16)} 起，错误：${msg.length > 80 ? `${msg.slice(0, 80)}…` : msg}）。已转入自动自愈：发现新端口会自动切换并通知。`,
           )
         }
 
@@ -147,8 +147,8 @@ export function startLinkWatch(deps: LinkWatchDeps): LinkWatch {
           console.log(`[linkwatch] 热换基完成 → ${found.baseUrl}（v${found.version}），复验中…`)
           try {
             await healthCheck(deps.client, true)
-            console.log("[linkwatch] ✅ 换基复验通过，链路恢复")
-            await fire(`✅ OpenCode 端口已漂移，已自动切换旧地址 → ${found.baseUrl}（v${found.version}），链路恢复。`)
+            console.log("[linkwatch] 换基复验通过，链路恢复")
+            await fire(` OpenCode 端口已漂移，已自动切换旧地址 → ${found.baseUrl}（v${found.version}），链路恢复。`)
             saveIncident(file, { ...inc, state: "closed", lastCheck: nowIso() })
             rec = null
             alarmOpenSent = false

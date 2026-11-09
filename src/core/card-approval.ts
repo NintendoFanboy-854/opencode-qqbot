@@ -60,7 +60,7 @@ function makeButton(label: string, style: number, data: ApprovalButtonData, _own
   // 注意：group_id 单选互斥在 C2C 多行布局下被平台校验拒绝（实测
   // "rows.buttons.id 无效"，2026-11-05），已与腾讯对齐撤下；互斥体感由 visited_label 承担。
   // _ownerOpenid 保留在签名里维持 buildApprovalKeyboard 的既有接口（身份索引在交互回调侧完成）。
-  const visited = data.d === "once" || data.d === "always" ? `✓ ${label}` : data.d === "reject" ? `✗ ${label}` : label
+  const visited = data.d === "once" || data.d === "always" ? `已选 ${label}` : data.d === "reject" ? `未选 ${label}` : label
   return {
     id: `approval-${data.d}-${data.r}`.slice(0, 64),
     render_data: { label: clipLabel(label), visited_label: clipLabel(visited), style },

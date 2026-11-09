@@ -15,7 +15,7 @@ export interface QueuedJob {
   enqueuedAt: number
 }
 
-const PREVIEW_MAX = 48
+const PREVIEW_MAX = 0 // 0=不截断预览
 
 /** 忙碌期间的用户意图键：msgId 不同的重复提问/同图重发仍视为同一意图。 */
 export function intentKeyOf(ctx: MessageContext): string {
@@ -26,7 +26,8 @@ export function intentKeyOf(ctx: MessageContext): string {
 
 export function previewText(text: string, max = PREVIEW_MAX): string {
   const flat = text.replace(/\s+/g, " ").trim()
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat || "(空消息)"
+  if (max > 0 && flat.length > max) return `${flat.slice(0, max)}…`
+  return flat || "(空消息)"
 }
 
 export function agoLabel(at: number, now = Date.now()): string {

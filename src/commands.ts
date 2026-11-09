@@ -220,9 +220,9 @@ async function handleSend(ctx: MessageContext, args: string, cmdCtx: CommandCont
   }
   try {
     const done = await sendLocalFile(ctx, path, { getToken: cmdCtx.getAccessToken })
-    return `📎 ${done}`
+    return `${done}`
   } catch (error) {
-    return `⚠️ 发送失败：${error instanceof Error ? error.message : error}`
+    return `警告：发送失败：${error instanceof Error ? error.message : error}`
   }
 }
 
@@ -315,7 +315,7 @@ async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promis
   const logLine = log
     ? (() => {
         const ageSec = log.lastWriteAt ? Math.round((Date.now() - log.lastWriteAt) / 1000) : -1
-        const stale = ageSec > 300 ? " ⚠️ 日志停滞" : ""
+        const stale = ageSec > 300 ? "警告：日志停滞" : ""
         return `日志：${log.path} · ${ageSec >= 0 ? `最后写入 ${ageSec}s 前` : "尚未写入"}${stale}`
       })()
     : "日志：未启用（QQ_LOG_FILE=off）"
@@ -440,14 +440,14 @@ async function handleHistory(ctx: MessageContext, args: string, cmdCtx: CommandC
     return "当前还没有会话"
   }
 
-  const n = /^\d+$/.test(args.trim()) ? Math.min(Math.max(Number(args.trim()), 1), 10) : 3
+  const n = /^\d+$/.test(args.trim()) ? Math.max(Number(args.trim()), 1) : 3
   const res = await cmdCtx.client.session.messages({ path: { id: session.sessionId } })
   const messages: SessionMessage[] = res?.data ?? []
   const body = renderHistory(messages, n)
   if (!body) {
     return "该会话暂无历史消息"
   }
-  return `📜 ${session.title ?? session.sessionId} · 最近 ${n} 轮\n\n${body}`
+  return `${session.title ?? session.sessionId} · 最近 ${n} 轮\n\n${body}`
 }
 
 async function handleWatch(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
@@ -600,7 +600,7 @@ export function buildHelpText(): string {
     "/agent - 列出可用 Agent",
     "/agent <name> - 切换 Agent",
     "/rename <name> - 重命名当前会话",
-    "/history [N] - 查看当前会话最近 N 轮历史（默认 3，最多 10）",
+    "/history [N] - 查看当前会话最近 N 轮历史（默认 3）",
     "/send <路径> - 把白名单目录内的文件/图片发到 QQ",
     "/watch - 观察当前会话实时过程（工具调用/完成会推送摘要）",
     "/watch <会话ID> - 观察指定会话",

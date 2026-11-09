@@ -121,8 +121,8 @@ interface OutboxDocument {
   entries: OutboxEntry[]
 }
 
-export const OUTBOX_SENT_RETENTION_MS = 24 * 60 * 60 * 1000
-export const OUTBOX_SENT_RETENTION_LIMIT = 20
+export const OUTBOX_SENT_RETENTION_MS = Number.POSITIVE_INFINITY
+export const OUTBOX_SENT_RETENTION_LIMIT = Number.POSITIVE_INFINITY
 export const OUTBOX_DEFAULT_RETRY_BASE_MS = 1_000
 export const OUTBOX_DEFAULT_RETRY_MAX_MS = 60_000
 

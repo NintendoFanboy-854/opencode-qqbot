@@ -28,7 +28,7 @@ export class SessionManager {
     this.loadSessions()
   }
 
-  // 持久化映射：bot 重启（升级/故障）不再丢失 QQ↔会话绑定
+  // 持久化映射：bot 重启（升级/故障）不再丢失 QQ会话绑定
   //（2026-10-13 实测教训：重启清空内存映射 → 用户 QQ 消息落到全新会话，AI 失忆从零探索）。
   private loadSessions(): void {
     try {

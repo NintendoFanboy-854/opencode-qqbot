@@ -234,12 +234,11 @@ export function createDelivery(
   config: Config,
   lastCtx: ReadonlyMap<string, MessageContext>,
 ): Delivery {
-  const PUSH_MIN_GAP_MS = 2000      // 用户级节流：最快 2 秒一批
-  const PUSH_MAX_LINES = 6          // 队列上限：洪峰丢最旧，防积压
+  const PUSH_MIN_GAP_MS = 0          // 不做用户级节流，交给 QQ 平台频控
+  const PUSH_MAX_LINES = Number.POSITIVE_INFINITY // 不丢推送行；积压由下游处理
   // 债务D4（2026-10-13 官方文档查证）：主动消息频控 = 单关系 1000 条/天 + 20/qpm，
-  // Bot 维度认证 10/qps（超限报 40034100）。原自设 15/天过度保守 → 默认 100 留
-  // 余量，可用 env QQ_ACTIVE_DAILY_LIMIT 覆盖。
-  const ACTIVE_DAILY_LIMIT = Number(process.env.QQ_ACTIVE_DAILY_LIMIT ?? 100)
+  // Bot 维度认证 10/qps（超限报 40034100）。本默认直接跟官方日上限，不再自设余量。
+  const ACTIVE_DAILY_LIMIT = Number(process.env.QQ_ACTIVE_DAILY_LIMIT ?? 1000)
 
   // B-msgid（2026-10-29，吸收 dsh transport/msgid-cache）：主动降级前尝试让发送
   // "骑"该用户最近的被动 msg_id——平台窗口内接受则按被动计（不耗主动配额）。
@@ -252,9 +251,10 @@ export function createDelivery(
 
   // J-轻（2026-10-30，用户拍板固化）：伪流式错峰——多片回复片间间隔（默认 300ms），
   // 配合 B3 typing 指示，长答案逐段到达体感近打字机；0=关闭恢复一次性全发。
+  // 2026-11-10：默认改为 0，不再人为加发送间隔。
   const STREAM_STAGGER_MS = (() => {
-    const n = Number(process.env.QQ_STREAM_STAGGER_MS ?? "300")
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 300
+    const n = Number(process.env.QQ_STREAM_STAGGER_MS ?? "0")
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0
   })()
 
   const pushQueues = new Map<string, PushQueue>()
@@ -376,7 +376,7 @@ export function createDelivery(
         saveQuotaMap(activeQuota) // O5：告警态也落盘
         console.warn(`[bridge] 用户 ${ctx.userId} 今日主动推送配额用尽，窗口外消息无法送达`)
         try {
-          await sendActive(ctx, "⚠️ 今日主动推送配额已用尽（QQ 限制），窗口外消息明日恢复送达")
+          await sendActive(ctx, "警告：今日主动推送配额已用尽（QQ 限制），窗口外消息明日恢复送达")
         } catch {
           // 告警也发不出去就静默
         }

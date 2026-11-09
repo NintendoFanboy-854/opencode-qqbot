@@ -9,19 +9,17 @@
 //   idle:      { id, time, type:"idle", outcome }
 import type { MessagePart, SessionMessage } from "./client.js"
 
-// H1（2026-10-30，/history 格式化重做）：默认上限放宽——/history 的目的是"回看
-// 内容"，旧 400 字/160 字无意义；保留 env 逃生门。按字符计（投递层管字节）。
-const TOOL_CLIP = 140
+// 2026-11-10：不再做展示截断；/history 要回看就回看全文。
+const TOOL_CLIP = 0
 
 function historyLimit(envKey: string, fallback: number): number {
   const n = Number(process.env[envKey])
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
 
-// 块级截断：保留换行与 markdown 结构（旧 clip 折叠 \s+ 会把代码块/表格压成一行，
-// 是 "/history 没格式化" 的核心病根），仅超长在尾部截断+提示。
+// 块级截断：max<=0 表示不截断；保留换行与 markdown 结构。
 function clipBlock(text: string, max: number): string {
-  if (text.length <= max) return text
+  if (max <= 0 || text.length <= max) return text
   return `${text.slice(0, max)}\n…（共 ${text.length} 字，已截断，回桌面看全文）`
 }
 
@@ -39,7 +37,7 @@ function toolRunOf(part: MessagePart): ToolRun {
   const toolName = typeof part.tool === "string" && part.tool ? part.tool : "tool"
   const exit = state.metadata?.exit
   const exitNote = typeof exit === "number" && exit !== 0 ? ` (exit ${exit})` : ""
-  const detail = `${toolName} ${clip(redactSecrets(summarizeInput(state.input)), TOOL_CLIP)} ${ok ? "✓" : `✗${exitNote}`}`
+  const detail = `${toolName} ${TOOL_CLIP > 0 ? clip(redactSecrets(summarizeInput(state.input)), TOOL_CLIP) : redactSecrets(summarizeInput(state.input))} ${ok ? "OK" : `FAIL${exitNote}`}`
   return { name: toolName, ok, detail }
 }
 
@@ -62,9 +60,8 @@ export function renderHistory(messages: SessionMessage[], turns: number): string
   const picked = segments.slice(-turns)
   if (picked.length === 0) return null
 
-  const userClip = historyLimit("QQ_HISTORY_USER_CLIP", 500)
-  const textClip = historyLimit("QQ_HISTORY_TEXT_CLIP", 1200)
-  const TOOL_DETAIL_MAX = 3
+  const userClip = historyLimit("QQ_HISTORY_USER_CLIP", 0)
+  const textClip = historyLimit("QQ_HISTORY_TEXT_CLIP", 0)
 
   const total = picked.length
   const out: string[] = []
@@ -72,27 +69,23 @@ export function renderHistory(messages: SessionMessage[], turns: number): string
     const lines: string[] = [`▎第 ${idx + 1} 轮（共 ${total} 轮）`]
     const toolStats = new Map<string, { ok: number; fail: number }>()
     const failDetails: string[] = []
-    let failOverflow = 0
 
     for (const m of seg) {
       if (m.type === "user") {
         const text = (m as { text?: string }).text ?? ""
         // H1 安全修复：正文全量脱敏（旧版只脱工具行，用户/AI 正文可外泄密钥）
-        if (text.trim()) lines.push(`🧑 ${clipBlock(redactSecrets(text.trim()), userClip)}`)
+        if (text.trim()) lines.push(`用户：${clipBlock(redactSecrets(text.trim()), userClip)}`)
       } else if (m.type === "assistant") {
         for (const p of m.content ?? []) {
           if (p.type === "text" && p.text?.trim()) {
-            lines.push(`🤖 ${clipBlock(redactSecrets(p.text.trim()), textClip)}`)
+            lines.push(`AI：${clipBlock(redactSecrets(p.text.trim()), textClip)}`)
           } else if (p.type === "tool") {
             const t = toolRunOf(p)
             const st = toolStats.get(t.name) ?? { ok: 0, fail: 0 }
             if (t.ok) st.ok += 1
             else st.fail += 1
             toolStats.set(t.name, st)
-            if (!t.ok) {
-              if (failDetails.length < TOOL_DETAIL_MAX) failDetails.push(`🔧 ${t.detail}`)
-              else failOverflow += 1
-            }
+            if (!t.ok) failDetails.push(`工具：${t.detail}`)
           }
         }
       }
@@ -101,11 +94,10 @@ export function renderHistory(messages: SessionMessage[], turns: number): string
 
     if (toolStats.size > 0) {
       const agg = [...toolStats.entries()]
-        .map(([name, s]) => `${name}×${s.ok + s.fail}${s.fail > 0 ? `（${s.fail}✗）` : "✓"}`)
+        .map(([name, s]) => `${name}×${s.ok + s.fail}${s.fail > 0 ? `（${s.fail}失败）` : "OK"}`)
         .join(" ")
-      lines.push(`🔧 ${agg}`)
+      lines.push(`工具：${agg}`)
       for (const d of failDetails) lines.push(d)
-      if (failOverflow > 0) lines.push(`🔧 …另有 ${failOverflow} 个失败工具（回桌面看详情）`)
     }
 
     // 跳过空轮（只有轮次头没有内容）

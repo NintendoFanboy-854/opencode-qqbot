@@ -78,16 +78,10 @@ function convertTables(text: string): string {
   return out.join("\n")
 }
 
-// 分条字节上限（2026-11-03 探针实证修订，替换旧"约 2000 字节"经验值——该值无官方出处且被证伪）：
-// - 官方文档（bot.q.qq.com/wiki API v2，2026-10-28 版）未公布 content/markdown.content 数值上限，
-//   仅错误码 40054007「消息长度超限」/40054018「消息过长或异常」证明服务端确有校验；
-// - 本机探针（生产环境发真实消息）：纯文本 8 万字/24 万字节、Markdown 60232 字节（2 万字+起止标识）
-//   均 HTTP 200 受理，且 2 万字 Markdown 经用户确认 QQ 客户端完整渲染；
-// - 故上限统一取 2 万字实测值 60232 字节（markdown=plain=60232）；
-// 分条逻辑（行边界/表格原子/围栏修补）保留，超 60232 字节仍分片。
-// 注意：必须按 UTF-8 字节切分，不能按字符数——中文 3 字节/字，按字符预算会在字节维度失控。
-const MARKDOWN_MAX_BYTES = 60232
-const PLAIN_MAX_BYTES = 60232
+// 官方未公布消息字节上限（仅 40054007/40054018 错误码）；不预设 60232 这类经验值。
+// 先整条发送，超长时由 API 错误触发自适应二分拆分。
+const MARKDOWN_MAX_BYTES = Number.POSITIVE_INFINITY
+const PLAIN_MAX_BYTES = Number.POSITIVE_INFINITY
 const encoder = new TextEncoder()
 
 function utf8Bytes(s: string): number {
@@ -225,47 +219,76 @@ export function splitMessage(text: string, maxBytes: number = MARKDOWN_MAX_BYTES
 }
 
 // J-轻（2026-10-30，伪流式固化）：多片错峰发送的延迟计划——片间各睡 staggerMs，
-// 单片无延迟。纯函数导出供测试。
+// 单片无延迟。纯函数导出供测试；新发送路径不再人为错峰，保留导出兼容旧测试。
 export function staggerDelays(chunkCount: number, staggerMs: number): number[] {
   if (chunkCount <= 1 || staggerMs <= 0) return []
   return Array.from({ length: chunkCount - 1 }, () => staggerMs)
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+class MessageTooLongError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "MessageTooLongError"
+  }
+}
+
+function isLengthError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return /40054007|40054018|消息长度超限|消息过长/.test(msg)
 }
 
 // 发送单个分片: 先尝试 markdown，失败则回退纯文本。返回服务端消息回执（含 id，
-// 供上下文缓存登记——引用解析用）。
+// 供上下文缓存登记——引用解析用）。超长由 API 错误码触发自适应拆分。
 async function sendChunk(
   accessToken: string,
   ctx: MessageContext,
   mdText: string,
   plainText: string,
-  msgSeq: number,
 ): Promise<MessageResponse | null> {
   const isGroup = ctx.type === "group" && ctx.groupId
 
   try {
+    const seq = getNextMsgSeq(ctx.msgId)
     if (isGroup) {
-      return await sendGroupMessage(accessToken, ctx.groupId!, mdText, ctx.msgId, msgSeq, true)
+      return await sendGroupMessage(accessToken, ctx.groupId!, mdText, ctx.msgId, seq, true)
     } else {
-      return await sendC2CMessage(accessToken, ctx.userId, mdText, ctx.msgId, msgSeq, true)
+      return await sendC2CMessage(accessToken, ctx.userId, mdText, ctx.msgId, seq, true)
     }
   } catch (error) {
-    // markdown 发送失败（如语法不被接受/内容违规）-> 回退纯文本
-    console.error("[qq-sender] markdown 发送失败，回退纯文本:", error)
+    if (!isLengthError(error)) {
+      // markdown 发送失败（如语法不被接受/内容违规）-> 回退纯文本
+      console.error("[qq-sender] markdown 发送失败，回退纯文本:", error)
+    }
   }
 
-  if (isGroup) {
-    return await sendGroupMessage(accessToken, ctx.groupId!, plainText, ctx.msgId, msgSeq, false)
-  } else {
-    return await sendC2CMessage(accessToken, ctx.userId, plainText, ctx.msgId, msgSeq, false)
+  try {
+    const seq = getNextMsgSeq(ctx.msgId)
+    if (isGroup) {
+      return await sendGroupMessage(accessToken, ctx.groupId!, plainText, ctx.msgId, seq, false)
+    } else {
+      return await sendC2CMessage(accessToken, ctx.userId, plainText, ctx.msgId, seq, false)
+    }
+  } catch (error) {
+    if (isLengthError(error)) throw new MessageTooLongError(error instanceof Error ? error.message : String(error))
+    throw error
   }
 }
 
+/** 超长消息二分：优先在换行处切，切不动才按字符中点切。 */
+function splitInHalf(text: string): [string, string] | null {
+  if (text.length < 2) return null
+  const mid = Math.floor(text.length / 2)
+  let idx = text.lastIndexOf("\n", mid)
+  if (idx <= 0) idx = text.indexOf("\n", mid)
+  if (idx <= 0 || idx >= text.length) idx = mid
+  const left = text.slice(0, idx)
+  const right = text.slice(idx)
+  if (!left || !right) return null
+  return [left, right]
+}
+
 export interface ReplyToQQOptions {
-  /** J-轻（2026-10-30）：伪流式错峰——多片发送时片间间隔 ms（默认 0=一次性全发） */
+  /** 保留参数以兼容调用方；不再人为加片间延迟。 */
   staggerMs?: number
 }
 
@@ -281,23 +304,32 @@ export async function replyToQQ(
   text: string,
   options?: ReplyToQQOptions,
 ): Promise<ReplyResult> {
+  void options
   const mdFormatted = formatForQQMarkdown(text)
   const plainFormatted = formatForQQ(text)
-
-  // 关键：按 UTF-8 字节切分（上限见文件头考据注释：2 万字实测），不能用字符数 maxLength，
-  // 否则中文长消息会超限被 QQ 静默丢弃（看似"答非所问"，实则是答案没发出去）。
   const mdChunks = splitMessage(mdFormatted, MARKDOWN_MAX_BYTES)
   const plainChunks = splitMessage(plainFormatted, PLAIN_MAX_BYTES)
-
-  const delays = staggerDelays(mdChunks.length, options?.staggerMs ?? 0)
   const ids: string[] = []
-  for (let i = 0; i < mdChunks.length; i++) {
-    if (i > 0 && delays[i - 1]) await sleep(delays[i - 1])
-    const msgSeq = getNextMsgSeq(ctx.msgId)
-    // 纯文本分片可能与 markdown 分片数量不一致，按索引兜底取对应/最后一片
-    const plainChunk = plainChunks[i] ?? plainChunks[plainChunks.length - 1] ?? mdChunks[i]
-    const res = await sendChunk(accessToken, ctx, mdChunks[i], plainChunk, msgSeq)
-    if (res?.id) ids.push(res.id)
+  let chunks = 0
+
+  async function sendPair(md: string, plain: string): Promise<void> {
+    try {
+      const res = await sendChunk(accessToken, ctx, md, plain)
+      chunks += 1
+      if (res?.id) ids.push(res.id)
+    } catch (error) {
+      if (!(error instanceof MessageTooLongError)) throw error
+      const mdParts = splitInHalf(md)
+      const plainParts = splitInHalf(plain)
+      if (!mdParts || !plainParts) throw error
+      await sendPair(mdParts[0], plainParts[0])
+      await sendPair(mdParts[1], plainParts[1])
+    }
   }
-  return { chunks: mdChunks.length, ids }
+
+  for (let i = 0; i < mdChunks.length; i++) {
+    const plainChunk = plainChunks[i] ?? plainChunks[plainChunks.length - 1] ?? mdChunks[i]
+    await sendPair(mdChunks[i], plainChunk)
+  }
+  return { chunks, ids }
 }

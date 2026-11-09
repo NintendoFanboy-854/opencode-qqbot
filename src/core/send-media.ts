@@ -4,14 +4,14 @@
 //
 // 双通道：①AI 回复里的 `QQ_SEND_FILE: <路径>` 标记（bridge 拦截）② /send <路径> 指令。
 // 安全：路径白名单（默认只允许 QQ 图片缓存目录与 bot 工作目录，QQ_SEND_EXTRA_ROOTS 可扩）；
-// 大小上限 20MB（官方单次上传上限，base64 前检查）。
+// 大小上限 200MB（QQ 官方富媒体硬限制；超软限制会降级为文件类型）。
 import { readFileSync, statSync } from "node:fs"
 import { resolve, extname, basename, sep } from "node:path"
 import { imageDir } from "../qq/media.js"
 import { uploadQQMedia, sendQQMediaMessage, MediaFileType } from "../qq/api.js"
 import type { MessageContext } from "../qq/types.js"
 
-export const MAX_SEND_BYTES = 20 * 1024 * 1024
+export const MAX_SEND_BYTES = 200 * 1024 * 1024
 
 /** 允许发送的根目录白名单（默认：QQ 图片缓存 + bot 工作目录；env QQ_SEND_EXTRA_ROOTS 逗号追加） */
 export function allowedSendRoots(extraEnv = process.env.QQ_SEND_EXTRA_ROOTS): string[] {
@@ -75,7 +75,7 @@ export async function sendLocalFile(
   }
   if (!stat.isFile()) throw new Error("不是文件")
   if (stat.size === 0) throw new Error("空文件")
-  if (stat.size > MAX_SEND_BYTES) throw new Error(`超过 20MB 上限（实际 ${Math.round(stat.size / 1024 / 1024)}MB）`)
+  if (stat.size > MAX_SEND_BYTES) throw new Error(`超过 QQ 官方 200MB 硬限制（实际 ${Math.round(stat.size / 1024 / 1024)}MB）`)
 
   const token = await deps.getToken()
   const fileType = fileTypeForPath(trimmed)

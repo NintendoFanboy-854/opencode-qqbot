@@ -8,7 +8,6 @@ import { join } from "path"
 import { homedir } from "os"
 import type { MessageContext } from "../qq/types.js"
 import type { OpencodeClient, PermissionDecision, PermissionRequest } from "../opencode/client.js"
-import { truncate } from "./util.js"
 
 // 用户级单槽：一次只有一个待审批请求在等该用户回复
 export interface PendingPermission {
@@ -25,7 +24,7 @@ export interface PendingPermission {
 /** 审批发起来源（卡片/文字菜单标注 + 联动清槽决策用） */
 export type PermOrigin = "bot" | "external"
 
-export const PERM_PROMPT_TTL_MS = 30 * 60 * 1000
+export const PERM_PROMPT_TTL_MS = 0 // 0=不自动拒绝；交给用户/OpenCode 侧决定
 
 export const DECISION_LABELS: Record<PermissionDecision, string> = {
   once: "允许（本次）",
@@ -41,7 +40,7 @@ export const DECISION_LABELS: Record<PermissionDecision, string> = {
  */
 export function formatPermissionConflictNotice(decision: PermissionDecision): string | null {
   if (decision !== "reject") return null
-  return "⚠️ 已收到「拒绝」，但服务端在该裁决前已放行此操作（引擎 ask fail-open），命令可能已执行。本条结果请勿视为已授权；若为破坏性命令请立即核对现场。"
+  return "警告：已收到「拒绝」，但服务端在该裁决前已放行此操作（引擎 ask fail-open），命令可能已执行。本条结果请勿视为已授权；若为破坏性命令请立即核对现场。"
 }
 
 /**
@@ -166,7 +165,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
     mainSessionId: string,
   ): Promise<PermissionDecision> {
     return new Promise<PermissionDecision>((resolve) => {
-      const timer = setTimeout(() => {
+      const timer = PERM_PROMPT_TTL_MS > 0 ? setTimeout(() => {
         if (pendingPermissions.get(ctx.userId)?.request.id === request.id) {
           pendingPermissions.delete(ctx.userId)
           savePendingPermMap(pendingPermissions)
@@ -174,9 +173,9 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
           resolve("reject")
           // 2026-11-04 修复（DEF-qqbot-20261104-3）：超时回执改走 safeDeliver——
           // 原裸 sendReply 投递失败被 .catch 静默吞掉，用户收不到任何超时通知。
-          void safeDeliver(ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
+          void safeDeliver(ctx, "审批超时，已自动拒绝该权限请求").catch(() => {})
         }
-      }, PERM_PROMPT_TTL_MS)
+      }, PERM_PROMPT_TTL_MS) : null
 
       pendingPermissions.set(ctx.userId, {
         request,
@@ -220,19 +219,19 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
             path: { sessionID: entry.request.sessionID, requestID: entry.request.id },
             body: { decision },
           })
-          await safeDeliver(entry.ctx, `✅ 审批已跨重启完成（${label}），原会话已继续`)
+          await safeDeliver(entry.ctx, `审批已跨重启完成（${label}），原会话已继续`)
         } catch (error) {
           // 2026-11-05 用户拍板：失败按类型区分文案——过期副本（点的是旧卡片）明确说
           // "重新发起"，服务异常才说"稍后重试"，不再一句"可能已失效"糊在一起。
           if (classifyApprovalReplyError(error) === "expired") {
             await safeDeliver(
               entry.ctx,
-              "⚠️ 审批等待超时：服务端已自动拒绝。请重新发起原操作，新审批会正常生效",
+              "警告：审批等待超时：服务端已自动拒绝。请重新发起原操作，新审批会正常生效",
             )
           } else {
             await safeDeliver(
               entry.ctx,
-              `⚠️ 审批转发失败（${error instanceof Error ? error.message : String(error)}），请稍后重试；若仍未生效请重新发起原操作`,
+              `警告：审批转发失败（${error instanceof Error ? error.message : String(error)}），请稍后重试；若仍未生效请重新发起原操作`,
             )
           }
         }
@@ -247,9 +246,9 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
   function restore(): void {
     const saved = loadPendingPermMap()
     for (const [uid, e] of Object.entries(saved)) {
-      const left = PERM_PROMPT_TTL_MS - (Date.now() - e.createdAt)
+      const left = PERM_PROMPT_TTL_MS > 0 ? PERM_PROMPT_TTL_MS - (Date.now() - e.createdAt) : Number.POSITIVE_INFINITY
       if (left <= 0) continue
-      const timer = setTimeout(() => {
+      const timer = Number.isFinite(left) ? setTimeout(() => {
         if (pendingPermissions.get(uid)?.request.id === e.request.id) {
           pendingPermissions.delete(uid)
           savePendingPermMap(pendingPermissions)
@@ -259,10 +258,10 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
               body: { decision: "reject" },
             })
             .catch(() => {})
-          void safeDeliver(e.ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
+          void safeDeliver(e.ctx, "审批超时，已自动拒绝该权限请求").catch(() => {})
           deps.onDecision?.(uid) // 恢复槽 TTL 拒绝也要唤醒队列
         }
-      }, left)
+      }, left) : null
       pendingPermissions.set(uid, {
         request: e.request,
         mainSessionId: e.mainSessionId,
@@ -304,7 +303,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
     const prev = pendingPermissions.get(userId)
     if (prev?.timer) clearTimeout(prev.timer)
 
-    const timer = setTimeout(() => {
+    const timer = PERM_PROMPT_TTL_MS > 0 ? setTimeout(() => {
       if (pendingPermissions.get(userId)?.request.id !== request.id) return
       pendingPermissions.delete(userId)
       savePendingPermMap(pendingPermissions)
@@ -312,8 +311,8 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
       void client.permission
         .reply({ path: { sessionID: request.sessionID, requestID: request.id }, body: { decision: "reject" } })
         .catch(() => {})
-      void safeDeliver(ctx, "审批超时（30 分钟），已自动拒绝该权限请求").catch(() => {})
-    }, PERM_PROMPT_TTL_MS)
+      void safeDeliver(ctx, "审批超时，已自动拒绝该权限请求").catch(() => {})
+    }, PERM_PROMPT_TTL_MS) : null
 
     pendingPermissions.set(userId, {
       request,
@@ -363,7 +362,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
       console.log(`[perm] 联动清槽（源头已解决）：uid=${uid.slice(0, 8)}… request=${requestID} reply=${String(reply)}`)
       void safeDeliver(
         e.ctx,
-        `🔄 审批 ${requestID.slice(-8)} 已由${e.origin === "bot" ? "机器人回合侧" : "桌面端"}处理（${label}），QQ 审批自动关闭`,
+        `审批 ${requestID.slice(-8)} 已由${e.origin === "bot" ? "机器人回合侧" : "桌面端"}处理（${label}），QQ 审批自动关闭`,
       ).catch(() => {})
       return true
     }
@@ -400,7 +399,7 @@ export function formatPermissionPrompt(
   mainSessionId?: string,
   origin?: PermOrigin,
 ): string {
-  const lines = ["🔐 需要权限审批", `动作：${request.action || "(未知)"}`]
+  const lines = ["需要权限审批", `动作：${request.action || "(未知)"}`]
   if (origin === "external") {
     // 2026-11-09 联动修复：桌面端发起的回合经事件流镜像到 QQ——标注来源，
     // 用户一眼知道这卡是桌面 AI 的活；QQ 与桌面审批等效（先到先解）。
@@ -410,14 +409,14 @@ export function formatPermissionPrompt(
   if (mainSessionId && request.sessionID && request.sessionID !== mainSessionId) {
     lines.push(`来源：子会话 ${request.sessionID}（subagent 发起）`)
   }
-  const resources = (request.resources ?? []).slice(0, 5)
+  const resources = request.resources ?? []
   if (resources.length > 0) {
     lines.push("资源：")
-    for (const r of resources) lines.push(`  ${truncate(r, 300)}`)
+    for (const r of resources) lines.push(`${r}`)
   }
-  if (request.message) lines.push(`说明：${truncate(request.message, 300)}`)
+  if (request.message) lines.push(`说明：${request.message}`)
   lines.push("")
   lines.push("回复「允许」= 仅本次｜「总是」= 保存为项目级白名单（后续同类命令永久放行）｜「拒绝」= 驳回（含本会话其他待审）")
-  lines.push("（30 分钟无响应自动拒绝，也可用 /allow /always /deny）")
+  lines.push("（无自动超时；可用 /allow /always /deny 处理）")
   return lines.join("\n")
 }

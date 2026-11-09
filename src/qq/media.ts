@@ -1,6 +1,6 @@
 // @input:  ./api (getAccessToken), ./types (MessageAttachment), node:fs/os/path
-// @output: extForImageMime, isAllowedDownloadHost, MAX_IMAGE_BYTES, MAX_FILE_BYTES,
-//          imageDir, fileDir, downloadQQAttachment, prepareQQAttachments, groupOutcomes,
+// @output: extForImageMime, isAllowedDownloadHost, imageDir, fileDir,
+//          downloadQQAttachment, prepareQQAttachments, groupOutcomes,
 //          augmentPromptWithAttachments, purgeOldQQImages
 // @pos:    qq层 - QQ 图片/文件下载落盘 + prompt 文本/附件合成（原生附件接入 2026-10-14）
 //
@@ -9,9 +9,11 @@
 // 纯文本桥时代图片被静默丢弃——现在任何失败（下载不通/类型不支持）都转成
 // 可见的文字备注，绝不静默。
 
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, readFileSync } from "node:fs"
+import { createWriteStream, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
+import { Readable } from "node:stream"
+import { pipeline } from "node:stream/promises"
 import type { MessageAttachment } from "./types.js"
 
 export interface PromptFile {
@@ -39,9 +41,6 @@ export function extForImageMime(mime: string): string | null {
   return null
 }
 
-export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
-/** 普通文件上限（QQ 文件消息下载落盘；比图片宽松，仍做内存熔断） */
-export const MAX_FILE_BYTES = 20 * 1024 * 1024
 const ALLOWED_HOST_SUFFIXES = [".qpic.cn", ".qq.com", ".qq.com.cn"]
 
 /** 下载域白名单（R2-P1-2）：只信 QQ 自家 CDN 且必须 https——在 fetch 之前
@@ -94,22 +93,22 @@ function uniqueFilePath(dir: string, name: string): string {
 
 async function fetchWithTimeout(url: string, ms: number, auth?: string): Promise<Response> {
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), ms)
+  const timer = ms > 0 ? setTimeout(() => ctrl.abort(), ms) : null
   try {
     return await fetch(url, {
       signal: ctrl.signal,
       headers: auth ? { Authorization: `QQBot ${auth}` } : {},
     })
   } finally {
-    clearTimeout(timer)
+    if (timer) clearTimeout(timer)
   }
 }
 
 /**
- * 下载 QQ 图片附件到本地。非图片类型返回 unsupported；下载失败返回 failed
+ * 下载 QQ 图片/文件附件到本地。非图片/非文件类型返回 unsupported；下载失败返回 failed
  * （脱敏短语，原始 URL/错误只进本机日志）。fetch 前过域白名单（R2-P1-2）；
- * 401/403 时带 access_token 重试一次（此时目标必为 QQ 自家域，token 不出站）；
- * 10MB 流式上限，超限 cancel 熔断。
+ * 401/403 时带 access_token 重试一次（此时目标必为 QQ 自家域，token 不出站）。
+ * 不设大小上限：直接流式落盘，避免整包进内存；容量由本机磁盘决定。
  */
 export async function downloadQQAttachment(
   att: MessageAttachment,
@@ -126,24 +125,23 @@ export async function downloadQQAttachment(
   }
   const ext = extForImageMime(att.content_type || "")
   // 普通文件（2026-11-10）：QQ 文件消息 content_type 为 "file"；部分场景只有 filename。
-  // 仍走同一套域白名单/鉴权重试/流式大小熔断，只是落盘目录和上限不同。
+  // 仍走同一套域白名单/鉴权重试，只是落盘目录不同。
   const isFile = !ext && !!att.url && (ctype === "file" || ctype === "application/octet-stream" || !!att.filename)
   if (!ext && !isFile) return { unsupported: att.content_type || att.filename || "未知类型" }
   if (!isAllowedDownloadHost(att.url)) return { failed: "下载域不在白名单" }
-  const maxBytes = ext ? MAX_IMAGE_BYTES : MAX_FILE_BYTES
-  const limitText = `${Math.floor(maxBytes / 1024 / 1024)}MB`
+  let full: string | null = null
   try {
     const dir = ext ? imageDir() : fileDir()
     mkdirSync(dir, { recursive: true })
     const originalName = ext ? "" : sanitizeFileName(att.filename)
     const name = ext ? `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}` : originalName
-    const full = ext ? join(dir, name) : uniqueFilePath(dir, name)
-    const timeoutMs = ext ? 15000 : 30000
-    let res = await fetchWithTimeout(att.url, timeoutMs)
+    full = ext ? join(dir, name) : uniqueFilePath(dir, name)
+    // 不设下载超时：交给底层 fetch/系统网络栈；需要时可后续用 env 控制。
+    let res = await fetchWithTimeout(att.url, 0)
     if ((res.status === 401 || res.status === 403) && getAuth) {
       try {
         const tok = await getAuth()
-        res = await fetchWithTimeout(att.url, timeoutMs, tok)
+        res = await fetchWithTimeout(att.url, 0, tok)
       } catch {
         /* 鉴权兜底失败：保持原状态，走下方 !res.ok 归 failed */
       }
@@ -152,30 +150,27 @@ export async function downloadQQAttachment(
       console.log("[media] 下载失败:", res.status, att.url) // 原始 URL 只进本机日志（B7 校准）
       return { failed: `HTTP ${res.status}` }
     }
-    // 大小上限——Content-Length 预检 + 流式逐块计数熔断
-    //（无 Content-Length 的分块响应同样有界；超限即 cancel，内存不涨）
-    const len = Number(res.headers.get("content-length") || 0)
-    if (len > maxBytes) return { failed: `超过${limitText}` }
-    const reader = res.body?.getReader()
-    if (!reader) return { failed: "无响应体" }
-    const chunks: Uint8Array[] = []
-    let total = 0
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      total += value.byteLength
-      if (total > maxBytes) {
-        await reader.cancel()
-        return { failed: `超过${limitText}` }
-      }
-      chunks.push(value)
+    if (res.body) {
+      await pipeline(Readable.fromWeb(res.body as any), createWriteStream(full))
+    } else {
+      writeFileSync(full, Buffer.from(await res.arrayBuffer()))
     }
-    if (total === 0) return { failed: "空响应" }
-    writeFileSync(full, Buffer.concat(chunks))
+    const total = statSync(full).size
+    if (total === 0) {
+      unlinkSync(full)
+      return { failed: "空响应" }
+    }
     if (ext) return { path: full, name }
     console.log(`[media] 文件已保存: ${full} (${total} bytes)`)
     return { path: full, name: originalName, kind: "file" }
   } catch (e) {
+    if (full) {
+      try {
+        unlinkSync(full)
+      } catch {
+        /* 清理失败忽略 */
+      }
+    }
     // 原始错误只进本机日志；回给用户的备注是脱敏短语（R2-P3）
     console.log("[media] 下载失败:", att.url, e instanceof Error ? e.message : e)
     return { failed: "网络错误或超时" }

@@ -46,7 +46,7 @@ export function primaryField(form: FormInfo): FieldLike | undefined {
 /** 渲染表单为 QQ 文本（选项字母化 A/B/C/D；多选提示逗号分隔）。 */
 export function renderFormPrompt(form: FormInfo): string {
   const field = primaryField(form)
-  const lines = [`📝 需要你的选择：${redactSecrets(form.title)}`]
+  const lines = [`需要你的选择：${redactSecrets(form.title)}`]
   if (!field) {
     lines.push("（空表单，请回桌面处理）")
     return lines.join("\n")
@@ -182,7 +182,7 @@ export function buildFormKeyboard(form: FormInfo, _ownerOpenid: string): InlineK
   if (field.type !== "string" && field.type !== "multiselect") return null
   const buttons: KeyboardButton[] = opts.slice(0, 20).map((opt) => ({
     id: `form-${form.id}-${opt.value}`.slice(0, 64),
-    render_data: { label: clipButtonLabel(opt.label), visited_label: clipButtonLabel(`✓ ${opt.label}`), style: 1 },
+    render_data: { label: clipButtonLabel(opt.label), visited_label: clipButtonLabel(`已选 ${opt.label}`), style: 1 },
     // permission 形状对齐腾讯 P0（{type:2} 不带 specify_user_ids，同审批卡；
     // 平台校验收敛后冲突形状会导致客户端不渲染键盘）。
     action: {
@@ -313,7 +313,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     } catch (error) {
       entry.replying = false
       const msg = error instanceof Error ? error.message : String(error)
-      void deliver(entry.ctx, `⚠️ 无法保存提交状态，尚未向服务端作答：${msg}；请回桌面处理`)
+      void deliver(entry.ctx, `警告：无法保存提交状态，尚未向服务端作答：${msg}；请回桌面处理`)
       return
     }
 
@@ -329,10 +329,10 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
         if (/AlreadySettled|already|OpenCode API 404/i.test(msg)) {
           // 桌面端先答/先取消是终态；只有明确的服务端冲突才清理。
           if (isCurrent(userId, entry)) clearEntry(userId, entry)
-          await deliver(entry.ctx, "ℹ️ 该选择已在桌面端处理或取消，QQ 卡片已失效；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
+          await deliver(entry.ctx, "该选择已在桌面端处理或取消，QQ 卡片已失效；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
         } else {
           // submitting + answer 保留在内存和磁盘，可手动重试或由 reconcile 续交。
-          await deliver(entry.ctx, `⚠️ 提交失败，选择已保留、可在重启后续交：${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}`)
+          await deliver(entry.ctx, `警告：提交失败，选择已保留、可在重启后续交：${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}`)
         }
         return
       }
@@ -363,7 +363,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       transition(entry, "expired")
     } catch (error) {
       entry.cancelling = false
-      await deliver(entry.ctx, `⚠️ 选择已到期，但取消状态无法落盘；请回桌面处理：${error instanceof Error ? error.message : error}`)
+      await deliver(entry.ctx, `警告：选择已到期，但取消状态无法落盘；请回桌面处理：${error instanceof Error ? error.message : error}`)
       return
     }
     try {
@@ -371,7 +371,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     } catch (error) {
       entry.cancelling = false
       const msg = error instanceof Error ? error.message : String(error)
-      await deliver(entry.ctx, `⚠️ 选择请求已到期，但服务端取消失败（${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}）；本地已保留恢复记录，请回桌面确认`)
+      await deliver(entry.ctx, `警告：选择请求已到期，但服务端取消失败（${msg.length > 120 ? `${msg.slice(0, 120)}…` : msg}）；本地已保留恢复记录，请回桌面确认`)
       return
     }
     entry.cancelling = false
@@ -383,7 +383,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       }
       clearEntry(userId, entry)
     }
-    await deliver(entry.ctx, "⏰ 选择请求已满 30 分钟未作答，服务端已确认取消；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
+    await deliver(entry.ctx, "提醒：选择请求已满 30 分钟未作答，服务端已确认取消；若 AI 再次询问你会立即收到新卡片，也可回桌面处理")
   }
 
   function scheduleExpiry(userId: string, entry: InternalPendingForm): void {
@@ -439,7 +439,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       const serverPending = server !== undefined && (!serverStatus || serverStatus === "pending")
       if (!serverPending) {
         clearEntry(userId, entry)
-        await deliver(entry.ctx, "ℹ️ 该选择已在桌面端处理或取消，QQ 卡片已失效")
+        await deliver(entry.ctx, "该选择已在桌面端处理或取消，QQ 卡片已失效")
         continue
       }
       if (entry.state === "expired") {
@@ -453,7 +453,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
 
   function pushForm(userId: string, ctx: MessageContext, form: FormInfo): void {
     if (!accepting) {
-      void deliver(ctx, "⚠️ 表单桥正在停止，暂不接受新的 QQ 作答；请回桌面处理")
+      void deliver(ctx, "警告：表单桥正在停止，暂不接受新的 QQ 作答；请回桌面处理")
       return
     }
     if (pending.get(userId)?.form.id === form.id) return
@@ -476,7 +476,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       journal.put(journalSnapshot(entry))
     } catch (error) {
       console.error("[form-bridge] 表单落盘失败，取消 QQ 推送:", error instanceof Error ? error.message : error)
-      void deliver(ctx, "⚠️ 选择请求无法保存恢复记录，本次未推送到 QQ；请回桌面处理")
+      void deliver(ctx, "警告：选择请求无法保存恢复记录，本次未推送到 QQ；请回桌面处理")
       return
     }
 
@@ -491,7 +491,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       try {
         journal.remove(userId, previous.form.id)
       } catch { /* 下次替换/reconcile 再清理 */ }
-      void deliver(previous.ctx, "⚠️ 有新的选择请求，上一个表单已取消在 QQ 的作答（仍可回桌面处理）")
+      void deliver(previous.ctx, "警告：有新的选择请求，上一个表单已取消在 QQ 的作答（仍可回桌面处理）")
     }
     console.log(`[form-bridge] 表单已推送 user=${userId.slice(0, 8)}… form=${form.id} title=${form.title.slice(0, 40)}`)
     const operation = (async () => {
@@ -511,15 +511,15 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     const entry = pending.get(userId)
     if (!entry) return false
     if (!accepting) {
-      void deliver(entry.ctx, "⚠️ 表单桥正在停止，本次答案未提交；请回桌面处理")
+      void deliver(entry.ctx, "警告：表单桥正在停止，本次答案未提交；请回桌面处理")
       return true
     }
     if (entry.state === "expired") {
-      void deliver(entry.ctx, "⚠️ 按钮和文字答案已失效，请使用新卡或回桌面处理")
+      void deliver(entry.ctx, "警告：按钮和文字答案已失效，请使用新卡或回桌面处理")
       return true
     }
     if (entry.replying || entry.cancelling) {
-      void deliver(entry.ctx, "⏳ 选择正在提交或取消，请勿重复操作；稍后会给出最终回执")
+      void deliver(entry.ctx, "选择正在提交或取消，请勿重复操作；稍后会给出最终回执")
       return true
     }
     const answer = parseFormAnswer(entry.form, text)
@@ -546,7 +546,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
   }
 
   function rejectButton(ctx: MessageContext): void {
-    void deliver(ctx, "⚠️ 按钮已失效、已处理或不属于当前选择，请使用新卡或回桌面处理")
+    void deliver(ctx, "警告：按钮已失效、已处理或不属于当前选择，请使用新卡或回桌面处理")
   }
 
   function handleButton(event: FormInteractionEvent): boolean {
@@ -562,7 +562,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
       return true
     }
     if (entry.replying || entry.cancelling) {
-      void deliver(ctx, "⏳ 该按钮已受理，正在等待服务端最终结果，请勿重复点击")
+      void deliver(ctx, "该按钮已受理，正在等待服务端最终结果，请勿重复点击")
       return true
     }
 
@@ -582,7 +582,7 @@ export function createFormBridge(deps: FormBridgeDeps): FormBridge {
     try {
       transition(entry, "clickReceived")
     } catch (error) {
-      void deliver(ctx, `⚠️ 无法保存按钮受理状态，尚未提交：${error instanceof Error ? error.message : error}`)
+      void deliver(ctx, `警告：无法保存按钮受理状态，尚未提交：${error instanceof Error ? error.message : error}`)
       return true
     }
     submit(userId, entry, answer, button.v, interactionId)

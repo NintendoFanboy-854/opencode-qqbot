@@ -8,12 +8,7 @@
 import type { SessionMessage } from "./client.js"
 import { redactSecrets } from "./history.js"
 
-const USER_CLIP = 160
-
-// E2（2026-10-29，用户要求"摘要回全文"）：答案截断上限改为运行时可配——
-// 默认 0=不截断回全文（投递层 splitMessage 自动分条送达）；设
-// QQ_DIGEST_ANSWER_MAX_CHARS>0 可恢复旧的截断模式。用户提问行（USER_CLIP）
-// 保持截断不变（问题行只是定位上下文，全文意义不大）。
+// 2026-11-10：用户提问行不再截断；答案仍可用 QQ_DIGEST_ANSWER_MAX_CHARS 显式截断（默认 0=全文）。
 function answerClipLimit(): number {
   const n = Number(process.env.QQ_DIGEST_ANSWER_MAX_CHARS ?? "0")
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
@@ -66,15 +61,15 @@ export function buildDigest(messages: SessionMessage[]): string | null {
   }
   if (!answer) return null
 
-  const lines = ["📋 桌面问答摘要"]
-  if (userText) lines.push(`🧑 ${clip(userText, USER_CLIP)}`)
+  const lines = ["桌面问答摘要"]
+  if (userText) lines.push(`用户：${userText}`)
   const clipLimit = answerClipLimit()
   if (clipLimit > 0) {
-    lines.push(`🤖 ${clip(answer, clipLimit)}`)
+    lines.push(`AI：${clip(answer, clipLimit)}`)
     if (answer.length > clipLimit) lines.push(`（答案共 ${answer.length} 字，回 /history 看更多）`)
   } else {
     // 全文模式：保留原文换行/排版（clip 的空白折叠只用于截断模式）
-    lines.push(`🤖 ${answer}`)
+    lines.push(`AI：${answer}`)
   }
   return redactSecrets(lines.join("\n"))
 }

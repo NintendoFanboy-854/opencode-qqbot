@@ -14,10 +14,10 @@ export const ORPHAN_DEFAULT_MS = 90_000
 /** "最近拒绝"展示窗口。 */
 export const REJECTED_WINDOW_MS = 30 * 60_000
 /** 单条回复字符上限（超过分页，避免 QQ 长文体验崩坏）。 */
-export const QUEUE_REPLY_MAX_CHARS = 1800
+export const QUEUE_REPLY_MAX_CHARS = 0 // 0=不截断
 const PAGE_SIZE = 10
 const ALL_PAGE_SIZE = 20
-const PREVIEW = 32
+const PREVIEW = 0 // 0=不截断
 
 export type ViewStage =
   | "claimed"
@@ -344,6 +344,7 @@ function reasonLabel(reason: string | undefined): string {
 }
 
 function clampReply(lines: string[], maxChars: number, hint: string): string {
+  if (maxChars <= 0) return lines.join("\n")
   let out = ""
   for (const line of lines) {
     if (out.length + line.length + 1 > maxChars) {
@@ -367,10 +368,11 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   const all = opts.all ?? false
   const page = Math.max(1, Math.floor(opts.page ?? 1))
   const pageSize = all ? ALL_PAGE_SIZE : PAGE_SIZE
+  const capacity = Number.isFinite(limit) ? `/${limit}` : ""
   const lines: string[] = []
 
   lines.push(`当前任务：${view.busy ? "处理中" : "空闲"}`)
-  lines.push(`队列：${view.counts.queued}/${limit} · 台账在途：${view.counts.inflight} 条`)
+  lines.push(`队列：${view.counts.queued}${capacity} · 台账在途：${view.counts.inflight} 条`)
 
   if (view.counts.queued > 0) {
     lines.push(`排队中 ${view.counts.queued} 条：`)
@@ -384,7 +386,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
     const remain = view.counts.queued - (start + slice.length)
     if (remain > 0) lines.push(`  …还有 ${remain} 条（/queue all ${page + 1}）`)
   } else if (view.counts.inflight === 0 && view.counts.rejected === 0) {
-    lines.push(`队列：空（0/${limit}）`)
+    lines.push(`队列：空（0${capacity}）`)
   }
 
   if (view.counts.claimed > 0) {
@@ -404,7 +406,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   }
 
   if (view.counts.orphan > 0) {
-    lines.push(`⚠️ 孤儿 ${view.counts.orphan} 条（已受理，未入队/未派发，超 ${Math.round(view.orphanMs / 1000)}s）`)
+    lines.push(`警告：孤儿 ${view.counts.orphan} 条（已受理，未入队/未派发，超 ${Math.round(view.orphanMs / 1000)}s）`)
     const shown = all ? view.orphan.slice(0, pageSize) : view.orphan.slice(0, 8)
     for (const e of shown) {
       lines.push(`  · ${previewText(e.text, PREVIEW)} · ${agoLabel(e.at, view.now)} · msg ${shortId(e.msgId)}`)
@@ -413,7 +415,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   }
 
   if (view.counts.ghost > 0) {
-    lines.push(`⚠️ 幽灵 ${view.counts.ghost} 条（队列有、台账无，需修复）`)
+    lines.push(`警告：幽灵 ${view.counts.ghost} 条（队列有、台账无，需修复）`)
     for (const e of view.ghost.slice(0, 5)) {
       lines.push(`  · ${previewText(e.text, PREVIEW)} · #${e.queueId ?? "-"} · msg ${shortId(e.msgId)}`)
     }
@@ -427,7 +429,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   }
 
   for (const w of view.warnings) {
-    if (w.startsWith("队列编号")) lines.push(`⚠️ ${w}`)
+    if (w.startsWith("队列编号")) lines.push(`警告：${w}`)
   }
 
   lines.push("发 /queue all 看全部 · /ledger 看台账明细 · /queue clear 清空")
@@ -471,7 +473,7 @@ export function formatLedgerReply(view: QueueView, opts: LedgerReplyOptions = {}
       lines.push(filter === "orphan" ? `孤儿 ${list.length} 条：` : `在途 ${list.length} 条（按受理时间）：`)
       slice.forEach((e, i) => {
         lines.push(
-          ` ${start + i + 1}. ${previewText(e.text, PREVIEW)} · ${clock(e.at)} · ${agoLabel(e.at, view.now)} · ${stageLabel(e.stage)} · att ${shortId(e.attemptId)} · sid ${shortId(e.sessionId)} · pid ${e.ownerPid ?? "-"}`,
+          `${start + i + 1}. ${previewText(e.text, PREVIEW)} · ${clock(e.at)} · ${agoLabel(e.at, view.now)} · ${stageLabel(e.stage)} · att ${shortId(e.attemptId)} · sid ${shortId(e.sessionId)} · pid ${e.ownerPid ?? "-"}`,
         )
       })
       const remain = list.length - (start + slice.length)
@@ -492,7 +494,7 @@ export function formatLedgerReply(view: QueueView, opts: LedgerReplyOptions = {}
   }
 
   if (view.warnings.length > 0) {
-    lines.push(`⚠️ ${view.warnings.join("；")}`)
+    lines.push(`警告：${view.warnings.join("；")}`)
   }
 
   lines.push("发 /ledger check 对账会话历史 · /ledger settle <尾号> confirm 人工结清")

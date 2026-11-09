@@ -13,10 +13,10 @@ import type { Config } from "../config.js"
 import type { MessageContext } from "../qq/types.js"
 import { createOutbox } from "./outbox.js"
 
-/** 默认 TTL：bot 长期不在线时积压不会在重启后集中刷屏。 */
-export const DEFAULT_NOTIFY_TTL_HOURS = 24
-/** 单条最大投递尝试次数：配额耗尽等永久失败不无限退避。 */
-export const DEFAULT_NOTIFY_MAX_ATTEMPTS = 8
+/** 默认 TTL：0=不按年龄丢弃；需要积压清理时显式配置小时数。 */
+export const DEFAULT_NOTIFY_TTL_HOURS = 0
+/** 单条最大投递尝试次数：0=不设上限，持续退避重试。 */
+export const DEFAULT_NOTIFY_MAX_ATTEMPTS = 0
 
 export type DeliverLike = (ctx: MessageContext, text: string) => Promise<void>
 
@@ -47,15 +47,16 @@ export function createNotifySink(options: NotifySinkOptions): NotifySink {
     options.ttlHours ?? process.env.QQ_NOTIFY_TTL_HOURS ?? DEFAULT_NOTIFY_TTL_HOURS,
   )
   const ttlMs =
-    (Number.isFinite(ttlHours) && ttlHours > 0 ? ttlHours : DEFAULT_NOTIFY_TTL_HOURS) *
-    60 * 60 * 1000
+    Number.isFinite(ttlHours) && ttlHours > 0
+      ? ttlHours * 60 * 60 * 1000
+      : Number.POSITIVE_INFINITY
   const maxRaw = Number(
     options.maxAttempts ?? process.env.QQ_NOTIFY_MAX_ATTEMPTS ?? DEFAULT_NOTIFY_MAX_ATTEMPTS,
   )
-  const maxAttempts = Number.isFinite(maxRaw) && maxRaw > 0 ? Math.floor(maxRaw) : DEFAULT_NOTIFY_MAX_ATTEMPTS
+  const maxAttempts = Number.isFinite(maxRaw) && maxRaw > 0 ? Math.floor(maxRaw) : undefined
   const outbox = createOutbox({ ...(options.filePath ? { filePath: options.filePath } : {}) })
   outbox.register("notify", (entry) => {
-    if (Date.now() - entry.createdAt > ttlMs) {
+    if (Number.isFinite(ttlMs) && Date.now() - entry.createdAt > ttlMs) {
       return { skipped: "ttl-expired" }
     }
     const text = (entry.payload as { text?: unknown } | null)?.text
@@ -67,7 +68,7 @@ export function createNotifySink(options: NotifySinkOptions): NotifySink {
     // maxAttempts 由 start 透传到 recover/flush：失败达到上限后保持 failed，不再无限退避。
     return options.deliver(ctx, text).then(() => ({ delivered: true, text: text.slice(0, 120) }))
   })
-  outbox.start({ recover: true, maxAttempts }).catch((error) => {
+  outbox.start({ recover: true, ...(maxAttempts !== undefined ? { maxAttempts } : {}) }).catch((error) => {
     console.error("[notify-sink] 启动恢复失败:", error instanceof Error ? error.message : error)
   })
   return {

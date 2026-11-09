@@ -18,7 +18,7 @@ type EventCallback = (event: V2Event) => void
 
 const RECONNECT_MIN_MS = 1000
 const RECONNECT_MAX_MS = 30_000
-const MAX_BUF_BYTES = 200_000 // 防御性上限（事件洪峰时丢弃积压而非撑爆内存）
+const MAX_BUF_BYTES = Number.POSITIVE_INFINITY // 不丢弃事件；内存由进程/系统管理
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))

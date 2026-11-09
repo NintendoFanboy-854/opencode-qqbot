@@ -1,7 +1,7 @@
 // @input:  ./acp（AcpClient）, ./sessions（SessionManager）
 // @output: AcpSessionRunner, toPermissionView, textDelta, AcpPermissionView,
 //          isAcpPromptTimeout, isAcpPromptBusy
-// @pos:    opencode层 - ACP 会话运行器（P1）：QQ 用户 ↔ ACP session、prompt 流式聚合、
+// @pos: opencode层 - ACP 会话运行器（P1）：QQ 用户 ACP session、prompt 流式聚合、
 //          权限请求转交上层、会话按需 load、取消与模型/agent 设置。
 //          纪律：全事件驱动，不做任何业务轮询（健康自检由上层看门狗负责）。
 

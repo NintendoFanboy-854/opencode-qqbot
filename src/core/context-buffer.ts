@@ -6,13 +6,12 @@
 // msgIdx 索引 + 解析）。QQ C2C/群消息的引用经由 message_reference.message_id
 // 透传；QQ 不提供 C2C 历史消息拉取，故引用解析只能靠本缓存——我方发出的回复
 // 也记录（消息 id 取服务端回执 MessageResponse.id），保证"引用 AI 答案"可解析。
-// 单进程 bot 用进程内 LRU（每域 200 条）足够；跨重启引用解析为空属可接受降级。
+// 单进程 bot 用进程内 Map 保存引用解析所需消息；不设条数上限（由进程生命周期回收）。
 interface RefEntry {
   text: string
   at: number
 }
 
-const MAX_ENTRIES_PER_SCOPE = 200
 const scopeBuffers = new Map<string, Map<string, RefEntry>>()
 
 /** 域键：C2C 按用户，群聊按群（引用多在群内发生） */
@@ -33,10 +32,6 @@ function bufferOf(scope: string): Map<string, RefEntry> {
 export function recordMessage(scope: string, msgId: string, text: string): void {
   if (!msgId) return
   const b = bufferOf(scope)
-  if (b.size >= MAX_ENTRIES_PER_SCOPE && !b.has(msgId)) {
-    const first = b.keys().next().value
-    if (first !== undefined) b.delete(first)
-  }
   b.set(msgId, { text, at: Date.now() })
 }
 
@@ -54,7 +49,7 @@ export function extractEmbeddedQuote(event: { message_type?: unknown; msg_elemen
   if (!event || Number(event.message_type) !== 103 || !event.msg_elements) return null
   const out: string[] = []
   const walk = (node: unknown, depth: number): void => {
-    if (depth > 8 || out.join("\n").length > 4000) return
+    if (depth > 8) return
     if (Array.isArray(node)) {
       for (const item of node) walk(item, depth + 1)
       return
@@ -68,8 +63,7 @@ export function extractEmbeddedQuote(event: { message_type?: unknown; msg_elemen
     }
   }
   walk(event.msg_elements, 0)
-  const text = out.join("\n").trim()
-  return (text.length > 2000 ? `${text.slice(0, 2000)}…` : text) || null // 截断必带省略号；空内容回落缓存通道
+  return out.join("\n").trim() || null
 }
 
 /** 测试/运维用：清空全部缓存 */

@@ -107,7 +107,7 @@ export function parseQuestionForm(requestedSchema: unknown): QuestionItem[] | nu
 /** 渲染一道题给 QQ（纯文本）。total>1 时带进度。 */
 export function renderQuestion(item: QuestionItem, index: number, total: number): string {
   const lines: string[] = []
-  lines.push(total > 1 ? `📝 需要你的选择（第 ${index + 1}/${total} 题）` : "📝 需要你的选择")
+  lines.push(total > 1 ? `需要你的选择（第 ${index + 1}/${total} 题）` : "需要你的选择")
   lines.push(item.title)
   if (item.description) lines.push(item.description)
   lines.push("")
@@ -160,7 +160,7 @@ export function parseAnswer(item: QuestionItem, content: string): ParsedAnswer {
     }
 
     if (item.multiple) {
-      // "AB" 这种连写字母按单字符拆开；其余按分隔符切
+      // "AB"这种连写字母按单字符拆开；其余按分隔符切
       const tokens = /^[A-Za-z]{2,}$/.test(text)
         ? text.split("")
         : text.split(/[\s,，、/|]+/).filter(Boolean)

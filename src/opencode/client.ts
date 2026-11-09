@@ -142,13 +142,16 @@ export interface OpencodeClient {
 
 // 回合超时：原 5 分钟与 QQ 被动回复窗口绑定，但真实长任务（写码+多轮工具）
 // 常超 5 分钟——超时后答案永久丢失（实测 2026-10-13）。最终回复现已有主动
-// 消息兜底（bridge.deliver 被动失败→主动），已解耦。默认 30 分钟，
-// 可用 env OPENCODE_TURN_TIMEOUT_MINUTES 覆盖。
+// 消息兜底（bridge.deliver 被动失败→主动），已解耦。
+// 2026-11-10：默认不再由插件设上限（0=不超时），交给 OpenCode/用户自己控制；
+// 需要旧行为时设 OPENCODE_TURN_TIMEOUT_MINUTES>0。
 // ★ P0 同族修复（2026-11-03）：静态 const 在模块加载期捕获 env，.env 运行时才
 //    注入——发布包装后 OVERRIDE 永远赶不上。改惰性函数：每次调用现场取值。
 function turnTimeoutMinutes(): number {
-  const n = Number(process.env.OPENCODE_TURN_TIMEOUT_MINUTES ?? "30")
-  return Number.isFinite(n) && n > 0 ? n : 30
+  const raw = process.env.OPENCODE_TURN_TIMEOUT_MINUTES
+  if (raw === undefined || raw.trim() === "") return 0
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 0
 }
 function responseTimeoutMs(): number {
   return turnTimeoutMinutes() * 60 * 1000
@@ -301,14 +304,32 @@ export function createClient(baseUrl: string): OpencodeClient {
   async function json(res: Response): Promise<any> {
     if (!res.ok) {
       const txt = await res.text().catch(() => "")
-      const excerpt = txt.length > 200 ? `${txt.substring(0, 200)}…` : txt
-      throw new Error(`OpenCode API ${res.status}: ${excerpt}`)
+      throw new Error(`OpenCode API ${res.status}: ${txt}`)
     }
     // 204 (如 /model /agent /permission reply) 无 body；res.json() 会抛错。
     if (res.status === 204) return null
     const txt = await res.text()
     if (!txt.trim()) return null
     return JSON.parse(txt)
+  }
+
+  /** 拉全量消息：按服务端 cursor 翻页，不预设条数上限。 */
+  async function allMessages(sessionId: string): Promise<SessionMessage[]> {
+    const all: SessionMessage[] = []
+    const seen = new Set<string>()
+    let cursor: string | undefined
+    for (;;) {
+      const q = new URLSearchParams()
+      if (cursor) q.set("cursor", cursor)
+      const suffix = q.size > 0 ? `?${q.toString()}` : ""
+      const page = await json(await req(`/session/${sessionId}/message${suffix}`))
+      all.push(...((page?.data ?? []) as SessionMessage[]))
+      const next = page?.cursor?.next
+      if (!next || seen.has(next)) break
+      seen.add(next)
+      cursor = next
+    }
+    return all
   }
 
   const oc: OpencodeClient = {
@@ -453,7 +474,8 @@ export function createClient(baseUrl: string): OpencodeClient {
       // LLM 入口实证：user 记录可核对每次真实 /prompt 受理，不再由 QQ 出站反推执行次数。
       console.log(`[opencode] LLM prompt 已受理 pid=${process.pid} session=${sessionId} user=${promptJson?.data?.id ?? "?"} baseline=${baseline}`)
 
-      const deadline = Date.now() + responseTimeoutMs()
+      const timeoutMs = responseTimeoutMs()
+      const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY
       let permissionWaitMs = 0 // 审批等待时间不计入 5 分钟超时（用户可能几分钟才回复）
       const handledPermissions = new Set<string>()
 
@@ -503,13 +525,8 @@ export function createClient(baseUrl: string): OpencodeClient {
           }
         }
 
-        // DEF-qqbot-20261105-P1 防线 A 配套（2026-11-07）：裸 /message 默认只回
-        // 50 条——长会话里占回合之后的 idle/下一 user 证据被窗口截断，回合
-        // 完成却判不出 done，悬挂至 30 分钟超时（11-07 实证 6 分钟悬挂+完整
-        // 消息链取证）。显式 limit=200 扩大判定窗口（与 fetchRecoveryMessages
-        // 同档；极端长会话由防线 A 的「下一 user 接替」判据兜住边界）。
-        const listJson = await json(await req(`/session/${sessionId}/message?limit=200`))
-        const msgs: SessionMessage[] = listJson?.data ?? []
+        // 不预设条数上限：按 cursor 拉全量，长会话不会因窗口截断丢掉 idle/下一 user 证据。
+        const msgs: SessionMessage[] = await allMessages(sessionId)
         // Completion = the idle marker of THIS turn (修复⑧ 回合边界归属)。
         // Tool-using turns emit several assistant messages (reasoning+tool) before
         // the final text one, so "first completed assistant" would return an empty

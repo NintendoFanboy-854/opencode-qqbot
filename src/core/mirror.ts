@@ -159,14 +159,14 @@ export function createMirror(deps: MirrorDeps): Mirror {
         disableMirrorSubs()
       }
       return enabled
-        ? "✅ 摘要镜像已开启：桌面会话轮次完成后推送问答摘要"
-        : "🔇 摘要镜像已关闭（/mirror on 重新开启）"
+        ? "摘要镜像已开启：桌面会话轮次完成后推送问答摘要"
+        : "摘要镜像已关闭（/mirror on 重新开启）"
     },
     status() {
       const subs = mirrorUnsubs.size
       return mirrorState.enabled
-        ? `📋 摘要镜像：开（已挂 ${subs} 个会话订阅）`
-        : "📋 摘要镜像：关（/mirror on 开启）"
+        ? `摘要镜像：开（已挂 ${subs} 个会话订阅）`
+        : "摘要镜像：关（/mirror on 开启）"
     },
   }
 
