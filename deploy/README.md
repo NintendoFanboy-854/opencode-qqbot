@@ -1,23 +1,22 @@
-# deploy/ — 服务化运维脚本（真相源）
+# deploy/ — 已退役（2026-11-09）
 
-运行时位置在 `~/.openqq/`（计划任务动作引用该路径）。本目录是**入库副本**：
+本目录曾存放 Windows 专属的 `.ps1` / `.vbs` 运维脚本（`start-openqq.ps1`、`watchdog.ps1`、
+`launch-hidden.vbs`）。按 `AGENTS.md` 的架构红线，**运行时代码只随插件包分发、只允许 TS/JS**，
+这些脚本已删除，能力迁移到包内 TS 产物：
 
-| 文件 | 运行时路径 | 作用 |
-|---|---|---|
-| `start-openqq.ps1` | `~/.openqq/start-openqq.ps1` | 启动器：单实例锁、`.env` 缺失快速失败、日志编号轮转、退出码传播 |
-| `launch-hidden.vbs` | `~/.openqq/launch-hidden.vbs` | 无窗口动作宿主（wscript GUI 宿主 + 隐藏 powershell），**透传子进程退出码** |
-| `watchdog.ps1` | `~/.openqq/watchdog.ps1` | 10 分钟看门狗：进程缺失 / 心跳 >5min 陈旧 → 杀残留 + Start-ScheduledTask |
+| 旧脚本 | 新入口（包内 `dist/`） |
+|---|---|
+| `start-openqq.ps1`（日志轮转 + 单实例） | `dist/openqq-bot.js`（自带日志轮转与单实例锁） |
+| `watchdog.ps1`（10 分钟巡检） | `dist/openqq-watchdog.js --once`（`openqq service install` 注册） |
+| `launch-hidden.vbs`（无窗口宿主） | 不再需要：detached spawn 由 `bot-launcher` 完成 |
+| `scripts/safe-restart.ps1` | `dist/openqq-cli.js restart`（等空闲→停→拉） |
 
-## 修改流程
-1. 在本目录改（git 提交），再复制到 `~/.openqq/` 生效；或
-2. 在 `~/.openqq/` 应急改完后**立即复制回本目录提交**——两处不一致 = 下次部署回滚。
+自启注册（唯一的平台差异点）：
 
-## 教训记录（2026-10-14）
-- E7b 把任务动作换成 `sh.Run(..., 0, False)`（不等待）→ 任务恒判成功，"失败 1 分钟重启×3"失效
-  约 1 天才被评审翻出。现为 `(..., 0, True)` + `WScript.Quit exitCode`。
-- VBScript 方法**作为表达式取返回值时参数必须整体加括号**：`x = sh.Run "cmd", 0, True`
-  是编译错误（弹错误框、脚本不执行）；必须 `x = sh.Run("cmd", 0, True)`。
+```bash
+openqq service install     # win32=schtasks / linux=systemd user / darwin=launchd
+openqq service status
+openqq service uninstall
+```
 
-## 绝不入库
-- `~/.openqq/.env`（明文密钥，ACL 已 icacls 收紧为仅当前用户）。
-- `~/.openqq/sessions.json` / `settings.json` / `greeted.json`（运行时状态）。
+运行时数据仍在 `~/.openqq/`（`.env`、台账、日志、`heartbeat`）——那里**不放代码**。

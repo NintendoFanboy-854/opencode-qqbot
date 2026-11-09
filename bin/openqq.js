@@ -12,6 +12,19 @@ import { join, dirname } from "node:path"
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..")
 
+// 2026-11-09 架构红线：看门狗/重启/自启注册都是包内 TS 产物，经本 shim 统一分发。
+// 传参不改变无参数行为。
+function runChild(cmd, args) {
+  const r = spawnSync(cmd, args, { stdio: "inherit" })
+  process.exit(r.status ?? 1)
+}
+if (argv[0] === "watchdog") {
+  runChild(detectBun() ?? "node", [join(root, "dist", "openqq-watchdog.js"), ...argv.slice(1)])
+}
+if (argv[0] === "restart" || argv[0] === "service") {
+  runChild("node", [join(root, "dist", "openqq-cli.js"), ...argv])
+}
+
 // notify 子命令分发（不改变无参数行为）：CLI 只入队 ~openqq/outbox.json，
 // 发送由 bot 进程 notify-sink 消费；CLI 不联网不取 token 不抢锁。
 const argv = process.argv.slice(2)

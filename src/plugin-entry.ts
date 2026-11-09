@@ -12,7 +12,7 @@ import { join } from "path"
 import { homedir } from "os"
 import { appendFileSync, existsSync, renameSync, statSync } from "fs"
 import { fileURLToPath } from "url"
-import { isInstanceAlive } from "./core/instance-lock.js"
+import { readBotHealth, decideWatchdog, botWatchdogPaths } from "./core/watchdog.js"
 import { resolveRuntime, buildLaunchPlan, spawnBotDetached, resolveBotEntry, readDotEnvField, botLogPath } from "./core/bot-launcher.js"
 
 const ENV_FILE = join(homedir(), ".openqq", ".env")
@@ -60,7 +60,11 @@ export default Plugin.define({
           )
           return
         }
-        if (isInstanceAlive(appId)) {
+        // 2026-11-09：判活升级为跨平台看门狗（锁 pid + process.kill + 心跳新鲜度）。
+        // 旧逻辑只看锁 mtime，进程活着但事件循环僵死时会误判健康。
+        const health = readBotHealth(botWatchdogPaths(appId))
+        const decision = decideWatchdog(health)
+        if (decision.action === "ok") {
           lastBlocker = null // 畅通复位
           return
         }
@@ -74,8 +78,16 @@ export default Plugin.define({
           warnOnce("runtime", "[opencode-qqbot] 未找到 bun/node 运行时，无法拉起 bot——请安装其中之一（https://bun.sh）")
           return
         }
+        // 残留但僵死：先杀再拉（pid 来自锁文件，跨平台可用）
+        if (decision.killPid !== null) {
+          try {
+            process.kill(decision.killPid)
+          } catch {
+            /* 已退出 */
+          }
+        }
         const pid = spawnBotDetached(buildLaunchPlan(runtime, entry, botLogPath()))
-        console.log(`[opencode-qqbot] bot 已拉起（pid=${pid}，runtime=${runtime}，entry=${entry}）`)
+        console.log(`[opencode-qqbot] bot 已拉起（pid=${pid}，runtime=${runtime}，原因：${decision.reason}）`)
         lastBlocker = null
       } catch (error) {
         // 引导器永不阻断宿主
