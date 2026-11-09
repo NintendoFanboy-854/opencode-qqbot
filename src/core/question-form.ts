@@ -126,7 +126,7 @@ export function renderQuestion(item: QuestionItem, index: number, total: number)
   } else {
     lines.push("请直接回复内容")
   }
-  lines.push("回复「取消」放弃；30 分钟未答：可选题自动跳过，必填题中止")
+  lines.push("回复「取消」放弃")
   return lines.join("\n")
 }
 

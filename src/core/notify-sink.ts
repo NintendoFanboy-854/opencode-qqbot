@@ -39,7 +39,7 @@ export interface NotifySink {
  * 创建并启动 notify 消费端。handler 语义：
  * - payload.text 投给 entry.ctx（c2c 主动消息；delivery 内含配额/降级/分条/24h 去重）；
  * - TTL 过期 → 返回 skipped 说明（outbox 记为 sent，不发送）——积压不刷屏；
- * - 投递抛错 → outbox 记 failed 并退避重试，到 maxAttempts 保持 failed。
+ * - 投递抛错 → outbox 记 failed 并退避重试；默认不设最大尝试次数。
  * start() 已含 recover（崩溃 sending→pending/failed，至少一次语义）。
  */
 export function createNotifySink(options: NotifySinkOptions): NotifySink {

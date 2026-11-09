@@ -158,7 +158,7 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
   }
 
   // promptAndWait 的 onPermission 回调：推 QQ 审批菜单，挂起等待用户回复。
-  // 只有 用户回复 或 30 分钟 TTL 会 resolve —— 后者自动拒绝，避免永久挂起。
+  // 只有用户回复会 resolve；不再自动超时。
   function waitForDecision(
     ctx: MessageContext,
     request: PermissionRequest,
@@ -241,8 +241,8 @@ export function createPermissionGate(deps: PermissionGateDeps): PermissionGate {
     entry.resolve(decision)
   }
 
-  // O2（P2-4a）：恢复重启前挂起的审批（30min TTL 内有效）；恢复条目超时则
-  // 直连 reject 解阻塞会话（原 waiter 已不存在，无人代答）
+  // O2（P2-4a）：恢复重启前挂起的审批；恢复条目不自动超时，
+  // 由用户回复或服务端终态解除。
   function restore(): void {
     const saved = loadPendingPermMap()
     for (const [uid, e] of Object.entries(saved)) {

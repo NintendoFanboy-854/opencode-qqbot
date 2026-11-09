@@ -46,7 +46,7 @@ import { truncate } from "./core/util.js"
 import { createDelivery } from "./core/delivery.js"
 import { createNotifySink } from "./core/notify-sink.js"
 import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approval.js"
-import { createFormBridge, renderFormPrompt } from "./core/form-bridge.js"
+import { createFormBridge } from "./core/form-bridge.js"
 import { parseQuestionForm, renderQuestion, parseAnswer, toFormContent, timeoutOutcome, type QuestionItem } from "./core/question-form.js"
 import { recordMessage, resolveQuote, scopeKeyOf, extractEmbeddedQuote } from "./core/context-buffer.js"
 import {
@@ -278,7 +278,7 @@ export function createBridge(
   // ===== 后台等待：前台超时后不放弃，任务完成时回传结果 =====
   // SSE execution.succeeded 即时触发 + 5 分钟轮询兜底（防 SSE 断连漏事件），
   // 上限 24 小时。用户在同一会话发起新回合时被取代（避免同一结果投递两次）。
-  const BG_WAIT_MAX_MS = 0 // 0=不设后台等待上限；完成/取消时自然结束
+  // 后台等待不设上限；完成/取消时自然结束。
   // P0-1（2026-11-09 69 分钟答案丢失事故）：完成检测 = SSE 即时 + 轮询兜底。
   // 轮询从 5min 收紧到 1min——SSE 断连窗口内完成判定最坏延迟 5min→1min，
   // 与「新输入接管（cancel）」竞态的丢失窗口同步收窄。
@@ -309,7 +309,6 @@ export function createBridge(
       cancelled = true
       unsub()
       clearInterval(pollTimer)
-      if (giveupTimer) clearTimeout(giveupTimer)
       bgWaits.delete(sessionId)
       // 被新回合取代（cancel 路径）时结清旧账——否则后台空账永久残留：安全重启
       // 永远等不到空闲、重启恢复会误重挂/补投旧答案（2026-11-05 实证两条僵尸账）。
@@ -356,7 +355,7 @@ export function createBridge(
       return { done: turn.hasIdle, text: turn.text }
     }
 
-    async function finish(kind: "done" | "giveup" | "superseded"): Promise<void> {
+    async function finish(kind: "done" | "superseded"): Promise<void> {
       if (cancelled || finished) return
       // 修复⑧防早交：SSE 的 execution.succeeded / 别回合 idle 可能唬人——
       // promptId 锚点可用时先核实本回合是否真的有 idle 终结标记。
@@ -378,19 +377,15 @@ export function createBridge(
       finished = true
       // R 项：先销账再清理——cleanup 对未完成（被取代）路径按 superseded 结清，
       // 顺序必须账清在前，否则原因会被 superseded 覆盖（settle 幂等，后写不生效）。
-      if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : kind === "giveup" ? "expired" : "superseded")
+      if (trackId) settleInflight(trackId, undefined, kind === "done" ? "answered" : "superseded")
       cleanup()
       // Q1：后台等待终态 → 放行该用户队列（此前为串行而挂起）
       void drainQueue(ctx.userId)
       if (kind === "superseded") {
         // DEF-qqbot-20261107-P2：后台等到的回合已被同会话新输入接管——任务已死，
-        // 明确交代而非沉默到 24 小时 giveup。
+        // 明确交代而不是静默。
         console.log(`[bridge] 后台回合被同会话新输入接管（superseded）session=${sessionId}`)
         await safeDeliver(ctx, "警告：后台任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
-        return
-      }
-      if (kind === "giveup") {
-        await safeDeliver(ctx, "警告：后台任务 24 小时仍未完成，停止自动跟进；结果可随时用 /history 查询")
         return
       }
       // SSE 完成事件后给最终消息落库留 2 秒余量，避免读到半截
@@ -466,10 +461,9 @@ export function createBridge(
       if (ev.type === "session.execution.succeeded") void finish("done")
     })
     const pollTimer = setInterval(() => void tick(), BG_POLL_MS)
-    const giveupTimer = BG_WAIT_MAX_MS > 0 ? setTimeout(() => void finish("giveup"), BG_WAIT_MAX_MS) : null
     bgWaits.set(sessionId, { cancel: cleanup })
     if (trackId) markInflightStage(trackId, "background", { sessionId })
-    console.log(`[bridge] 会话 ${sessionId} 转入后台等待（${BG_WAIT_MAX_MS > 0 ? `最长 ${BG_WAIT_MAX_MS / 3_600_000} 小时` : "无上限"}）`)
+    console.log(`[bridge] 会话 ${sessionId} 转入后台等待（不设上限）`)
   }
 
   const watchApi: WatchApi = {
@@ -546,14 +540,15 @@ export function createBridge(
     client,
     sendReply,
     safeDeliver,
-    sendFormCard: async (ctx, form, keyboard) => {
+    sendFormCard: async (ctx, _form, keyboard, text, passive) => {
       try {
         const token = await getAccessToken(config.qq.appId, config.qq.clientSecret)
-        const text = renderFormPrompt(form)
+        // 第一题用被动回复；后续题改用主动消息，避免单条消息 4 次被动回复上限。
+        const replyTo = passive ? ctx.msgId || undefined : undefined
         if (ctx.type === "group" && ctx.groupId) {
-          await sendGroupMessage(token, ctx.groupId, text, ctx.msgId || undefined, undefined, true, keyboard)
+          await sendGroupMessage(token, ctx.groupId, text, replyTo, undefined, true, keyboard)
         } else {
-          await sendC2CMessage(token, ctx.userId, text, ctx.msgId || undefined, undefined, true, keyboard)
+          await sendC2CMessage(token, ctx.userId, text, replyTo, undefined, true, keyboard)
         }
         return true
       } catch (error) {
@@ -620,14 +615,13 @@ export function createBridge(
               return decision
             },
             onElicitation: (userId, params) => handleElicitation(userId, params),
-            // 会话没有超时限（2026-11-08 用户口径）：满 30 分钟只通知「转后台继续」，
-            // 回合继续跑、完成即回传；串行链保持占用，队列不会提前推进。
+            // ACP 的 promptNotice 可选用：配置后只发「转后台继续」通知，不终止回合。
             onPromptNotice: (userId, sessionId) => {
-              console.log(`[bridge] 回合前台等待满 30 分钟，转后台继续 sid=${shortId(sessionId)} user=${userId.slice(0, 8)}…`)
+              console.log(`[bridge] 回合执行较久，发转后台通知 sid=${shortId(sessionId)} user=${userId.slice(0, 8)}…`)
               const ctx = lastCtx.get(userId) ?? ctxForUser(userId)
               void safeDeliver(
                 ctx,
-                "本轮已执行满 30 分钟，仍在继续（前台等待结束，已转后台），完成即回传；可 /stop 中止。",
+                "本轮执行时间较长，仍在继续，完成即回传；可 /stop 中止。",
               )
             },
           },
@@ -1398,12 +1392,12 @@ export function createBridge(
           await safeDeliver(ctx, "警告：上一条任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
           settleInflight(trackId, undefined, "superseded")
         } else if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
-          // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 5 分钟轮询兜底，
-          // 最长 24 小时），完成时经 deliver 被动/主动回传 —— 12 小时长任务的答案也不丢。
+          // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 轮询兜底，
+          // 不设上限），完成时经 deliver 被动/主动回传。
           // R 项：不销账——bgWait 完成投递时才销（完成前死亡由启动对账接管）。
           await safeDeliver(
             ctx,
-            "回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（最长 24 小时）。期间可用 /history 查看进展。",
+            "回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（不设上限）。期间可用 /history 查看进展。",
           )
           startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId, turnStart)
         } else if (isAcpPromptBusy(error)) {
@@ -1416,8 +1410,8 @@ export function createBridge(
           )
           settleInflight(trackId, undefined, "error")
         } else if (isAcpPromptTimeout(error)) {
-          // 仅硬上限（6 小时）会走到这里；30 分钟只是通知，不终止回合。
-          await safeDeliver(ctx, "回合已达硬上限（6 小时），已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
+          // 仅显式配置 ACP 硬上限时会走到这里。
+          await safeDeliver(ctx, "回合达到 ACP 配置的硬上限，已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
           settleInflight(trackId, undefined, "error")
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错

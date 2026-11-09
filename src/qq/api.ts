@@ -457,7 +457,7 @@ export async function acknowledgeInteraction(
 // ── 媒体发送（生态观察缺口 4：bot→QQ 发图/文件，P0 参照 qqbot-nodejs protocol/api/media.ts）──
 export const MediaFileType = { IMAGE: 1, VIDEO: 2, VOICE: 3, FILE: 4 } as const
 
-/** 上传媒体到 QQ 拿 file_info（单次上限 20MB；base64 体由调用方给） */
+/** 上传媒体到 QQ 拿 file_info（QQ 官方硬限制 200MB；base64 体由调用方给） */
 export async function uploadQQMedia(
   accessToken: string,
   ctx: MessageContext,

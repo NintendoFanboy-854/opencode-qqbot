@@ -189,7 +189,7 @@ function readDocument(filePath: string, now: number): OutboxDocument {
 }
 
 /**
- * sent 先按 24h 年龄过滤，再取 updatedAt 最新 20 条；非 sent 全量保留。
+ * sent 全部保留；非 sent 全量保留。
  * 输出按 createdAt 升序，createdAt 相同保持原相对顺序，避免活跃项被修剪或重排。
  */
 export function pruneOutboxEntries(entries: OutboxEntry[], now = Date.now()): OutboxEntry[] {

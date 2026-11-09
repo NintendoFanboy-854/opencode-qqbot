@@ -452,7 +452,7 @@ export function formatLedgerReply(view: QueueView, opts: LedgerReplyOptions = {}
   const page = Math.max(1, Math.floor(opts.page ?? 1))
   const lines: string[] = [
     `台账快照 · ${new Date(view.now).toLocaleString("zh-CN", { hour12: false })}`,
-    `在途 ${view.counts.inflight} · 已结 ${view.counts.settledRecent}（保留 24h / 最新 20）`,
+    `在途 ${view.counts.inflight} · 已结 ${view.counts.settledRecent}（全部保留）`,
   ]
 
   const wantInflight = filter === "all" || filter === "orphan" || filter === "inflight"

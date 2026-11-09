@@ -93,7 +93,7 @@ export interface AcpHandlers {
   /** agent → client 表单/提问；返回 ACP 的 elicitation 结果。未处理时返回 decline。 */
   onElicitation?: (params: Record<string, unknown>) => Promise<unknown>
   /**
-   * 回合前台等待满 promptNoticeMs（默认 30 分钟）时触发一次——**只通知，不终止**。
+   * 回合前台等待满 promptNoticeMs 时触发一次——**只通知，不终止**。
    * 2026-11-08 用户口径：会话没有超时限，只有弹窗才有 TTL；
    * 超时只意味着「前台等待结束，转后台继续」，任务继续跑、完成即回传。
    */
@@ -338,9 +338,9 @@ export class AcpClient {
 
   async prompt(sessionId: string, prompt: Array<{ type: "text"; text: string } | Record<string, unknown>>): Promise<{ stopReason?: string }> {
     // 2026-11-08 用户口径：**会话没有超时限，只有弹窗才有 TTL**。
-    // 满 promptNoticeMs（30 分钟）只通知一次「已转后台继续」，promise 不 reject、
+    // 满 promptNoticeMs 只通知一次「已转后台继续」，promise 不 reject、
     // 任务不被杀、串行链保持占用（后续消息继续排队，不会撞 -32603）；
-    // 只有 promptTimeoutMs（6 小时硬上限）才 reject，用于兜住真正的死挂。
+    // 只有显式配置的 promptTimeoutMs 才 reject，用于兜住真正的死挂。
     const noticeMs = this.opts.promptNoticeMs ?? 0
     const capMs = this.opts.promptTimeoutMs ?? 0
     let noticed = false

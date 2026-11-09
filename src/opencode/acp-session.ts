@@ -60,7 +60,7 @@ export interface AcpSessionHandlers {
   /** 表单/提问（P3 接入 form-bridge）；未处理时 decline。 */
   onElicitation?: (userId: string, params: Record<string, unknown>) => Promise<unknown>
   /**
-   * 回合前台等待满 30 分钟（2026-11-08 用户口径：会话没有超时限）——
+   * 回合前台等待通知（2026-11-08 用户口径：会话没有超时限）——
    * 只通知「转后台继续」，**不终止回合**，串行链保持占用。
    */
   onPromptNotice?: (userId: string, sessionId: string) => void

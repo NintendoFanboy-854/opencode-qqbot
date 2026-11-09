@@ -29,6 +29,10 @@ export interface FormJournalEntry {
   createdAt: number
   state: FormLifecycleState
   answer?: Record<string, unknown>
+  /** 多字段表单的部分答案（最终提交前） */
+  answers?: Record<string, unknown>
+  /** 当前正在询问的字段下标（form.fields 下标） */
+  fieldIndex?: number
   display?: string
   interactionId?: string
   updatedAt: number
@@ -99,6 +103,8 @@ function normalizeEntry(value: unknown): FormJournalEntry | undefined {
     createdAt: entry.createdAt,
     state: entry.state,
     ...(entry.answer && typeof entry.answer === "object" && !Array.isArray(entry.answer) ? { answer: entry.answer } : {}),
+    ...(entry.answers && typeof entry.answers === "object" && !Array.isArray(entry.answers) ? { answers: entry.answers } : {}),
+    ...(typeof entry.fieldIndex === "number" && Number.isInteger(entry.fieldIndex) && entry.fieldIndex >= 0 ? { fieldIndex: entry.fieldIndex } : {}),
     ...(typeof entry.display === "string" ? { display: entry.display } : {}),
     ...(typeof entry.interactionId === "string" ? { interactionId: entry.interactionId } : {}),
     updatedAt: entry.updatedAt,
@@ -113,6 +119,8 @@ function snapshot(entry: FormJournalEntry): FormJournalEntry {
     createdAt: entry.createdAt,
     state: entry.state,
     ...(entry.answer ? { answer: entry.answer } : {}),
+    ...(entry.answers ? { answers: entry.answers } : {}),
+    ...(typeof entry.fieldIndex === "number" ? { fieldIndex: entry.fieldIndex } : {}),
     ...(entry.display !== undefined ? { display: entry.display } : {}),
     ...(entry.interactionId ? { interactionId: entry.interactionId } : {}),
     updatedAt: entry.updatedAt,

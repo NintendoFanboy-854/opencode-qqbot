@@ -85,7 +85,7 @@ export const SETTLED_RETENTION_MS = INFLIGHT_MAX_AGE_MS
 export const SETTLED_RETENTION_LIMIT = Number.POSITIVE_INFINITY
 
 /**
- * 台账保留策略（纯函数）：保留全部 inflight；settled 先按 24h 过滤，再按 at 取最新 20 条。
+ * 台账保留策略（纯函数）：inflight/settled 全部保留，不按年龄或数量裁剪。
  * 输出按 at 升序；at 相同时保持输入相对顺序。数量上限并列时保留输入中靠后的记录。
  */
 export function pruneInflightEntries(entries: InflightEntry[], now = Date.now()): InflightEntry[] {
