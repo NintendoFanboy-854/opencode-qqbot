@@ -17,7 +17,7 @@ import {
   type CommandResult,
   type ServiceSpec,
 } from "./service-main.js"
-import { resolveBunCommand, resolveRuntime } from "../core/bot-launcher.js"
+import { resolveBunCommand, locateOnPath, resolveRuntime } from "../core/bot-launcher.js"
 
 const DEFAULT_INTERVAL_MIN = 10
 
@@ -29,9 +29,13 @@ function sibling(name: string): string {
 
 function runtimeCommand(): string {
   const runtime = resolveRuntime()
-  if (runtime === "bun") return resolveBunCommand() ?? "bun"
-  if (runtime === "node") return "node"
+  if (runtime === "bun") return resolveBunCommand() ?? throwNoRuntime("bun")
+  if (runtime === "node") return locateOnPath("node") ?? throwNoRuntime("node")
   throw new Error("未找到 bun/node 运行时")
+}
+
+function throwNoRuntime(kind: string): never {
+  throw new Error(`未找到 ${kind} 全路径可执行体——注册动作需要全路径命令（静默红线）`)
 }
 
 function printResult(label: string, r: CommandResult): void {

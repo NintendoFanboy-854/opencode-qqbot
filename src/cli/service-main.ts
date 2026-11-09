@@ -56,7 +56,7 @@ export function buildSchtasksTaskXml(spec: ServiceSpec, now = new Date()):
     `<Repetition><Interval>PT${spec.intervalMin}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>` +
     `<Enabled>true</Enabled></TimeTrigger>`
   return [
-    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<?xml version="1.0" encoding="UTF-16"?>',
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
     `<RegistrationInfo><Author>${user}</Author><Description>OpenCode QQBot watchdog (plugin-managed, silent)</Description></RegistrationInfo>`,
     `<Triggers>${trigger}</Triggers>`,
