@@ -175,10 +175,13 @@ export class AcpClient {
       // ACP 的 stdout 只承载协议；stderr 是日志。此处不落正文，避免噪声/泄密。
     })
     child.on("error", (error) => {
+      // stale 守卫：迟到的 error/exit 属于已被替换的旧子进程，不得触碰当前状态
+      if (this.child !== child) return
       this.teardown()
       this.failAll(error instanceof Error ? error : new Error(String(error)))
     })
     child.on("exit", (code, signal) => {
+      if (this.child !== child) return
       this.teardown()
       this.failAll(new Error(`ACP 进程退出 code=${code} signal=${signal ?? ""}`))
       this.handlers.onExit?.(code, signal)
@@ -188,14 +191,21 @@ export class AcpClient {
     // elicitation.form 是 `{_meta?}` 形状，写成 true 会被判为无效能力，
     // opencode 侧 formElicitation=false → 表单/提问直接被取消，
     // question 工具只会回 "The question couldn't be shown..."（不产生任何下发）。
-    // 2026-11-09 加固：initialize 独立握手超时（默认 30s，不再吃 10 分钟通用超时）；
-    // 握手失败立即清理子进程，下次 start() 可干净重试。
+    // 2026-11-09 加固：initialize 独立握手超时（默认 30s，不再吃 10 分钟通用超时）。
+    // 2026-11-09 自纠：握手失败必须先杀子进程再清引用——否则 opencode 成孤儿进程，
+    // 每次自愈重试堆一个实例（多实例并存还会互相干扰会话状态）；且 exit/error
+    // 处理器有 stale 守卫，迟到的旧进程事件不会误清空新传输。
     try {
       await this.request("initialize", {
         protocolVersion: 1,
         clientCapabilities: { elicitation: { form: {} } },
       }, this.opts.handshakeTimeoutMs ?? 30_000)
     } catch (error) {
+      try {
+        child.kill()
+      } catch {
+        /* 已退出 */
+      }
       this.teardown()
       throw error
     }
