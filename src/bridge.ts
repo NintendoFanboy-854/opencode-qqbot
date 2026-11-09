@@ -72,6 +72,7 @@ import {
   type QueueView,
 } from "./core/queue-view.js"
 import { messageFingerprint } from "./core/inbound-dedupe.js"
+import { isPidAlive } from "./core/watchdog.js"
 import { extractSendFileMarkers, sendLocalFile } from "./core/send-media.js"
 import type { InteractionEvent } from "./qq/types.js"
 // O7b：解析/格式化保持经 bridge 再导出——单测与既有调用方导入路径不变
@@ -604,14 +605,29 @@ export function createBridge(
   if (acpRunner) console.log("[bridge] transport=acp（ACP 传输启用；权限由 session/request_permission 阻塞）")
 
   // P5 健康自检（看门狗）：60s 一次，只检查 ACP 传输存活/握手，不查权限等业务接口。
-  // 失败时尝试重启传输；真正的“在途/队列”对账仍由既有启动对账负责。
+  // 失败时尝试进程内自愈（修传输不动进程）；连续 3 次自愈失败 → 退出码 42 把处置权
+  // 交还外部监督者（systemd WATCHDOG=trigger 同款语义：内部修不好就上报换进程）。
   if (acpRunner) {
+    let acpRestartFails = 0
     const timer = setInterval(() => {
-      if (acpRunner.running) return
+      if (acpRunner.running) {
+        acpRestartFails = 0
+        return
+      }
       console.warn("[watchdog] ACP 传输不存活，尝试重启")
-      void acpRunner.start().catch((error) => {
-        console.error("[watchdog] ACP 重启失败:", error instanceof Error ? error.message : error)
-      })
+      void acpRunner.start().then(
+        () => {
+          acpRestartFails = 0
+        },
+        (error) => {
+          acpRestartFails++
+          console.error(`[watchdog] ACP 重启失败（${acpRestartFails}/3）:`, error instanceof Error ? error.message : error)
+          if (acpRestartFails >= 3) {
+            console.error("[watchdog] ACP 连续自愈失败 3 次，进程以退出码 42 移交外部监督者")
+            process.exit(42)
+          }
+        },
+      )
     }, 60_000)
     timer.unref?.()
   }
@@ -1478,6 +1494,13 @@ export function createBridge(
           settleInflight(entry.msgId, undefined, "answered")
           console.log(`[bridge] 启动对账：已补投答案 msgId=${entry.msgId}`)
         } else if (cls.kind === "running") {
+          // 2026-11-09 透明度补强：原执行进程已死时，回合「存活」以服务端为准——
+          // 后台等待有 REST 轮询兜底，但不再是「同一个活着的回合」，日志必须说清。
+          if (entry.ownerPid !== undefined && !isPidAlive(entry.ownerPid)) {
+            console.log(
+              `[bridge] 启动对账：原执行进程 ${entry.ownerPid} 已退出，回合状态以服务端会话为准（后台等待+轮询兜底）msgId=${entry.msgId}`,
+            )
+          }
           // 跨重启也要保持 QQ 回合同一身份：后台直答完成时，镜像不得再投摘要。
           mirror.beginTurn(entry.sessionId)
           // 不单独发“仍在执行”通知；完成时统一回传最终答案，避免通知也占一条回复。

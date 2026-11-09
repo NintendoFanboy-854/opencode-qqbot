@@ -188,3 +188,225 @@ export function appendWatchdogLog(line: string): void {
     /* 日志失败不阻断巡检 */
   }
 }
+
+// ===== 监督层（2026-11-09 重构，替代裸 healOnce 的「无脑杀旧拉新」）=====
+// 设计对标（当日检索实证）：
+//  - Erlang OTP supervisor：maximum restart intensity——窗口内重启超限 → 放弃并上报，
+//    「防止同因反复死亡反复重启」；
+//  - fleet-guard（Claude Code 生态）：升级杀 SIGTERM→宽限→SIGKILL，且 fail-open
+//    「守卫绝不能拖死被守卫者」；
+//  - k8s 教训：liveness 误杀瞬时态 → 冷却窗口（冷却期内的重复判死直接跳过）；
+//  - claude-code#85206：杀掉后必须保留工作并对操作者可感（give-up 必告警）。
+
+export interface SupervisorPolicy {
+  /** 距上次重启不足该值 → 冷却跳过（防插件引导器与计划任务互踢、防抖动） */
+  cooldownMs: number
+  /** windowMs 内最多重启次数（OTP intensity） */
+  maxRestarts: number
+  /** 重启强度统计窗口（OTP period） */
+  windowMs: number
+  /** SIGTERM 后等待退出的宽限，超时升级强杀（fleet-guard 升级杀） */
+  graceMs: number
+  /** 监督者认领锁的有效期：持锁期间其他监督者让行 */
+  claimTtlMs: number
+}
+
+export const DEFAULT_SUPERVISOR_POLICY: SupervisorPolicy = {
+  cooldownMs: 2 * 60_000,
+  maxRestarts: 3,
+  windowMs: 15 * 60_000,
+  graceMs: 8_000,
+  claimTtlMs: 90_000,
+}
+
+export interface SupervisorState {
+  /** 重启时间戳（升序）；滑动窗口统计强度 */
+  restartLog: number[]
+  /** 上次 give-up 告警时间（30 分钟内不重复轰炸操作者） */
+  alertedAt?: number
+}
+
+export type SuperviseAction =
+  | { kind: "ok" }
+  | { kind: "yield"; reason: string } // 其他监督者持锁
+  | { kind: "cooldown"; untilMs: number }
+  | { kind: "spawn"; reason: string }
+  | { kind: "grace-kill-spawn"; killPid: number; reason: string }
+  | { kind: "give-up"; restarts: number }
+
+/** 纯决策矩阵（导出供测试）：健康 → 强度 → 冷却 → 处置方式。 */
+export function decideSupervise(
+  health: BotHealth,
+  state: SupervisorState,
+  now: number,
+  policy: SupervisorPolicy = DEFAULT_SUPERVISOR_POLICY,
+): SuperviseAction {
+  const staleHeartbeat = health.heartbeatAgeMs !== null && health.heartbeatAgeMs > HEARTBEAT_STALE_MS
+  const needsRestart =
+    health.lockPid === null || health.pidAlive === false || staleHeartbeat
+  if (!needsRestart) return { kind: "ok" }
+
+  // OTP intensity：窗口内已达上限 → 放弃循环，上报人工（不给故障进程当永动机）
+  const windowStart = now - policy.windowMs
+  const recentRestarts = state.restartLog.filter((t) => t > windowStart).length
+  if (recentRestarts >= policy.maxRestarts) return { kind: "give-up", restarts: recentRestarts }
+
+  // 冷却：刚重启过又判死 → 大概率是瞬时/叠加判死，跳过本轮（k8s 误杀教训）
+  const last = state.restartLog[state.restartLog.length - 1] ?? null
+  if (last !== null && now - last < policy.cooldownMs) return { kind: "cooldown", untilMs: last + policy.cooldownMs }
+
+  if (health.lockPid !== null && health.pidAlive !== false && staleHeartbeat) {
+    return {
+      kind: "grace-kill-spawn",
+      killPid: health.lockPid,
+      reason: `心跳陈旧 ${Math.round((health.heartbeatAgeMs ?? 0) / 60_000)} 分钟（进程活但事件循环无进展）`,
+    }
+  }
+  return { kind: "spawn", reason: health.lockPid === null ? "无实例锁（bot 未运行）" : "锁定进程已退出" }
+}
+
+export interface SuperviseDeps {
+  paths: BotWatchdogPaths
+  spawn: () => number
+  policy?: SupervisorPolicy
+  now?: () => number
+  kill?: (pid: number, signal?: "SIGTERM" | "SIGKILL") => void
+  isAlive?: (pid: number) => boolean
+  sleep?: (ms: number) => Promise<void>
+  log?: (line: string) => void
+  /** give-up 时上报操作者（QQ 通知等）；缺省只落日志 */
+  alert?: (message: string) => void
+  statePath?: string
+  claimPath?: string
+}
+
+export interface SuperviseResult {
+  action: string
+  detail: string
+  killedPid: number | null
+  spawnedPid: number | null
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+const defaultSupervisorKill = (pid: number, signal?: "SIGTERM" | "SIGKILL"): void => {
+  try {
+    process.kill(pid, signal)
+  } catch {
+    /* 已退出 */
+  }
+}
+
+function readJson<T>(path: string, fallback: T): T {
+  try {
+    return { ...fallback, ...(JSON.parse(readFileSync(path, "utf-8")) as T) }
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 单次监督：认领锁 → 判健康 → 决策 → 执行（优雅杀/拉起/放弃上报）→ 记强度账。
+ * 插件引导器与计划任务共用本函数，互斥靠 claim 文件，杜绝双开竞争。
+ */
+export async function superviseOnce(deps: SuperviseDeps): Promise<SuperviseResult> {
+  const policy = deps.policy ?? DEFAULT_SUPERVISOR_POLICY
+  const now = deps.now?.() ?? Date.now()
+  const log = deps.log ?? (() => {})
+  const sleep = deps.sleep ?? defaultSleep
+  const kill = deps.kill ?? defaultSupervisorKill
+  const isAlive = deps.isAlive ?? isPidAlive
+  const statePath = deps.statePath ?? join(homedir(), ".openqq", "supervisor.json")
+  const claimPath = deps.claimPath ?? join(homedir(), ".openqq", "supervisor.lock")
+
+  // —— 监督者认领（进程内互斥；持锁者崩溃后 claimTtlMs 可被接管）——
+  const claim = readJson<{ pid: number; ts: number }>(claimPath, { pid: 0, ts: 0 })
+  if (claim.ts && now - claim.ts < policy.claimTtlMs && claim.pid !== process.pid) {
+    return { action: "yield", detail: `监督者 pid=${claim.pid} 持锁中`, killedPid: null, spawnedPid: null }
+  }
+  try {
+    writeFileSync(claimPath, JSON.stringify({ pid: process.pid, ts: now }))
+  } catch {
+    return { action: "yield", detail: "认领锁不可写", killedPid: null, spawnedPid: null }
+  }
+  const release = (): void => {
+    try {
+      writeFileSync(claimPath, JSON.stringify({ pid: 0, ts: 0 }))
+    } catch {
+      /* 残留由 TTL 接管 */
+    }
+  }
+
+  try {
+    const health = readBotHealth(deps.paths, now)
+    const state = readJson<SupervisorState>(statePath, { restartLog: [] })
+    const action = decideSupervise(health, state, now, policy)
+
+    if (action.kind === "ok") return { action: "ok", detail: "健康", killedPid: null, spawnedPid: null }
+    if (action.kind === "cooldown") {
+      log(`[supervisor] 冷却中（上次重启 ${Math.round((now - (action.untilMs - policy.cooldownMs)) / 1000)}s 前），本轮跳过`)
+      return { action: "cooldown", detail: "冷却跳过", killedPid: null, spawnedPid: null }
+    }
+    if (action.kind === "yield") {
+      return { action: "yield", detail: action.reason, killedPid: null, spawnedPid: null }
+    }
+    if (action.kind === "give-up") {
+      const message = `⚠️ QQBot 看门狗已放弃：${action.restarts} 次重启/${Math.round(policy.windowMs / 60_000)} 分钟仍不健康。继续自动重启没有意义（同因反复死亡），请人工检查 %TEMP%\\opencode 下 bot.out.log 与 ~/.openqq/watchdog.log。`
+      appendWatchdogLog(`give-up：${message}`)
+      log(`[supervisor] give-up：${action.restarts} 次重启仍异常，停止循环并上报`)
+      // 告警去抖：30 分钟内只报一次（计划任务每 10 分钟一轮，防止轰炸）
+      const lastAlert = state.alertedAt ?? 0
+      if (now - lastAlert > 30 * 60_000) {
+        try {
+          deps.alert?.(message)
+          state.alertedAt = now
+          writeFileSync(statePath, JSON.stringify(state))
+        } catch {
+          /* 上报失败不阻断 */
+        }
+      }
+      return { action: "give-up", detail: message, killedPid: null, spawnedPid: null }
+    }
+
+    // spawn / grace-kill-spawn
+    let killedPid: number | null = null
+    if (action.kind === "grace-kill-spawn" && action.killPid !== process.pid) {
+      const pid = action.killPid
+      // 升级杀（fleet-guard）：TERM → 宽限轮询 → KILL。
+      // Windows 上 Node 的 SIGTERM≈立即终止（无 handler 语义），宽限主要服务 posix；
+      // 但轮询仍统一：确认死亡后才拉起，绝不「边杀边拉」。
+      kill(pid, "SIGTERM")
+      const deadline = now + policy.graceMs
+      let alive = isAlive(pid)
+      while (alive && Date.now() < deadline) {
+        await sleep(250)
+        alive = isAlive(pid)
+      }
+      if (alive) {
+        kill(pid, "SIGKILL")
+        const hardDeadline = Date.now() + 3_000
+        while (alive && Date.now() < hardDeadline) {
+          await sleep(250)
+          alive = isAlive(pid)
+        }
+      }
+      if (alive) {
+        appendWatchdogLog(`give-up-kill：pid=${pid} 无法终止（权限/系统级），本次不拉起`)
+        return { action: "give-up", detail: `pid=${pid} 无法终止`, killedPid: null, spawnedPid: null }
+      }
+      killedPid = pid
+    }
+    const spawnedPid = deps.spawn()
+    state.restartLog.push(Date.now())
+    state.restartLog = state.restartLog.filter((t) => t > Date.now() - policy.windowMs * 2)
+    try {
+      writeFileSync(statePath, JSON.stringify(state))
+    } catch {
+      log("[supervisor] 强度账落盘失败（不影响本次拉起）")
+    }
+    const detail = `${action.reason}；${killedPid ? `已优雅停 pid=${killedPid}；` : ""}已拉起 pid=${spawnedPid}`
+    appendWatchdogLog(`restart：${detail}`)
+    return { action: "restart", detail, killedPid, spawnedPid }
+  } finally {
+    release()
+  }
+}

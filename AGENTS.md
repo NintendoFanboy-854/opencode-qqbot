@@ -31,6 +31,9 @@
 
 - [x] `src/core/watchdog.ts`：判活（锁 mtime + 心跳 + pid 存在）与重启决策，纯函数优先、可测
 - [x] `src/cli/watchdog-main.ts` → `dist/openqq-watchdog.js`：单次/循环巡检入口
+- [x] 监督语义（2026-11-09 重构，`superviseOnce`）：优雅杀（TERM→宽限 8s→KILL）→ 拉起；
+      冷却 2 分钟跳过（防互踢）；重启强度 3 次/15 分钟超限 → give-up 并 QQ 告警（不当永动机）；
+      监督者认领锁互斥（插件引导器与计划任务不双开）；连续杀不掉则放弃本轮
 - [x] `src/core/bot-control.ts` + `src/cli/openqq-main.ts` → `dist/openqq-cli.js`：`safe-restart.ps1` 的 TS 跨平台等价物（等空闲→停→拉）
 - [x] `src/cli/service-main.ts`：三平台自启注册/注销/状态
 - [x] 插件引导器内联 watchdog 巡检（OpenCode 在线时即看门狗）

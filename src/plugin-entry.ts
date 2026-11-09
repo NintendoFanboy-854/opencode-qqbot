@@ -12,8 +12,10 @@ import { join } from "path"
 import { homedir } from "os"
 import { appendFileSync, existsSync, renameSync, statSync } from "fs"
 import { fileURLToPath } from "url"
-import { readBotHealth, decideWatchdog, botWatchdogPaths } from "./core/watchdog.js"
-import { resolveRuntime, buildLaunchPlan, spawnBotDetached, resolveBotEntry, readDotEnvField, botLogPath } from "./core/bot-launcher.js"
+import { botWatchdogPaths, superviseOnce } from "./core/watchdog.js"
+import { startBot } from "./core/bot-control.js"
+import { runNotifyCli } from "./cli/notify.js"
+import { readDotEnvField } from "./core/bot-launcher.js"
 
 const ENV_FILE = join(homedir(), ".openqq", ".env")
 const CHECK_INTERVAL_MS = (() => {
@@ -60,35 +62,26 @@ export default Plugin.define({
           )
           return
         }
-        // 2026-11-09：判活升级为跨平台看门狗（锁 pid + process.kill + 心跳新鲜度）。
-        // 旧逻辑只看锁 mtime，进程活着但事件循环僵死时会误判健康。
-        const health = readBotHealth(botWatchdogPaths(appId))
-        const decision = decideWatchdog(health)
-        if (decision.action === "ok") {
-          lastBlocker = null // 畅通复位
-          return
-        }
-        const entry = resolveBotEntry(fileURLToPath(import.meta.url))
-        if (!entry) {
-          warnOnce("entry", "[opencode-qqbot] 未找到 bot 入口（bot.js / dist/openqq-bot.js / src/index.ts 全缺）——插件安装不完整")
-          return
-        }
-        const runtime = resolveRuntime()
-        if (!runtime) {
-          warnOnce("runtime", "[opencode-qqbot] 未找到 bun/node 运行时，无法拉起 bot——请安装其中之一（https://bun.sh）")
-          return
-        }
-        // 残留但僵死：先杀再拉（pid 来自锁文件，跨平台可用）
-        if (decision.killPid !== null) {
-          try {
-            process.kill(decision.killPid)
-          } catch {
-            /* 已退出 */
-          }
-        }
-        const pid = spawnBotDetached(buildLaunchPlan(runtime, entry, botLogPath()))
-        console.log(`[opencode-qqbot] bot 已拉起（pid=${pid}，runtime=${runtime}，原因：${decision.reason}）`)
-        lastBlocker = null
+        // 2026-11-09 重构：巡检升级为 superviseOnce（与计划任务同一监督矩阵 + 认领互斥）：
+        // 优雅杀/冷却/重启强度超限 give-up 并告警，杜绝裸「杀旧拉新」循环。
+        void superviseOnce({
+          paths: botWatchdogPaths(appId),
+          spawn: () => startBot(fileURLToPath(import.meta.url), (line) => console.log(line)),
+          log: (line) => console.log(line),
+          alert: (message) => {
+            console.warn(message)
+            void runNotifyCli(["--text", message, "--id", `supervisor-giveup-${Date.now()}`]).catch(() => {})
+          },
+        })
+          .then((result) => {
+            if (result.action === "restart") {
+              console.log(`[opencode-qqbot] bot 已拉起（${result.detail}）`)
+            }
+            if (result.action === "ok" || result.action === "restart") lastBlocker = null
+          })
+          .catch((error) => {
+            console.error("[opencode-qqbot] 巡检失败:", error instanceof Error ? error.message : error)
+          })
       } catch (error) {
         // 引导器永不阻断宿主
         console.error("[opencode-qqbot] 拉起失败:", error instanceof Error ? error.message : error)
