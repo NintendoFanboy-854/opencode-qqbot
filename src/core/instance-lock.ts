@@ -22,6 +22,9 @@ const LOCK_RETRY_MS = 5_000 // 待命抢锁间隔
 // 心跳 touch 失败是静默的（锁文件被新实例接管/删除后自己并不知道），双 believer
 // 并存造成同 msgId 并发受理（主链）。自检看锁文件里的 pid：不是自己且进程存活
 // → 本实例是残留，自杀退出；锁文件消失同样说明被强抢 → 自杀。待命态无锁不检。
+// P2-10（2026-11-09）：自杀判定加锁 mtime 新鲜度——真 holder 每 10s 心跳 touch；
+// holder pid 存活但锁已陈旧 = 高度疑似 PID 复用（Windows pid 回收快），此时不自杀，
+// 交由 stale 强抢流程正常接管（误自杀比双跑代价大，宽进严出）。
 const LOCK_SELF_CHECK_MS = 60_000
 
 export interface InstanceLock {
@@ -87,8 +90,13 @@ export function acquireInstanceLockAt(
       if (holder === process.pid) return
       try {
         process.kill(holder!, 0)
-        console.error(`[instance-lock] 自检：锁已被 pid=${holder} 持有且进程存活，本实例为残留 believer，自杀退出`)
-        process.exit(1)
+        // P2-10：holder 存活时分两种情况——锁新鲜=真双 believer（自杀）；锁陈旧=疑 PID 复用（不自杀）
+        const lockFresh = Date.now() - statSync(path).mtimeMs <= LOCK_STALE_MS
+        if (lockFresh) {
+          console.error(`[instance-lock] 自检：锁已被 pid=${holder} 持有且进程存活（锁新鲜），本实例为残留 believer，自杀退出`)
+          process.exit(1)
+        }
+        console.warn(`[instance-lock] 自检：holder pid=${holder} 存活但锁已陈旧（疑 PID 复用），不自杀，交由 stale 强抢接管`)
       } catch {
         /* holder 已死：等待其锁被 stale 逻辑回收，本实例继续自检 */
       }
