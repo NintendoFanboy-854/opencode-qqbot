@@ -277,6 +277,16 @@ export function createBridge(
         for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
       }
     }
+    // 关键：模型常把"说明文字"和工具调用放在同一步里，text.ended 可能晚于 tool.called。
+    // step.ended 的 finish="tool-calls" 是确定信号：这一步说完还要继续干活，先把它说的话发出去。
+    if (ev.type === "session.step.ended" && d.finish === "tool-calls" && !earlyTextSent.has(sessionID)) {
+      const said = (earlyTextBuf.get(sessionID) ?? []).join("\n\n").trim()
+      earlyTextBuf.delete(sessionID)
+      if (said) {
+        earlyTextSent.add(sessionID)
+        for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
+      }
+    }
     if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed") {
       earlyTextBuf.delete(sessionID)
       earlyTextSent.delete(sessionID)
