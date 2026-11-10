@@ -174,6 +174,8 @@ export function createBridge(
   // 2026-11-10：硬编码回执已删除——"收到"由模型自己说，插件只负责把它的话及时转发。
 
   const busyUsers = new Set<string>()
+  // 2026-11-10：最近一次说话的用户——发文件工具没有天然收件人，用它兜底。
+  let lastActiveUserId = ""
   // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
   const claimedContexts = new WeakSet<MessageContext>()
   // 修复⑦：队列 drain 重入的 ctx——受理回执跳过（drain 已有「开始执行队列」节点，
@@ -1133,6 +1135,7 @@ export function createBridge(
   purgeOldQQImages()
 
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
+    lastActiveUserId = ctx.userId
     let claimedMsgId = ""
     const intentKey = intentKeyOf(ctx)
     // drain 重入/重启恢复的 ctx 已带受理账；若它在派发前的早退点（表单消费/命令/
@@ -1643,14 +1646,20 @@ export function createBridge(
         unlinkSync(full)
         const target = String(item.path ?? "").trim()
         if (!target) continue
-        const userId = sessions.all()[0]?.userId
-        if (!userId) continue
+        const userId = lastActiveUserId || sessions.all()[0]?.userId
+        if (!userId) {
+          console.log("[spool] 没有可发送的用户，丢弃:", target)
+          continue
+        }
         const ctx = ctxForUser(userId)
+        console.log(`[spool] 发送 ${target} → user=${userId.slice(0, 8)}…`)
         void sendLocalFile(ctx, target, { getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret) })
-          .then(() => {
+          .then((done) => {
+            console.log(`[spool] 成功：${done}`)
             if (item.note) void notifyUser(ctx, String(item.note))
           })
           .catch((error) => {
+            console.log("[spool] 失败:", toErrorMessage(error))
             void notifyUser(ctx, `发送文件失败：${error instanceof Error ? error.message : error}`)
           })
       }
