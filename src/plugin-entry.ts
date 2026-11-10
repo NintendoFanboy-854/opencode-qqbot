@@ -118,7 +118,7 @@ export default Plugin.define({
             required: ["path"],
             additionalProperties: false,
           } as never,
-          execute: async (input: unknown) => {
+          execute: async (input: unknown, context: { sessionID?: string }) => {
             const args = (input ?? {}) as { path?: string; note?: string }
             const target = String(args.path ?? "").trim()
             const note = String(args.note ?? "").trim()
@@ -127,7 +127,7 @@ export default Plugin.define({
             mkdirSync(spool, { recursive: true })
             writeFileSync(
               join(spool, `${Date.now()}-${randomUUID().slice(0, 8)}.json`),
-              JSON.stringify({ path: target, note, at: Date.now() }),
+              JSON.stringify({ path: target, note, sessionID: context?.sessionID ?? "", at: Date.now() }),
               "utf8",
             )
             return { content: `已交给 QQ 发送：${target}` }

@@ -1636,7 +1636,7 @@ export function createBridge(
       for (const name of readdirSync(SPOOL_DIR)) {
         if (!name.endsWith(".json")) continue
         const full = join(SPOOL_DIR, name)
-        let item: { path?: string; note?: string } = {}
+        let item: { path?: string; note?: string; sessionID?: string } = {}
         try {
           item = JSON.parse(readFileSync(full, "utf8"))
         } catch {
@@ -1646,7 +1646,9 @@ export function createBridge(
         unlinkSync(full)
         const target = String(item.path ?? "").trim()
         if (!target) continue
-        const userId = lastActiveUserId || sessions.all()[0]?.userId
+        const wantedSession = String(item.sessionID ?? "").trim()
+        const bySession = wantedSession ? sessions.all().find((x) => x.sessionId === wantedSession)?.userId : undefined
+        const userId = bySession || lastActiveUserId || sessions.all()[0]?.userId
         if (!userId) {
           console.log("[spool] 没有可发送的用户，丢弃:", target)
           continue
