@@ -12,6 +12,8 @@ interface UserSession {
   modelId?: string
   providerId?: string
   agentId?: string
+  /** 模型档位（low/high/max）；仅镜像服务端，显示与继承用 */
+  variant?: string
   /** 项目归属（location.directory）缓存——新建会话继承链的同步来源；由 enforceLocation 回写 */
   directory?: string
 }
@@ -85,7 +87,10 @@ export class SessionManager {
     // owner 裁定 2026-11-09：/new 继承「当前会话」的模型/Agent（仅新建这一次性代入；
     // 切换已有会话永不继承——见 switchSession）。
     const prev = this.sessions.get(userId)
-    const inheritedModel = prev?.providerId && prev.modelId ? { providerID: prev.providerId, id: prev.modelId } : undefined
+    const inheritedModel =
+      prev?.providerId && prev.modelId
+        ? { providerID: prev.providerId, id: prev.modelId, ...(prev.variant ? { variant: prev.variant } : {}) }
+        : undefined
     const inheritedAgent = prev?.agentId || this.defaultAgent() || undefined
     const result = await this.client.session.create({
       location: { directory },
@@ -95,6 +100,7 @@ export class SessionManager {
       sessionId: result.data!.id,
       title: result.data!.title,
       ...(inheritedModel ? { providerId: inheritedModel.providerID, modelId: inheritedModel.id } : {}),
+      ...(inheritedModel?.variant ? { variant: inheritedModel.variant } : {}),
       ...(inheritedAgent ? { agentId: inheritedAgent } : {}),
     }
     this.sessions.set(userId, session)
@@ -149,9 +155,12 @@ export class SessionManager {
       if (model?.providerID && model?.id) {
         s.providerId = model.providerID
         s.modelId = model.id
+        if (model.variant) s.variant = model.variant
+        else delete s.variant
       } else {
         delete s.providerId
         delete s.modelId
+        delete s.variant
       }
       if (typeof agent === "string" && agent) s.agentId = agent
       else delete s.agentId
@@ -232,15 +241,17 @@ export class SessionManager {
 
   // v2: 模型/agent 是 session 级（/prompt body 会被剥离），必须调 session 端点。
   // 先服务端成功再落本地，避免 /model 显示成功但实际没生效。
-  async setModel(userId: string, providerId: string, modelId: string): Promise<void> {
+  async setModel(userId: string, providerId: string, modelId: string, variant?: string): Promise<void> {
     const s = this.sessions.get(userId)
     if (!s) return
     await this.client.session.setModel({
       path: { id: s.sessionId },
-      body: { model: { providerID: providerId, id: modelId } },
+      body: { model: { providerID: providerId, id: modelId, ...(variant ? { variant } : {}) } },
     })
     s.providerId = providerId
     s.modelId = modelId
+    if (variant) s.variant = variant
+    else delete s.variant
     this.saveSessions()
   }
 
@@ -275,9 +286,9 @@ export class SessionManager {
     }
   }
 
-  getModel(userId: string): { providerId?: string; modelId?: string } {
+  getModel(userId: string): { providerId?: string; modelId?: string; variant?: string } {
     const s = this.sessions.get(userId)
-    return { providerId: s?.providerId, modelId: s?.modelId }
+    return { providerId: s?.providerId, modelId: s?.modelId, variant: s?.variant }
   }
 
   getAgent(userId: string): string | undefined {

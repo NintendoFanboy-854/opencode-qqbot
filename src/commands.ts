@@ -7,9 +7,7 @@ import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
 import { renderHistory } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
 import { sendLocalFile } from "./core/send-media.js"
-import { fileLogStatus } from "./core/file-log.js"
-
-const SELECTION_TTL_MS = 60_000
+const SELECTION_TTL_MS = Number.POSITIVE_INFINITY // 2026-11-10：序号选择不再过期
 
 // 观察模式 API（bridge 实现：SSE 订阅 + 里程碑推送）
 export interface WatchApi {
@@ -74,7 +72,7 @@ export interface PendingSelection {
 /** ACP 命令适配（与 REST 的 sessions/client 同语义的最小面）。 */
 export interface CommandAcpApi {
   newSession: (userId: string) => Promise<string>
-  setModel: (userId: string, providerId: string, modelId: string) => Promise<void>
+  setModel: (userId: string, providerId: string, modelId: string, variant?: string) => Promise<void>
   setAgent: (userId: string, agentId: string) => Promise<void>
   cancel: (userId: string) => void
 }
@@ -120,11 +118,13 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
     case "cancel": // /cancel 与 /stop 同义（用户自然习惯 + pi-qqbot 同款，UAT S3 实证缺口）
       return handleStop(ctx, cmdCtx)
     case "queue":
-      return handleQueue(ctx, parsed.args, cmdCtx)
     case "ledger":
-      return handleLedger(ctx, parsed.args, cmdCtx)
     case "progress":
-      return cmdCtx.progress.query(ctx.userId)
+    case "sessions":
+    case "watch":
+    case "mirror":
+      // 2026-11-10：诊断类命令已下线（用户要求只留核心）。仍接受但明确告知。
+      return "这条命令已经下线了，发 /help 看现在支持什么"
     case "status":
       return handleStatus(ctx, cmdCtx)
     case "sessions":
@@ -139,12 +139,8 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
       return handleRename(ctx, parsed.args, cmdCtx)
     case "history":
       return handleHistory(ctx, parsed.args, cmdCtx)
-    case "watch":
-      return handleWatch(ctx, parsed.args, cmdCtx)
     case "send":
       return handleSend(ctx, parsed.args, cmdCtx)
-    case "mirror":
-      return handleMirror(parsed.args, cmdCtx)
     default:
       return `不支持的命令：/${parsed.name}\n发送 /help 查看可用命令`
   }
@@ -183,8 +179,8 @@ export async function handlePendingSelection(
   }
 
   await ensureSession(userId, cmdCtx)
-  await cmdCtx.sessions.setModel(userId, model.providerId, model.modelId)
-  return `已切换模型：${item.label}`
+  await cmdCtx.sessions.setModel(userId, model.providerId, model.modelId, model.variant)
+  return `已切换模型：${model.providerId}/${model.modelId}${model.variant ? `#${model.variant}` : ""}`
 }
 
 function parseCommand(content: string): ParsedCommand | null {
@@ -216,7 +212,7 @@ async function handleNew(ctx: MessageContext, cmdCtx: CommandContext): Promise<s
 async function handleSend(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
   const path = args.trim()
   if (!path) {
-    return "用法：/send <本地文件路径>（仅允许白名单目录：QQ 图片缓存与 bot 工作目录）"
+    return "用法：/send <本地文件路径>"
   }
   try {
     const done = await sendLocalFile(ctx, path, { getToken: cmdCtx.getAccessToken })
@@ -238,44 +234,7 @@ async function handleStop(ctx: MessageContext, cmdCtx: CommandContext): Promise<
   return `已发送停止请求：${target}${suffix}`
 }
 
-// Q1：/queue 查看与管理忙碌队列（2026-11-05：默认视图 join 台账，不再只看内存）
-function handleQueue(ctx: MessageContext, args: string, cmdCtx: CommandContext): string {
-  const parts = args.trim().split(/\s+/).filter(Boolean)
-  const sub = parts[0]?.toLowerCase() ?? ""
-  if (sub === "clear") {
-    const n = cmdCtx.queue.clear(ctx.userId)
-    return n > 0 ? `已清空队列（${n} 条）` : "队列本来就是空的"
-  }
-  if (sub === "drop") {
-    const id = Number(parts[1])
-    if (!Number.isInteger(id) || id <= 0) return "用法：/queue drop <编号>"
-    return cmdCtx.queue.drop(ctx.userId, id)
-  }
-  if (sub === "all") {
-    const page = Number(parts[1] ?? "1")
-    return cmdCtx.queue.listAll(ctx.userId, Number.isInteger(page) && page > 0 ? page : 1)
-  }
-  if (/^\d+$/.test(sub)) {
-    return cmdCtx.queue.listAll(ctx.userId, Math.max(1, Number(sub)))
-  }
-  return cmdCtx.queue.list(ctx.userId)
-}
-
-// 2026-11-05：/ledger——台账诊断（快照 / 对账 / 人工结清）
-async function handleLedger(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
-  const parts = args.trim().split(/\s+/).filter(Boolean)
-  const sub = parts[0]?.toLowerCase() ?? ""
-  if (sub === "check") {
-    return cmdCtx.ledger.check(ctx.userId)
-  }
-  if (sub === "settle") {
-    const key = parts[1] ?? ""
-    const confirm = (parts[2] ?? "").toLowerCase() === "confirm"
-    if (!key) return "用法：/ledger settle <msgId尾号> confirm"
-    return cmdCtx.ledger.settle(ctx.userId, key, confirm)
-  }
-  return cmdCtx.ledger.view(ctx.userId, args)
-}
+// 2026-11-10：/queue、/ledger 命令实现已删除（诊断类功能下线）。
 
 /**
  * /status 会话行标题解析（2026-11-09 陈旧缓存显示缺陷修复）：
@@ -306,30 +265,20 @@ export async function resolveStatusSessionTitle(
 
 async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
   const sessionInfo = await resolveStatusSessionTitle(cmdCtx.sessions, cmdCtx.client, ctx.userId)
-  const { providerId, modelId } = cmdCtx.sessions.getModel(ctx.userId)
+  const { providerId, modelId, variant } = cmdCtx.sessions.getModel(ctx.userId)
   const agentId = cmdCtx.sessions.getAgent(ctx.userId)
 
   const openCodeStatus = await getOpenCodeStatus(cmdCtx.client)
   const qqStatus = await getQQStatus(cmdCtx)
-  const log = fileLogStatus()
-  const logLine = log
-    ? (() => {
-        const ageSec = log.lastWriteAt ? Math.round((Date.now() - log.lastWriteAt) / 1000) : -1
-        const stale = ageSec > 300 ? "警告：日志停滞" : ""
-        return `日志：${log.path} · ${ageSec >= 0 ? `最后写入 ${ageSec}s 前` : "尚未写入"}${stale}`
-      })()
-    : "日志：未启用（QQ_LOG_FILE=off）"
 
-  return [
-    "OpenCode 状态",
-    `服务器：${openCodeStatus}`,
-    `QQ 鉴权：${qqStatus}`,
-    `会话：${sessionInfo.sessionId ? `${sessionInfo.title ?? "未命名会话"} (${sessionInfo.sessionId})` : "未创建"}`,
-    `模型：${providerId && modelId ? `${providerId} / ${modelId}` : "默认"}`,
-    `Agent：${agentId ?? "默认"}`,
-    cmdCtx.queue.summary(ctx.userId),
-    logLine,
-  ].join("\n")
+  const model = providerId && modelId ? `${providerId}/${modelId}${variant ? `#${variant}` : ""}` : "默认"
+  const lines = [
+    `模型：${model}`,
+    `会话：${sessionInfo.sessionId ? (sessionInfo.title ?? "未命名") : "未创建"}（Agent：${agentId ?? "默认"}）`,
+  ]
+  if (openCodeStatus !== "运行中") lines.push(`服务器异常：${openCodeStatus}`)
+  if (qqStatus !== "正常") lines.push(`QQ 鉴权异常：${qqStatus}`)
+  return lines.join("\n")
 }
 
 async function handleSessions(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
@@ -354,13 +303,15 @@ async function handleSessions(ctx: MessageContext, cmdCtx: CommandContext): Prom
 }
 
 async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
-  if (!args) {
+  const query = args.trim().toLowerCase()
+  if (!query || query === "all") {
     const models = await listModels(cmdCtx.client)
     if (models.length === 0) {
       return "当前没有可用模型"
     }
 
     const current = cmdCtx.sessions.getModel(ctx.userId)
+
     cmdCtx.pendingSelections.set(ctx.userId, {
       type: "model",
       items: models.map((model) => ({ id: model.id, label: model.label })),
@@ -372,23 +323,23 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
       return `${index + 1}. ${isCurrent ? "[当前] " : ""}${model.label}`
     })
 
-    return ["可用模型：", ...lines, "回复序号或 /model <provider/model> 切换（60 秒内有效）"].join("\n")
+    return ["可用模型：", ...lines, "回复序号切换，或 /model <provider/model>#max 直接指定档位"].join("\n")
   }
 
-  if (/^\d+$/.test(args)) {
-    const result = await handlePendingSelection(ctx.userId, Number(args), cmdCtx)
+  if (/^\d+$/.test(query)) {
+    const result = await handlePendingSelection(ctx.userId, Number(query), cmdCtx)
     return result ?? "没有待选择的模型列表，请先发送 /model"
   }
 
   const model = splitModelId(args)
   if (!model) {
-    return "模型格式不对，请使用 /model <provider/model>"
+    return "模型格式不对，请使用 /model <provider/model>，档位用 #max"
   }
 
   await ensureSession(ctx.userId, cmdCtx)
-  if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, model.providerId, model.modelId)
-  else await cmdCtx.sessions.setModel(ctx.userId, model.providerId, model.modelId)
-  return `已切换模型：${model.providerId} / ${model.modelId}`
+  if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, model.providerId, model.modelId, model.variant)
+  else await cmdCtx.sessions.setModel(ctx.userId, model.providerId, model.modelId, model.variant)
+  return `已切换模型：${model.providerId}/${model.modelId}${model.variant ? `#${model.variant}` : ""}`
 }
 
 async function handleAgent(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
@@ -430,8 +381,14 @@ async function handleRename(ctx: MessageContext, args: string, cmdCtx: CommandCo
     return "当前还没有会话可重命名"
   }
 
+  // 2026-11-10：改名必须落到服务端。此前只写本地缓存，/status 回读服务端标题时会覆盖回去。
+  try {
+    await cmdCtx.client.session.update({ path: { id: session.sessionId }, body: { title } })
+  } catch (error) {
+    return `改名失败：${toErrorMessage(error)}`
+  }
   cmdCtx.sessions.switchSession(ctx.userId, session.sessionId, title, session.directory)
-  return `已重命名当前会话：${title}`
+  return `已重命名：${title}`
 }
 
 async function handleHistory(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
@@ -450,33 +407,7 @@ async function handleHistory(ctx: MessageContext, args: string, cmdCtx: CommandC
   return `${session.title ?? session.sessionId} · 最近 ${n} 轮\n\n${body}`
 }
 
-async function handleWatch(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
-  const a = args.trim()
-  const lower = a.toLowerCase()
-
-  if (lower === "off" || lower === "stop") {
-    return cmdCtx.watch.stop(ctx.userId)
-  }
-
-  if (!a) {
-    const session = await cmdCtx.sessions.getOrCreate(ctx.userId)
-    return cmdCtx.watch.start(ctx.userId, session.sessionId, ctx)
-  }
-
-  if (/^ses_/i.test(a)) {
-    return cmdCtx.watch.start(ctx.userId, a, ctx)
-  }
-
-  return "用法：/watch 观察当前会话｜/watch <会话ID> 观察指定会话｜/watch off 停止观察"
-}
-
-function handleMirror(args: string, cmdCtx: CommandContext): string {
-  const a = args.trim().toLowerCase()
-  if (!a) return cmdCtx.mirror.status()
-  if (["on", "1", "开", "打开"].includes(a)) return cmdCtx.mirror.set(true)
-  if (["off", "0", "关", "关闭"].includes(a)) return cmdCtx.mirror.set(false)
-  return "用法：/mirror 查看状态｜/mirror on 开启｜/mirror off 关闭"
-}
+// 2026-11-10：/watch、/mirror 命令实现已删除。
 
 async function ensureSession(userId: string, cmdCtx: CommandContext): Promise<void> {
   if (cmdCtx.acp) return // ACP 适配内部会 getOrCreate
@@ -524,6 +455,28 @@ async function listSessions(client: OpencodeClient): Promise<ListedSession[]> {
 }
 
 async function listModels(client: OpencodeClient): Promise<ListedModel[]> {
+  // 2026-11-10：改用 /api/model（带 variants），列表里能看出每个模型的思考档位。
+  // 无数据时回落到 config.providers（老路径，不含档位）。
+  const modelApi = extractProperty(client, "model")
+  const listFn = typeof modelApi === "object" && modelApi !== null ? Reflect.get(modelApi, "list") : undefined
+  if (typeof listFn === "function") {
+    const response = await Promise.resolve(listFn.call(modelApi))
+    const raw = extractArray(response).length > 0 ? extractArray(response) : extractArray(extractProperty(response, "data"))
+    const models: ListedModel[] = []
+    for (const item of raw) {
+      const providerId = getString(item, "providerID") ?? getString(item, "providerId")
+      const modelId = getString(item, "id") ?? getString(item, "modelID")
+      if (!providerId || !modelId) continue
+      const rawVariants = extractProperty(item, "variants")
+      const variants = Array.isArray(rawVariants)
+        ? rawVariants.map((v) => (isRecord(v) ? getString(v, "id") : undefined)).filter((v): v is string => !!v)
+        : []
+      const suffix = variants.length > 0 ? ` [${variants.join("|")}]` : ""
+      models.push({ id: `${providerId}/${modelId}`, label: `${providerId}/${modelId}${suffix}` })
+    }
+    if (models.length > 0) return models
+  }
+
   const configApi = extractProperty(client, "config")
   const providersFn = typeof configApi === "object" && configApi !== null ? Reflect.get(configApi, "providers") : undefined
   const response = typeof providersFn === "function" ? await Promise.resolve(providersFn.call(configApi)) : []
@@ -542,7 +495,7 @@ async function listModels(client: OpencodeClient): Promise<ListedModel[]> {
       }
       models.push({
         id: `${providerId}/${modelId}`,
-        label: `${providerId} / ${modelId}`,
+        label: `${providerId}/${modelId}`,
       })
     }
   }
@@ -571,49 +524,38 @@ async function listAgents(client: OpencodeClient): Promise<ListedAgent[]> {
     .filter((agent): agent is ListedAgent => agent !== null)
 }
 
-function splitModelId(value: string): { providerId: string; modelId: string } | null {
+function splitModelId(value: string): { providerId: string; modelId: string; variant?: string } | null {
   const trimmed = value.trim()
-  const slashIndex = trimmed.indexOf("/")
-  if (slashIndex <= 0 || slashIndex === trimmed.length - 1) {
+  // 档位语法：provider/model#max（与 opencode.json 顶层 model 写法一致）
+  const hashIndex = trimmed.indexOf("#")
+  const head = hashIndex >= 0 ? trimmed.slice(0, hashIndex).trim() : trimmed
+  const variant = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() : ""
+  const slashIndex = head.indexOf("/")
+  if (slashIndex <= 0 || slashIndex === head.length - 1) {
     return null
   }
 
-  const providerId = trimmed.slice(0, slashIndex).trim()
-  const modelId = trimmed.slice(slashIndex + 1).trim()
+  const providerId = head.slice(0, slashIndex).trim()
+  const modelId = head.slice(slashIndex + 1).trim()
   if (!providerId || !modelId) {
     return null
   }
 
-  return { providerId, modelId }
+  return { providerId, modelId, ...(variant ? { variant } : {}) }
 }
 
 export function buildHelpText(): string {
   return [
     "可用命令：",
-    "/new - 创建新会话",
-    "/stop - 停止当前 AI 运行",
-    "/status - 查看服务器和当前会话状态",
-    "/sessions - 列出历史会话并回复序号切换",
-    "/help - 查看帮助",
-    "/model - 列出可用模型",
-    "/model <provider/model> - 切换模型",
-    "/agent - 列出可用 Agent",
-    "/agent <name> - 切换 Agent",
-    "/rename <name> - 重命名当前会话",
-    "/history [N] - 查看当前会话最近 N 轮历史（默认 3）",
-    "/send <路径> - 把白名单目录内的文件/图片发到 QQ",
-    "/watch - 观察当前会话实时过程（工具调用/完成会推送摘要）",
-    "/watch <会话ID> - 观察指定会话",
-    "/watch off - 停止观察",
-    "/progress - 手动进度查询（工具调用/失败统计、在途状态，本地事件源零模型调用）",
-    "/queue - 队列与台账对账视图；/queue all [页码] 全量；/queue clear 清空；/queue drop <编号> 定点删除",
-    "/ledger - 台账快照（在途/孤儿/最近拒绝）；/ledger check 对账会话历史；/ledger settle <尾号> confirm 人工结清",
-    "/cancel - 同 /stop：中止当前 AI 运行并清空忙碌队列",
-    "/mirror [on|off] - 桌面问答摘要镜像开关（会话轮次完成推送问答摘要）",
-    "",
-    "权限审批（AI 请求权限时）：",
-    "回复「允许」= 本次允许｜「总是」= 总是允许｜「拒绝」= 拒绝",
-    "（无自动超时）",
+    "/new - 开新会话",
+    "/stop - 停下当前任务",
+    "/status - 现在在干什么",
+    "/model - 换模型（支持 provider/model#max）",
+    "/agent - 换 Agent",
+    "/history [N] - 最近几轮对话",
+    "/send <路径> - 把文件发到 QQ",
+    "/rename <名字> - 重命名当前会话",
+    "需要审批时回复：允许 / 总是 / 拒绝",
   ].join("\n")
 }
 

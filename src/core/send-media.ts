@@ -6,7 +6,7 @@
 // 安全：路径白名单（默认只允许 QQ 图片缓存目录与 bot 工作目录，QQ_SEND_EXTRA_ROOTS 可扩）；
 // 大小上限 200MB（QQ 官方富媒体硬限制；超软限制会降级为文件类型）。
 import { readFileSync, statSync } from "node:fs"
-import { resolve, extname, basename, sep } from "node:path"
+import { resolve, extname, basename } from "node:path"
 import { imageDir } from "../qq/media.js"
 import { uploadQQMedia, sendQQMediaMessage, MediaFileType } from "../qq/api.js"
 import type { MessageContext } from "../qq/types.js"
@@ -22,10 +22,11 @@ export function allowedSendRoots(extraEnv = process.env.QQ_SEND_EXTRA_ROOTS): st
   return roots.map((r) => resolve(r))
 }
 
-/** 路径白名单校验：规范化后必须落在某个允许根目录内（分隔符按平台自适应） */
+/** 路径白名单校验：2026-11-10 用户明确要求去掉——不做路径限制，任何本地文件都可发送。 */
 export function isAllowedSendPath(filePath: string, roots = allowedSendRoots()): boolean {
-  const full = resolve(filePath.trim().replace(/^"|"$/g, ""))
-  return roots.some((root) => full === root || full.startsWith(root + sep))
+  void filePath
+  void roots
+  return true
 }
 
 /** 扩展名 → QQ MediaFileType（图片=1/视频=2/语音=3/其余=文件） */
@@ -65,7 +66,7 @@ export async function sendLocalFile(
 ): Promise<string> {
   const trimmed = filePath.trim()
   if (!isAllowedSendPath(trimmed)) {
-    throw new Error(`路径不在白名单（仅允许：${allowedSendRoots().join("、")}；可加 QQ_SEND_EXTRA_ROOTS）`)
+    throw new Error(`打不开这个文件：${filePath}`)
   }
   let stat
   try {

@@ -93,28 +93,28 @@ export interface QueueView {
 const STAGE_LABEL: Record<ViewStage, string> = {
   claimed: "派发中",
   queued: "排队中",
-  dispatched: "已派发",
+  dispatched: "已发出",
   running: "执行中",
-  background: "后台等待",
-  orphan: "孤儿",
-  ghost: "幽灵",
-  settled: "已结",
-  rejected: "已拒",
+  background: "在后台跑",
+  orphan: "卡住了",
+  ghost: "对不上",
+  settled: "已完成",
+  rejected: "已取消",
 }
 
 const REASON_LABEL: Record<SettleReason, string> = {
-  answered: "已答",
+  answered: "已回答",
   error: "处理失败",
   "queue-full": "排队已满",
   "duplicate-msgid": "重复消息",
-  "duplicate-intent": "重复意图",
+  "duplicate-intent": "重复请求",
   cancelled: "已取消",
   dropped: "已删除",
-  blocked: "被阻塞",
-  superseded: "被新回合取代",
+  blocked: "被挡住（等审批）",
+  superseded: "被新消息顶掉",
   expired: "已过期",
-  redispatch: "重启重派",
-  manual: "人工结清",
+  redispatch: "服务重启后重试",
+  manual: "手动标记已完成",
 }
 
 const STAGE_RANK: Record<InflightStage, number> = {
@@ -372,7 +372,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   const lines: string[] = []
 
   lines.push(`当前任务：${view.busy ? "处理中" : "空闲"}`)
-  lines.push(`队列：${view.counts.queued}${capacity} · 台账在途：${view.counts.inflight} 条`)
+  lines.push(`排队：${view.counts.queued}${capacity} 条 · 正在处理：${view.counts.inflight} 条`)
 
   if (view.counts.queued > 0) {
     lines.push(`排队中 ${view.counts.queued} 条：`)
@@ -386,11 +386,11 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
     const remain = view.counts.queued - (start + slice.length)
     if (remain > 0) lines.push(`  …还有 ${remain} 条（/queue all ${page + 1}）`)
   } else if (view.counts.inflight === 0 && view.counts.rejected === 0) {
-    lines.push(`队列：空（0${capacity}）`)
+    lines.push(`排队：空（0${capacity}）`)
   }
 
   if (view.counts.claimed > 0) {
-    lines.push(`派发中 ${view.counts.claimed} 条（受理后 90s 内，正常窗口）`)
+    lines.push(`刚收到 ${view.counts.claimed} 条（90 秒内，正常）`)
   }
 
   if (view.counts.running > 0 && view.running) {
@@ -398,15 +398,15 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   }
 
   if (view.counts.background > 0) {
-    lines.push(`后台等待 ${view.counts.background} 条（完成会自动回传）`)
+    lines.push(`后台在跑 ${view.counts.background} 条（完成会自动回传）`)
   }
 
   if (view.counts.dispatched > 0) {
-    lines.push(`已派发 ${view.counts.dispatched} 条（等待接续执行）`)
+    lines.push(`已发出 ${view.counts.dispatched} 条（等待接续）`)
   }
 
   if (view.counts.orphan > 0) {
-    lines.push(`警告：孤儿 ${view.counts.orphan} 条（已受理，未入队/未派发，超 ${Math.round(view.orphanMs / 1000)}s）`)
+    lines.push(`卡住了 ${view.counts.orphan} 条（还没开始也没结束，超过 ${Math.round(view.orphanMs / 1000)} 秒）`)
     const shown = all ? view.orphan.slice(0, pageSize) : view.orphan.slice(0, 8)
     for (const e of shown) {
       lines.push(`  · ${previewText(e.text, PREVIEW)} · ${agoLabel(e.at, view.now)} · msg ${shortId(e.msgId)}`)
@@ -415,7 +415,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
   }
 
   if (view.counts.ghost > 0) {
-    lines.push(`警告：幽灵 ${view.counts.ghost} 条（队列有、台账无，需修复）`)
+    lines.push(`记录对不上 ${view.counts.ghost} 条（内部异常，重启可清）`)
     for (const e of view.ghost.slice(0, 5)) {
       lines.push(`  · ${previewText(e.text, PREVIEW)} · #${e.queueId ?? "-"} · msg ${shortId(e.msgId)}`)
     }
@@ -432,7 +432,7 @@ export function formatQueueReply(view: QueueView, opts: QueueReplyOptions = {}):
     if (w.startsWith("队列编号")) lines.push(`警告：${w}`)
   }
 
-  lines.push("发 /queue all 看全部 · /ledger 看台账明细 · /queue clear 清空")
+  lines.push("发 /queue all 看全部 · /queue clear 清空")
 
   return clampReply(lines, opts.maxChars ?? QUEUE_REPLY_MAX_CHARS, "内容过长，发 /queue all 分页查看")
 }

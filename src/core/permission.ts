@@ -28,7 +28,7 @@ export const PERM_PROMPT_TTL_MS = 0 // 0=不自动拒绝；交给用户/OpenCode
 
 export const DECISION_LABELS: Record<PermissionDecision, string> = {
   once: "允许（本次）",
-  always: "总是允许（已存入项目白名单）",
+  always: "总是允许（以后不再问）",
   reject: "拒绝",
 }
 
@@ -416,7 +416,7 @@ export function formatPermissionPrompt(
   }
   if (request.message) lines.push(`说明：${request.message}`)
   lines.push("")
-  lines.push("回复「允许」= 仅本次｜「总是」= 保存为项目级白名单（后续同类命令永久放行）｜「拒绝」= 驳回（含本会话其他待审）")
+  lines.push("回复「允许」= 这次同意｜「总是」= 以后都同意｜「拒绝」= 不行")
   lines.push("（无自动超时；可用 /allow /always /deny 处理）")
   return lines.join("\n")
 }

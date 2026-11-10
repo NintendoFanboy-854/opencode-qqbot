@@ -53,6 +53,9 @@ export interface PermissionRequest {
 export interface PromptOptions {
   model?: { providerID: string; modelID: string }
   agent?: string
+  // 2026-11-10：投递方式。"steer"=插入正在跑的回合（插话），"queue"=排队等回合结束。
+  // 不传走服务端默认。
+  delivery?: "steer" | "queue"
 }
 
 export interface PromptAndWaitOptions extends PromptOptions {
@@ -116,8 +119,13 @@ export interface OpencodeClient {
       query?: { limit?: number; cursor?: string }
     }): Promise<{ data?: SessionMessage[]; cursor?: { next?: string } }>
     prompt(opts: { path: { id: string }; body: { text: string } & PromptOptions }): Promise<{ data?: { time?: { created?: number } } }>
-    setModel(opts: { path: { id: string }; body: { model: { providerID: string; id: string } } }): Promise<unknown>
+    setModel(opts: {
+      path: { id: string }
+      body: { model: { providerID: string; id: string; variant?: string } }
+    }): Promise<unknown>
     setAgent(opts: { path: { id: string }; body: { agent: string } }): Promise<unknown>
+    /** 会话改名（PATCH /session/{id}）；服务端才是权威标题 */
+    update(opts: { path: { id: string }; body: { title?: string } }): Promise<unknown>
   }
   permission: {
     list(): Promise<{ data?: PermissionRequest[] }>
@@ -132,6 +140,9 @@ export interface OpencodeClient {
   }
   app: {
     agents(): Promise<{ data?: unknown[] }>
+  }
+  model: {
+    list(): Promise<{ data?: unknown[] }>
   }
   config: {
     providers(): Promise<{ data?: unknown[] }>
@@ -377,6 +388,9 @@ export function createClient(baseUrl: string): OpencodeClient {
       async setAgent(opts) {
         return json(await req(`/session/${opts.path.id}/agent`, { method: "POST", body: JSON.stringify(opts.body) }))
       },
+      async update(opts) {
+        return json(await req(`/session/${opts.path.id}`, { method: "PATCH", body: JSON.stringify(opts.body) }))
+      },
     },
 
     permission: {
@@ -413,6 +427,12 @@ export function createClient(baseUrl: string): OpencodeClient {
     app: {
       async agents() {
         return json(await req("/agent"))
+      },
+    },
+
+    model: {
+      async list() {
+        return json(await req("/model"))
       },
     },
 

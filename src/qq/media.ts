@@ -41,17 +41,11 @@ export function extForImageMime(mime: string): string | null {
   return null
 }
 
-const ALLOWED_HOST_SUFFIXES = [".qpic.cn", ".qq.com", ".qq.com.cn"]
-
-/** 下载域白名单（R2-P1-2）：只信 QQ 自家 CDN 且必须 https——在 fetch 之前
- *  拦截，同时断"access_token 出站"与"SSRF 打内网"两条链；精确匹配或以
- *  . 结尾匹配，防 qq.com.evil.com 后缀伪造。 */
+/** 2026-11-10：下载域白名单已移除——用户转发的任何链接都允许下载。 */
 export function isAllowedDownloadHost(url: string): boolean {
   try {
-    const u = new URL(url)
-    if (u.protocol !== "https:") return false
-    const host = u.hostname.toLowerCase()
-    return ALLOWED_HOST_SUFFIXES.some((s) => host === s.slice(1) || host.endsWith(s))
+    new URL(url)
+    return true
   } catch {
     return false
   }

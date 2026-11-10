@@ -112,12 +112,12 @@ export function stallNudgeText(
 ): string {
   const status =
     !s.anchored
-      ? "状态不明（历史账无归属锚点）"
+      ? "没找到这条任务的记录"
       : s.roundRunning
-        ? "已停滞（回合尚未终结，可能被桌面端审批/选择弹窗阻塞）"
-        : "已终结但未回传（异常）"
+        ? "还在跑，但已经很久没有新动作了（可能是桌面端弹了审批框在等你点）"
+        : "看起来停了，但结果还没出来"
   const action = s.lastAction ? `｜最近动作：${s.lastAction}` : ""
-  return `警告：后台任务执行超过 ${minsExec} 分钟｜状态：${status}｜已 ${s.idleMin} 分钟无进展${action}\n桌面端确实空闲请忽略本提醒；或回复 /stop 中止该回合后重发。`
+  return `这个任务已经跑了 ${minsExec} 分钟，${s.idleMin} 分钟没有新动静（${status}）。\n如果桌面端弹了框，去点一下；不想等了就发 /stop。${action}`
 }
 
 // H2 停滞提醒决策（导出供测试，2026-10-30）：bgWait 零进展时提醒用户处置桌面弹窗。
@@ -171,7 +171,7 @@ export function createBridge(
   // 2026-11-03 用户拍板：「已收到」回执默认不发（非调试无价值），调试期在
   // ~/.openqq/.env 设 QQ_ACK_RECEIPT=1 开启。loadEnvFile 全量注入 process.env，
   // 排队回执「已排队 #N」为功能性提示不受此开关影响。
-  const ackReceiptEnabled = /^(1|true|on)$/i.test(process.env.QQ_ACK_RECEIPT ?? "")
+  const ackReceiptEnabled = !/^(0|false|off)$/i.test(process.env.QQ_ACK_RECEIPT ?? "")
 
   const busyUsers = new Set<string>()
   // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
@@ -268,8 +268,8 @@ export function createBridge(
     }
     const line = formatMilestone(ev, callCache)
     if (!line) return
-    // 2026-10-14 用户拍板：里程碑只投 /watch 显式订阅者——自身回合回显与
-    // 会话订阅表的其他来源一律不再隐式携带（镜像只发摘要卡）。
+    // 2026-11-10：工具调用类进度默认不推。用户明确要求：工具调用不要发回来。
+    // 只有显式 /watch 订阅者才收；"还在跑"的体感交给静默心跳，不靠工具流水。
     for (const userId of milestoneTargets(activeWatches, sessionID)) enqueuePush(userId, line)
   }
 
@@ -287,8 +287,10 @@ export function createBridge(
   // H2（2026-10-30，昨晚卡死事故复盘）：桌面审批/选择弹窗对 bot 无通道（V2 无
   // question API，C 项已证伪）——共享会话会被"桌面弹窗挂起"传导性卡死，且静默。
   // bgWait 期间检测"零进展停滞"，主动提醒用户：去桌面端处理弹窗，或用 /stop 终止。
-  const STALL_FIRST_NUDGE_MS = 30 * 60 * 1000
-  const STALL_NUDGE_INTERVAL_MS = 30 * 60 * 1000
+  // 2026-11-10：静默阈值从 30 分钟改为 60 秒——用户不在电脑前，1 分钟没动静就该有回声。
+  // 30 分钟那档原本是为「桌面弹窗卡住」设计的，被误当成了通用的停滞提醒。
+  const STALL_FIRST_NUDGE_MS = 60 * 1000
+  const STALL_NUDGE_INTERVAL_MS = 180 * 1000
   const STALL_NUDGE_MAX = 3
 
   function startBackgroundWait(sessionId: string, ctx: MessageContext, baseline: number, trackId?: string, promptId = "", turnStartedAt?: number): void {
@@ -335,7 +337,7 @@ export function createBridge(
           mirror.scheduleUnlock(sessionId)
           void drainQueue(ctx.userId)
           // 投递失败不得上抛：账已结清，补投失败由 deliver 层自己的重试/降级负责
-          await safeDeliver(ctx, `你发来新消息前，上一回合已完成，结果如下：\n\n${turn.text}`).catch(() => {})
+          await safeDeliver(ctx, `你发新消息前，上一个任务已经做完了，结果如下：\n\n${turn.text}`).catch(() => {})
           console.log(`[bridge] 接管前抢救：后台回合已完成且未投递，结果已补投 session=${sessionId}`)
           return
         }
@@ -385,7 +387,7 @@ export function createBridge(
         // DEF-qqbot-20261107-P2：后台等到的回合已被同会话新输入接管——任务已死，
         // 明确交代而不是静默。
         console.log(`[bridge] 后台回合被同会话新输入接管（superseded）session=${sessionId}`)
-        await safeDeliver(ctx, "警告：后台任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+        await safeDeliver(ctx, "你刚发的新消息顶掉了上一个任务（它还没做完，结果不会有了）。需要的话我再跑一遍")
         return
       }
       // SSE 完成事件后给最终消息落库留 2 秒余量，避免读到半截
@@ -884,7 +886,7 @@ export function createBridge(
       if (job.ctx.msgId) settleInflight(job.ctx.msgId, undefined, "dropped")
       msgQueue.drop(userId, id)
       console.log(`[queue] drop user=${userId.slice(0, 8)}… qid=${id} settle=dropped`)
-      return `已删除队列 #${id}（台账已结清）`
+      return `已删除排队项 #${id}`
     },
   }
 
@@ -936,15 +938,15 @@ export function createBridge(
       if (sub && sub !== "all") {
         const pool = [...view.inflightEntries, ...view.settledRecent]
         const hit = pool.find((e) => e.msgId === sub || e.msgId.endsWith(sub) || shortId(e.msgId) === sub)
-        if (!hit) return `台账里没有匹配「${sub}」的条目（发 /ledger 查看尾号）`
+        if (!hit) return `没有匹配「${sub}」的记录（发 /ledger 看编号）`
         return formatLedgerReply(view, { detail: hit })
       }
       return formatLedgerReply(view)
     },
     check: async (userId: string): Promise<string> => {
       const view = queueViewFor(userId)
-      if (view.inflightEntries.length === 0) return "台账在途：0 条，无需对账"
-      const lines = [`台账对账 · 在途 ${view.inflightEntries.length} 条`]
+      if (view.inflightEntries.length === 0) return "没有正在处理的记录，不用检查"
+      const lines = [`检查结果 · 正在处理 ${view.inflightEntries.length} 条`]
       let answered = 0
       let running = 0
       let lost = 0
@@ -953,7 +955,7 @@ export function createBridge(
         const label = `${shortId(e.msgId)}「${previewText(e.text, 20)}」`
         if (!e.sessionId) {
           lost++
-          lines.push(` · ${label} → lost（从未进入会话；可 /ledger settle ${shortId(e.msgId)} confirm 结清）`)
+          lines.push(` · ${label} → 丢了（从没进入会话；可 /ledger settle ${shortId(e.msgId)} confirm 标记处理完）`)
           continue
         }
         try {
@@ -961,22 +963,22 @@ export function createBridge(
           const cls = classifyInflight({ text: e.text, at: e.at }, msgs)
           if (cls.kind === "answered") {
             answered++
-            lines.push(` · ${label} → answered（答案已在库里，重启会补投）`)
+            lines.push(` · ${label} → 答案已经在库里，重启会补发`)
           } else if (cls.kind === "running") {
             running++
-            lines.push(` · ${label} → running（回合在跑/未终结）`)
+            lines.push(` · ${label} → 正在跑`)
           } else {
             lost++
-            lines.push(` · ${label} → lost（会话历史找不到；可重发或结清）`)
+            lines.push(` · ${label} → 找不到（可重发或标记处理完）`)
           }
         } catch (error) {
           failed++
-          lines.push(` · ${label} → 对账失败：${toErrorMessage(error)}`)
+          lines.push(` · ${label} → 检查失败：${toErrorMessage(error)}`)
         }
       }
       if (view.inflightEntries.length > 20) lines.push(` …其余 ${view.inflightEntries.length - 20} 条未展开`)
-      lines.push(`汇总：answered ${answered} · running ${running} · lost ${lost}${failed ? ` · 失败 ${failed}` : ""}`)
-      lines.push("修复：/ledger settle <尾号> confirm 人工结清；重启对账会自动补投/重挂")
+      lines.push(`汇总：已有答案 ${answered} · 正在跑 ${running} · 丢了 ${lost}${failed ? ` · 失败 ${failed}` : ""}`)
+      lines.push("处理：/ledger settle <编号> confirm 手动标记；重启会自动补发")
       console.log(
         `[journal] check user=${userId.slice(0, 8)}… inflight=${view.inflightEntries.length} answered=${answered} running=${running} lost=${lost} failed=${failed}`,
       )
@@ -987,49 +989,24 @@ export function createBridge(
       const hits = view.inflightEntries.filter(
         (e) => e.msgId === key || e.msgId.endsWith(key) || shortId(e.msgId) === key,
       )
-      if (hits.length === 0) return `台账在途里没有匹配「${key}」的条目`
-      if (hits.length > 1) return `尾号「${key}」匹配到 ${hits.length} 条，请给更长的尾号`
+      if (hits.length === 0) return `正在处理的记录里没有匹配「${key}」的`
+      if (hits.length > 1) return `「${key}」匹配到 ${hits.length} 条，请给更长的编号`
       const hit = hits[0]
-      if (!hit) return `台账在途里没有匹配「${key}」的条目`
+      if (!hit) return `正在处理的记录里没有匹配「${key}」的`
       if (!confirm) {
-        return `将结清：${shortId(hit.msgId)}「${previewText(hit.text, 30)}」\n确认请发 /ledger settle ${key} confirm`
+        return `将标记为已处理：${shortId(hit.msgId)}「${previewText(hit.text, 30)}」\n确认请发 /ledger settle ${key} confirm`
       }
       const ok = settleInflight(hit.msgId, undefined, "manual")
       const job = msgQueue.list(userId).find((j) => j.ctx.msgId === hit.msgId)
       if (job) msgQueue.drop(userId, job.id)
       console.log(`[journal] settle-manual user=${userId.slice(0, 8)}… msg=${shortId(hit.msgId)} ok=${ok}`)
-      return ok ? `已结清：${shortId(hit.msgId)}（人工）` : "该条目已不在在途状态"
+      return ok ? `已标记为已处理：${shortId(hit.msgId)}` : "这条已经不在处理中了"
     },
   }
 
   // 孤儿巡检：每 60s 扫一次台账；仅对新增孤儿且距上次提醒 >10min 的用户发一条汇总。
-  const ORPHAN_SCAN_MS = (() => {
-    const n = Number(process.env.QQ_ORPHAN_SCAN_SECONDS ?? "60")
-    return Number.isFinite(n) && n > 0 ? Math.floor(n * 1000) : 0
-  })()
-  const ORPHAN_NOTIFY_GAP_MS = 10 * 60_000
-  const lastOrphanNotify = new Map<string, number>()
-  if (ORPHAN_SCAN_MS > 0) {
-    setInterval(() => {
-      try {
-        const now = Date.now()
-        const users = new Set(listInflightView().inflight.map((e) => e.userId))
-        for (const uid of users) {
-          const view = queueViewFor(uid)
-          if (view.counts.orphan === 0) continue
-          if (now - (lastOrphanNotify.get(uid) ?? 0) < ORPHAN_NOTIFY_GAP_MS) continue
-          lastOrphanNotify.set(uid, now)
-          console.log(`[queue] orphan-scan user=${uid.slice(0, 8)}… count=${view.counts.orphan}`)
-          void safeDeliver(
-            ctxForUser(uid),
-            `警告：台账发现 ${view.counts.orphan} 条孤儿消息（受理后未入队/未派发）。发 /queue 查看；/ledger settle <尾号> confirm 可人工结清。`,
-          ).catch(() => {})
-        }
-      } catch (error) {
-        console.error("[queue] 孤儿巡检失败:", toErrorMessage(error))
-      }
-    }, ORPHAN_SCAN_MS)
-  }
+  // 2026-11-10：孤儿巡检已移除——它每分钟扫一遍并给用户发"卡住了"的告警，
+  // 属于自建监工。真卡住时用户会自己发现。
 
   // Q2：手动进度查询（本地事件统计，零模型调用）
   const progressApi = {
@@ -1038,8 +1015,8 @@ export function createBridge(
       if (!session) return "当前还没有会话，发消息即可开始"
       const st = turnStats.get(session.sessionId)
       const busy = busyUsers.has(userId) ? "处理中" : "空闲"
-      const bg = bgWaits.has(session.sessionId) ? " · 后台等待在途" : ""
-      if (!st) return `当前会话：${busy}${bg}\n暂无工具调用记录（本会话新起或尚无动作类里程碑）`
+      const bg = bgWaits.has(session.sessionId) ? " · 后台在跑" : ""
+      if (!st) return `当前会话：${busy}${bg}\n还没有工具调用记录`
       return [
         `当前会话：${busy}${bg}`,
         `工具调用 ${st.tools} 次（失败 ${st.failed}）`,
@@ -1075,13 +1052,8 @@ export function createBridge(
       : {}),
   }
 
-  // R2 修复批次启动项（2026-10-14）；2026-11-10 增加通配符全开模式
-  if (config.allowedUsers.length === 0) {
-    console.warn("[security] ALLOWED_USERS 为空 → 所有消息将被拒绝（fail-closed）；请在 ~/.openqq/.env 配置白名单")
-  } else if (config.allowedUsers.includes("*") || config.allowedUsers.some((u) => u.toLowerCase() === "all")) {
-    console.warn("[security] ALLOWED_USERS 包含通配符 → 已允许所有人使用（高风险）")
-  }
-  // R2-P1-3：恢复持久化的 /watch 订阅（里程碑已改 /watch 专属，重启不得静默丢）
+  // 2026-11-10：名单门禁已移除——不再有白名单概念，谁发消息都给服务。
+  // R2-P1-3：恢复持久化的 /watch 订阅
   {
     const saved = loadWatchedMap()
     const known = new Set(sessions.all().map((x) => x.sessionId))
@@ -1118,14 +1090,6 @@ export function createBridge(
       console.log(`[queue] release-early msg=${shortId(ctx.msgId)} reason=${reason}${note ? ` note=${note}` : ""}`)
     }
     try {
-      // P1 修复（2026-11-03，外部复盘核验）：拒绝时记录 openid——新用户无任何
-      // 途径获取自己的 openid 填 ALLOWED_USERS，首配死锁；白名单内不打印（无需）。
-      if (!isAllowedUser(ctx.userId, config.allowedUsers)) {
-        console.log(`[security] 拒绝非白名单用户：openid=${ctx.userId}（把它加入 ~/.openqq/.env 的 ALLOWED_USERS 后重启即开通）`)
-        await notifyUser(ctx, "你不在允许使用的名单里")
-        return
-      }
-
       const content = ctx.content.trim()
       // 纯图消息（无文字但有附件）同样放行；真空消息才丢
       if (!content && !ctx.attachments?.length) {
@@ -1225,16 +1189,27 @@ export function createBridge(
         claimedMsgId = ctx.msgId
       }
 
-      if (busyUsers.has(ctx.userId) && !claimedContexts.has(ctx)) {
-        const duplicateIntent = activeIntents.get(ctx.userId) === intentKey || msgQueue.hasIntent(ctx.userId, intentKey)
-        if (duplicateIntent) {
-          settleInflight(ctx.msgId, undefined, "duplicate-intent") // 重复意图已有原回合负责，直接结清，禁止恢复时再跑
-          console.log(`[bridge] 相同意图已在执行/队列，跳过 msgId=${ctx.msgId}`)
-          return
-        }
-      }
+      // 2026-11-10：重复意图忽略已移除——你重问一遍就是重问，不再替你判断"手滑"。
 
       if (busyUsers.has(ctx.userId)) {
+        // 2026-11-10：插话优先。平台支持 delivery="steer"——把新消息直接并入正在跑的回合，
+        // 而不是排到回合结束后再执行。附件消息仍走排队（steer 不携带附件）。
+        // 失败/不可用时静默回落到下面的排队逻辑。
+        const steerEnabled = !/^(0|false|off)$/i.test(process.env.QQ_STEER ?? "")
+        const steerSessionId = sessions.getSession(ctx.userId)?.sessionId
+        if (steerEnabled && TRANSPORT !== "acp" && steerSessionId && !ctx.attachments?.length) {
+          try {
+            await client.session.prompt({
+              path: { id: steerSessionId },
+              body: { text: content, delivery: "steer" },
+            })
+            releaseClaimed("answered", "已插入当前任务")
+            await notifyUser(ctx, "收到，已插入当前任务，它会在下一步调整")
+            return
+          } catch (error) {
+            console.log(`[steer] 插话失败，回落排队：${toErrorMessage(error)}`)
+          }
+        }
         // Q1（学习 pi-qqbot 队列 UX）：忙碌不再拒绝——FIFO 排队，回合结束自动执行
         // 自检补强：入队即下载附件——QQ 签名 URL 短时效，drain 时下载必过期
         if (ctx.attachments?.length && !ctx.preparedAttachments) {
@@ -1258,7 +1233,7 @@ export function createBridge(
         // 入队前已由 claimInflight 落账；drain 重入时回填 sessionId，不重复写账。
         await notifyUser(
           ctx,
-          `已排队 #${queued.job.id}（第 ${queued.ahead + 1} 位${queued.ahead > 0 ? `，前面还有 ${queued.ahead} 条` : ""}），当前任务结束后自动执行。\n发 /queue 查看队列，/cancel 可中止当前任务并清空队列。`,
+          `已排队（第 ${queued.ahead + 1} 位${queued.ahead > 0 ? `，前面还有 ${queued.ahead} 条` : ""}），当前任务结束后自动执行。发 /cancel 可中止。`,
         )
         return
       }
@@ -1272,7 +1247,7 @@ export function createBridge(
   // 通知——这三处都不进本分支，同一 intent 不重复点头。
   // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
       if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
-        await notifyUser(ctx, "已收到，正在处理，完成后自动回复你")
+        await notifyUser(ctx, "收到，开始处理了")
       }
 
       // B3（2026-10-29 同步升级）：C2C typing 指示——长回合处理中给用户
@@ -1419,7 +1394,7 @@ export function createBridge(
           // R 项：不销账——bgWait 完成投递时才销（完成前死亡由启动对账接管）。
           await safeDeliver(
             ctx,
-            "回合超过前台时限，已转后台等待：任务继续执行，完成即回传结果（不设上限）。期间可用 /history 查看进展。",
+            "这个任务还在跑，我先把它放到后台，做完就发你；期间发 /stop 可中止。",
           )
           startBackgroundWait(sessionId, ctx, turnStart, trackId, promptId, turnStart)
         } else if (isAcpPromptBusy(error)) {
@@ -1428,12 +1403,12 @@ export function createBridge(
           console.error(`[bridge] 会话被占用（active prompt）sid=${shortId(sessionId)}: ${toErrorMessage(error)}`)
           await safeDeliver(
             ctx,
-            "该会话正有回合在执行（可能是桌面端在跑，或上一轮尚未结束），本轮未重复发起。\n发 /stop 可中止当前回合后重试。",
+            "这个会话正在跑别的任务（可能是桌面端，也可能上一轮还没结束），这次没有重复发起。\n发 /stop 可以中止后再来。",
           )
           settleInflight(trackId, undefined, "error")
         } else if (isAcpPromptTimeout(error)) {
           // 仅显式配置 ACP 硬上限时会走到这里。
-          await safeDeliver(ctx, "回合达到 ACP 配置的硬上限，已停止并释放会话；请重新发起（长任务可拆步，或用 /stop 提前结束）。")
+          await safeDeliver(ctx, "这个任务到了配置的时限，已经停下。要接着做的话重新发一次，长任务可以拆开。")
           settleInflight(trackId, undefined, "error")
         } else {
           // Q3：额度/鉴权错误给救援话术（报类别+原文+恢复路径），不死胡同报错
@@ -1537,7 +1512,7 @@ export function createBridge(
         settleInflight(entry.msgId, undefined, "expired")
         await deliver(
           ctx,
-          `警告：重启前队列里有一条消息超过恢复窗口未执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。为避免执行陈旧意图未自动重派，需要的话请重发一次`,
+          `重启前排队的一条消息等太久了，没有自动执行（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。需要的话重发一次`,
         )
         console.log(`[bridge] 启动对账：超窗排队空账已通知销账 msgId=${entry.msgId}`)
         continue
@@ -1568,7 +1543,7 @@ export function createBridge(
           void handleMessage(ctx)
           console.log(`[bridge] 启动对账：丢失消息已重派 msgId=${entry.msgId}`)
         } else {
-          await deliver(ctx, `警告：此前重启期间丢失一条你的消息「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」（超过自动重派窗口未重发），需要的话请重发一次`)
+          await deliver(ctx, `重启期间有一条你的消息没能自动恢复（「${entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text}」）。需要的话重发一次`)
           settleInflight(entry.msgId, undefined, "expired")
           console.log(`[bridge] 启动对账：超期消息仅通知 msgId=${entry.msgId}`)
         }
