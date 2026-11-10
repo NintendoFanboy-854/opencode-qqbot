@@ -2,7 +2,7 @@
 // @output: createBridge, isAllowedUser, milestoneTargets, loadWatchedMap, saveWatchedMap,
 //          （O7b 再导出）parsePermissionDecision, formatPermissionPrompt
 // @pos:    根层 - 核心桥接: QQ 消息 -> OpenCode -> QQ 回复
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "fs"
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, writeFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
 import type { Config } from "./config.js"
@@ -1431,7 +1431,7 @@ export function createBridge(
           // superseded 销账：不转后台（任务已死，「继续执行」是谎言）、不占位符、
           // 不挂 30 分钟超时。账本结清后 finally 正常 drain 队列。
           console.log(`[bridge] 回合被同会话新输入接管（superseded）msg=${shortId(trackId)} sid=${shortId(sessionId)}`)
-          await safeDeliver(ctx, "警告：上一条任务被同会话的新输入打断，未产出结果；如需结果请重新发送")
+          // 2026-11-10：不再往聊天里发"被顶掉"的提示——单用户场景只会造成误会，日志留痕即可。
           settleInflight(trackId, undefined, "superseded")
         } else if (sessionId && turnStart > 0 && error instanceof Error && error.message.includes("响应超时")) {
           // 前台时限到 ≠ 放弃：任务继续跑，转入后台等待（SSE + 轮询兜底，
@@ -1624,6 +1624,40 @@ export function createBridge(
       if (msgQueue.size(userId) > 0 && !busyUsers.has(userId)) void drainQueue(userId)
     }
   }
+
+  // 2026-11-10：消费发文件工具的待发队列（插件工具跑在 opencode 进程里，只能写文件交接）。
+  const SPOOL_DIR = join(homedir(), ".openqq", "spool")
+  setInterval(() => {
+    try {
+      if (!existsSync(SPOOL_DIR)) return
+      for (const name of readdirSync(SPOOL_DIR)) {
+        if (!name.endsWith(".json")) continue
+        const full = join(SPOOL_DIR, name)
+        let item: { path?: string; note?: string } = {}
+        try {
+          item = JSON.parse(readFileSync(full, "utf8"))
+        } catch {
+          unlinkSync(full)
+          continue
+        }
+        unlinkSync(full)
+        const target = String(item.path ?? "").trim()
+        if (!target) continue
+        const userId = sessions.all()[0]?.userId
+        if (!userId) continue
+        const ctx = ctxForUser(userId)
+        void sendLocalFile(ctx, target, { getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret) })
+          .then(() => {
+            if (item.note) void notifyUser(ctx, String(item.note))
+          })
+          .catch((error) => {
+            void notifyUser(ctx, `发送文件失败：${error instanceof Error ? error.message : error}`)
+          })
+      }
+    } catch (error) {
+      console.log("[spool] 扫描失败:", toErrorMessage(error))
+    }
+  }, 1500)
 
   return {
     handleMessage,

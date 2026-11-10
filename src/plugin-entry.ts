@@ -10,7 +10,8 @@
 import { Plugin } from "@opencode/plugin"
 import { join } from "path"
 import { homedir } from "os"
-import { appendFileSync, existsSync, renameSync, statSync } from "fs"
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, writeFileSync } from "fs"
+import { randomUUID } from "crypto"
 import { appendWatchdogLog, botWatchdogPaths, superviseOnce } from "./core/watchdog.js"
 import { startBot } from "./core/bot-control.js"
 import { runNotifyCli } from "./cli/notify.js"
@@ -100,6 +101,40 @@ export default Plugin.define({
     }
     ensure()
     const timer = setInterval(ensure, CHECK_INTERVAL_MS)
+
+    // 2026-11-10：真正的发文件工具，取代 QQ_SEND_FILE 文本标记。
+    // 工具跑在 opencode 进程里，没法直接说 QQ 协议——把意图写进 spool 目录，bot 进程消费后发送。
+    void _ctx.tool
+      .transform((editor) => {
+        editor.add({
+          name: "qq_send_file",
+          description: "把本机文件作为附件发送到用户的 QQ。发报告、截图、压缩包时用这个工具。",
+          input: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "文件的绝对路径" },
+              note: { type: "string", description: "随文件附的一句话说明，可省略" },
+            },
+            required: ["path"],
+            additionalProperties: false,
+          } as never,
+          execute: async (input: unknown) => {
+            const args = (input ?? {}) as { path?: string; note?: string }
+            const target = String(args.path ?? "").trim()
+            const note = String(args.note ?? "").trim()
+            if (!target) throw new Error("path 不能为空")
+            const spool = join(homedir(), ".openqq", "spool")
+            mkdirSync(spool, { recursive: true })
+            writeFileSync(
+              join(spool, `${Date.now()}-${randomUUID().slice(0, 8)}.json`),
+              JSON.stringify({ path: target, note, at: Date.now() }),
+              "utf8",
+            )
+            return { content: `已交给 QQ 发送：${target}` }
+          },
+        } as never)
+      })
+      .catch((error) => console.error("[opencode-qqbot] 注册 qq_send_file 失败:", error))
 
     // 事件探针（可选，默认关）：QQ_EVENT_PROBE=true 时订阅全量事件流落盘
     let probeAbort: AbortController | null = null
