@@ -292,7 +292,8 @@ export function createDelivery(
       q.lines.length = 0
       return
     }
-    const text = q.lines.splice(0, q.lines.length).map((l) => `· ${l}`).join("\n")
+    // 2026-11-10：不再给每行加 "· " 前缀——原样转发，用户看到的字就是模型写的字。
+    const text = q.lines.splice(0, q.lines.length).join("\n")
     q.lastSent = Date.now()
     try {
       await deliver(ctx, text)
