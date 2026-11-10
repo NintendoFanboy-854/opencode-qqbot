@@ -117,18 +117,17 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
     case "stop":
     case "cancel": // /cancel 与 /stop 同义（用户自然习惯 + pi-qqbot 同款，UAT S3 实证缺口）
       return handleStop(ctx, cmdCtx)
+    case "sessions":
+      return handleSessions(ctx, cmdCtx)
     case "queue":
     case "ledger":
     case "progress":
-    case "sessions":
     case "watch":
     case "mirror":
       // 2026-11-10：诊断类命令已下线（用户要求只留核心）。仍接受但明确告知。
       return "这条命令已经下线了，发 /help 看现在支持什么"
     case "status":
       return handleStatus(ctx, cmdCtx)
-    case "sessions":
-      return handleSessions(ctx, cmdCtx)
     case "help":
       return buildHelpText()
     case "model":
@@ -553,6 +552,7 @@ export function buildHelpText(): string {
     "/model - 换模型（支持 provider/model#max）",
     "/agent - 换 Agent",
     "/history [N] - 最近几轮对话",
+    "/sessions - 列出会话并回复序号切换",
     "/send <路径> - 把文件发到 QQ",
     "/rename <名字> - 重命名当前会话",
     "需要审批时回复：允许 / 总是 / 拒绝",
