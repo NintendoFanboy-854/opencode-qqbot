@@ -277,14 +277,28 @@ export function createBridge(
         for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
       }
     }
-    // 关键：模型常把"说明文字"和工具调用放在同一步里，text.ended 可能晚于 tool.called。
-    // step.ended 的 finish="tool-calls" 是确定信号：这一步说完还要继续干活，先把它说的话发出去。
+    // 关键：模型常把"说明文字"和工具调用放在同一步里，text.ended 可能晚于 tool.called，
+    // 甚至根本不发。所以这一步结束时（finish=tool-calls）直接去读那条消息的 text 段。
     if (ev.type === "session.step.ended" && d.finish === "tool-calls" && !earlyTextSent.has(sessionID)) {
-      const said = (earlyTextBuf.get(sessionID) ?? []).join("\n\n").trim()
+      const mid = typeof d.assistantMessageID === "string" ? d.assistantMessageID : ""
+      const users = [...(sessionSubs.get(sessionID) ?? [])]
       earlyTextBuf.delete(sessionID)
-      if (said) {
+      if (mid && users.length > 0) {
         earlyTextSent.add(sessionID)
-        for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
+        void (async () => {
+          try {
+            const res = await client.session.message({ path: { id: sessionID, messageID: mid } })
+            const content = Array.isArray(res?.data?.content) ? res.data.content : []
+            const said = content
+              .filter((p) => p?.type === "text")
+              .map((p) => String(p.text ?? ""))
+              .join("\n\n")
+              .trim()
+            if (said) for (const userId of users) enqueuePush(userId, said)
+          } catch (error) {
+            console.log("[feedback] 读取本步文本失败:", toErrorMessage(error))
+          }
+        })()
       }
     }
     if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed") {

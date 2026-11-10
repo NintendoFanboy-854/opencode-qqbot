@@ -118,6 +118,8 @@ export interface OpencodeClient {
       path: { id: string }
       query?: { limit?: number; cursor?: string }
     }): Promise<{ data?: SessionMessage[]; cursor?: { next?: string } }>
+    /** 单条消息详情（content[] 含 text/reasoning/tool 段） */
+    message(opts: { path: { id: string; messageID: string } }): Promise<{ data?: { content?: Array<{ type?: string; text?: string }> } }>
     prompt(opts: { path: { id: string }; body: { text: string } & PromptOptions }): Promise<{ data?: { time?: { created?: number } } }>
     setModel(opts: {
       path: { id: string }
@@ -378,6 +380,9 @@ export function createClient(baseUrl: string): OpencodeClient {
         if (opts.query?.cursor) query.set("cursor", opts.query.cursor)
         const suffix = query.size > 0 ? `?${query.toString()}` : ""
         return json(await req(`/session/${opts.path.id}/message${suffix}`))
+      },
+      async message(opts) {
+        return json(await req(`/session/${opts.path.id}/message/${opts.path.messageID}`))
       },
       async prompt(opts) {
         return json(await req(`/session/${opts.path.id}/prompt`, { method: "POST", body: JSON.stringify(opts.body) }))
