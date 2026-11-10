@@ -171,7 +171,7 @@ export function createBridge(
   // 2026-11-03 用户拍板：「已收到」回执默认不发（非调试无价值），调试期在
   // ~/.openqq/.env 设 QQ_ACK_RECEIPT=1 开启。loadEnvFile 全量注入 process.env，
   // 排队回执「已排队 #N」为功能性提示不受此开关影响。
-  const ackReceiptEnabled = !/^(0|false|off)$/i.test(process.env.QQ_ACK_RECEIPT ?? "")
+  // 2026-11-10：硬编码回执已删除——"收到"由模型自己说，插件只负责把它的话及时转发。
 
   const busyUsers = new Set<string>()
   // 队列 drain 会重入 handleMessage；标记本 ctx 已认领，避免把合法出队当成平台重投。
@@ -197,6 +197,10 @@ export function createBridge(
   const eventStream = createEventStream(client.baseUrl)
   const sessionSubs = new Map<string, Set<string>>()   // sessionID -> userIds
   const sessionUnsubs = new Map<string, () => void>()  // sessionID -> SSE 退订
+  // 2026-11-10：模型自己说的话才是早反馈。不硬编码任何回执，只把模型本轮最先说出的
+  // 那段话，在第一次工具调用前转发一次（之后不再转发，避免与最终答案重复）。
+  const earlyTextBuf = new Map<string, string[]>()
+  const earlyTextSent = new Set<string>()
   const activeWatches = new Map<string, string>()      // userId -> sessionID（/watch 显式订阅）
   const lastCtx = new Map<string, MessageContext>()    // userId -> 最近消息 ctx（推送通道选择依据）
   const bgWaits = new Map<string, { cancel: () => void }>() // 会话 -> 后台等待
@@ -251,6 +255,32 @@ export function createBridge(
     sessionLastActivity.set(sessionID, Date.now())
     // Q2：本地工具统计（/progress 查询数据源，动作类才计——文件类不算进度）
     const d = (ev.data ?? {}) as Record<string, any>
+    // 2026-11-10：转发模型自己说的话（早反馈），不硬编码任何回执。
+    if (ev.type === "session.execution.started") {
+      earlyTextBuf.delete(sessionID)
+      earlyTextSent.delete(sessionID)
+    }
+    if (ev.type === "session.text.ended") {
+      const said = typeof d.text === "string" ? d.text.trim() : ""
+      if (said) {
+        const buf = earlyTextBuf.get(sessionID) ?? []
+        buf.push(said)
+        earlyTextBuf.set(sessionID, buf)
+      }
+    }
+    // 第一次工具调用之前说的话，就是模型自己想说的"我先看一下…"——发出去，只发这一次。
+    if (ev.type === "session.tool.called" && !earlyTextSent.has(sessionID)) {
+      const said = (earlyTextBuf.get(sessionID) ?? []).join("\n\n").trim()
+      earlyTextBuf.delete(sessionID)
+      if (said) {
+        earlyTextSent.add(sessionID)
+        for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
+      }
+    }
+    if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed") {
+      earlyTextBuf.delete(sessionID)
+      earlyTextSent.delete(sessionID)
+    }
     if (ev.type === "session.tool.called" || ev.type === "session.tool.success") {
       const cmd = typeof d.input === "string" ? d.input : d.input?.command
       const actionable = ev.type === "session.tool.success" || (typeof cmd === "string" && cmd.trim())
@@ -1240,15 +1270,6 @@ export function createBridge(
 
       activeIntents.set(ctx.userId, intentKey)
       busyUsers.add(ctx.userId)
-
-  // 修复⑦（2026-11-03）：受理即回执——前台回合立刻短句确认，消除静默期
-  // （expA 实证：无受理回执时用户观感=「没有任何回复」）。Queue 路径此前
-  // 已回「已排队 #N」、drain 重入已有「开始执行队列」、重派路径有「重启恢复」
-  // 通知——这三处都不进本分支，同一 intent 不重复点头。
-  // （同日迭代：改为开关制、默认不发——见顶部 ackReceiptEnabled。）
-      if (ackReceiptEnabled && ctx.msgId && !drainReentries.has(ctx)) {
-        await notifyUser(ctx, "收到，开始处理了")
-      }
 
       // B3（2026-10-29 同步升级）：C2C typing 指示——长回合处理中给用户
       // "对方正在输入"体感（官方 input_notify，仅 C2C；失败静默不阻塞主流程）
