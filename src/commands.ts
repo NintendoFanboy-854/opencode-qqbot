@@ -298,7 +298,7 @@ async function handleSessions(ctx: MessageContext, cmdCtx: CommandContext): Prom
     return `${index + 1}. ${prefix}${session.title}`
   })
 
-  return ["会话列表：", ...lines, "回复序号切换会话（60 秒内有效）"].join("\n")
+  return ["会话列表：", ...lines, "回复序号切换会话"].join("\n")
 }
 
 async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {

@@ -44,6 +44,7 @@ import {
 } from "./core/permission.js"
 import { truncate } from "./core/util.js"
 import { createDelivery } from "./core/delivery.js"
+import { StepForwarder } from "./core/step-forwarder.js"
 import { createNotifySink } from "./core/notify-sink.js"
 import { handleApprovalInteraction, sendApprovalCard } from "./core/card-approval.js"
 import { createFormBridge } from "./core/form-bridge.js"
@@ -199,10 +200,129 @@ export function createBridge(
   const eventStream = createEventStream(client.baseUrl)
   const sessionSubs = new Map<string, Set<string>>()   // sessionID -> userIds
   const sessionUnsubs = new Map<string, () => void>()  // sessionID -> SSE 退订
-  // 2026-11-10：模型自己说的话才是早反馈。不硬编码任何回执，只把模型本轮最先说出的
-  // 那段话，在第一次工具调用前转发一次（之后不再转发，避免与最终答案重复）。
-  const earlyTextBuf = new Map<string, string[]>()
-  const earlyTextSent = new Set<string>()
+  // 2026-11-12：模型一轮里可以任意交错「文本 → 工具 → 文本 → 工具 → 最终输出」。
+  // 按 assistantMessageID 收集每个 step 的完整可见文本，在 step.ended 时逐段转发；
+  // 最终答复若已经实时转发，收尾时不再重发。reasoning（CoT）不转发，只发 text。
+  const stepForwarder = new StepForwarder()
+  const stepFetchInFlight = new Set<string>() // `${sessionID}:${messageID}`
+  const lateStepFlushQueued = new Set<string>()
+  const pendingStepFlush = new Map<string, Promise<void>>()
+
+  const stepKey = (sessionID: string, messageID: string): string => `${sessionID}:${messageID}`
+
+  function forwardStepText(sessionID: string, messageID: string, finish: string, text: string): void {
+    if (!messageID || stepForwarder.isForwarded(sessionID, messageID)) return
+    const users = [...(sessionSubs.get(sessionID) ?? [])]
+    if (users.length === 0) return
+    const extracted = extractSendFileMarkers(text)
+    if (!extracted.text && extracted.paths.length === 0) return
+    if (extracted.text) {
+      const body = redactSecrets(extracted.text)
+      if (body) for (const userId of users) enqueuePush(userId, body)
+    }
+    for (const path of extracted.paths) {
+      for (const userId of users) {
+        void sendLocalFile(ctxForUser(userId), path, {
+          getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
+        })
+          .then((done) => enqueuePush(userId, done))
+          .catch((error) => {
+            enqueuePush(userId, `发送文件失败：${error instanceof Error ? error.message : String(error)}`)
+          })
+      }
+    }
+    stepForwarder.markForwarded(sessionID, messageID, finish, extracted.text)
+    console.log(`[feedback] step 已转发 mid=${messageID.slice(0, 12)}… finish=${finish || "?"}`)
+  }
+
+  function scheduleStepFetch(sessionID: string, messageID: string, finish: string): void {
+    const key = stepKey(sessionID, messageID)
+    if (stepFetchInFlight.has(key)) return
+    stepFetchInFlight.add(key)
+    const p = (async () => {
+      try {
+        const res = await client.session.message({ path: { id: sessionID, messageID } })
+        const content = Array.isArray(res?.data?.content) ? res.data.content : []
+        const said = content
+          .filter((part) => part?.type === "text")
+          .map((part) => String(part.text ?? ""))
+          .join("\n")
+          .trim()
+        if (said) {
+          forwardStepText(sessionID, messageID, finish, said)
+          return
+        }
+        const buffered = stepForwarder.collect(sessionID, messageID)
+        if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
+      } catch (error) {
+        console.log("[feedback] 读取本步文本失败:", toErrorMessage(error))
+        const buffered = stepForwarder.collect(sessionID, messageID)
+        if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
+      } finally {
+        stepFetchInFlight.delete(key)
+        // text.ended 恰好在 fetch 返回空之后到达：补一次缓冲兜底
+        if (!stepForwarder.isForwarded(sessionID, messageID)) {
+          const buffered = stepForwarder.collect(sessionID, messageID)
+          if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
+        }
+      }
+    })().catch((error) => console.log("[feedback] 本步文本转发失败:", toErrorMessage(error)))
+    pendingStepFlush.set(sessionID, p)
+    void p.finally(() => {
+      if (pendingStepFlush.get(sessionID) === p) pendingStepFlush.delete(sessionID)
+    })
+  }
+
+  function scheduleLateStepFlush(sessionID: string, messageID: string, finish: string): void {
+    const key = stepKey(sessionID, messageID)
+    if (lateStepFlushQueued.has(key)) return
+    lateStepFlushQueued.add(key)
+    setTimeout(() => {
+      lateStepFlushQueued.delete(key)
+      if (stepForwarder.isForwarded(sessionID, messageID)) return
+      if (stepFetchInFlight.has(key)) return
+      const text = stepForwarder.collect(sessionID, messageID)
+      if (text) forwardStepText(sessionID, messageID, finish, text)
+    }, 0)
+  }
+
+  function flushBufferedSteps(sessionID: string, opts?: { skipInFlight?: boolean }): void {
+    for (const messageID of stepForwarder.pending(sessionID)) {
+      if (opts?.skipInFlight && stepFetchInFlight.has(stepKey(sessionID, messageID))) continue
+      const text = stepForwarder.collect(sessionID, messageID)
+      if (text) forwardStepText(sessionID, messageID, stepForwarder.finishOf(sessionID, messageID), text)
+    }
+  }
+
+  async function awaitStepFlush(sessionID: string): Promise<void> {
+    const p = pendingStepFlush.get(sessionID)
+    if (!p) return
+    let timer: NodeJS.Timeout | undefined
+    await Promise.race([
+      p.catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 5000)
+        timer.unref?.()
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+  }
+
+  /**
+   * 最终答复是否已由 step 实时转发。promptAndWait 的轮询可能比 SSE 早一个 tick，
+   * 若前面已有 step 成功转发（说明事件链路正常），给最后一步最多 1 秒追上，避免双发。
+   */
+  async function wasFinalForwardedWithGrace(sessionID: string, text: string): Promise<boolean> {
+    await awaitStepFlush(sessionID)
+    if (stepForwarder.wasFinalForwarded(sessionID, text)) return true
+    // 前面已有 step 转发=SSE 链路正常，给最后一步 1 秒追上；纯问答给 300ms 即可
+    const attempts = stepForwarder.hasForwarded(sessionID) ? 10 : 3
+    for (let i = 0; i < attempts; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      if (stepForwarder.wasFinalForwarded(sessionID, text)) return true
+    }
+    return false
+  }
   const activeWatches = new Map<string, string>()      // userId -> sessionID（/watch 显式订阅）
   const lastCtx = new Map<string, MessageContext>()    // userId -> 最近消息 ctx（推送通道选择依据）
   const bgWaits = new Map<string, { cancel: () => void }>() // 会话 -> 后台等待
@@ -257,55 +377,41 @@ export function createBridge(
     sessionLastActivity.set(sessionID, Date.now())
     // Q2：本地工具统计（/progress 查询数据源，动作类才计——文件类不算进度）
     const d = (ev.data ?? {}) as Record<string, any>
-    // 2026-11-10：转发模型自己说的话（早反馈），不硬编码任何回执。
+    // 2026-11-12：每个 step 的可见文本都转发；不再只发第一段。
     if (ev.type === "session.execution.started") {
-      earlyTextBuf.delete(sessionID)
-      earlyTextSent.delete(sessionID)
+      stepForwarder.startTurn(sessionID)
+      for (const key of [...stepFetchInFlight]) if (key.startsWith(`${sessionID}:`)) stepFetchInFlight.delete(key)
+      for (const key of [...lateStepFlushQueued]) if (key.startsWith(`${sessionID}:`)) lateStepFlushQueued.delete(key)
+      pendingStepFlush.delete(sessionID)
     }
     if (ev.type === "session.text.ended") {
-      const said = typeof d.text === "string" ? d.text.trim() : ""
-      if (said) {
-        const buf = earlyTextBuf.get(sessionID) ?? []
-        buf.push(said)
-        earlyTextBuf.set(sessionID, buf)
-      }
-    }
-    // 第一次工具调用之前说的话，就是模型自己想说的"我先看一下…"——发出去，只发这一次。
-    if (ev.type === "session.tool.called" && !earlyTextSent.has(sessionID)) {
-      const said = (earlyTextBuf.get(sessionID) ?? []).join("\n\n").trim()
-      earlyTextBuf.delete(sessionID)
-      if (said) {
-        earlyTextSent.add(sessionID)
-        for (const userId of sessionSubs.get(sessionID) ?? []) enqueuePush(userId, said)
-      }
-    }
-    // 关键：模型常把"说明文字"和工具调用放在同一步里，text.ended 可能晚于 tool.called，
-    // 甚至根本不发。所以这一步结束时（finish=tool-calls）直接去读那条消息的 text 段。
-    if (ev.type === "session.step.ended" && d.finish === "tool-calls" && !earlyTextSent.has(sessionID)) {
       const mid = typeof d.assistantMessageID === "string" ? d.assistantMessageID : ""
-      const users = [...(sessionSubs.get(sessionID) ?? [])]
-      earlyTextBuf.delete(sessionID)
-      if (mid && users.length > 0) {
-        earlyTextSent.add(sessionID)
-        void (async () => {
-          try {
-            const res = await client.session.message({ path: { id: sessionID, messageID: mid } })
-            const content = Array.isArray(res?.data?.content) ? res.data.content : []
-            const said = content
-              .filter((p) => p?.type === "text")
-              .map((p) => String(p.text ?? ""))
-              .join("\n\n")
-              .trim()
-            if (said) for (const userId of users) enqueuePush(userId, said)
-          } catch (error) {
-            console.log("[feedback] 读取本步文本失败:", toErrorMessage(error))
-          }
-        })()
+      const ordinal = typeof d.ordinal === "number" ? d.ordinal : 0
+      const said = typeof d.text === "string" ? d.text : ""
+      if (mid && said.trim()) {
+        stepForwarder.addText(sessionID, mid, ordinal, said)
+        // text.ended 晚于 step.ended：等同一 tick 的 text 段收齐后补发
+        if (stepForwarder.isEnded(sessionID, mid) && !stepForwarder.isForwarded(sessionID, mid)) {
+          scheduleLateStepFlush(sessionID, mid, stepForwarder.finishOf(sessionID, mid))
+        }
+      }
+    }
+    if (ev.type === "session.step.ended") {
+      const mid = typeof d.assistantMessageID === "string" ? d.assistantMessageID : ""
+      const finish = typeof d.finish === "string" ? d.finish : ""
+      if (mid) {
+        const buffered = stepForwarder.markEnded(sessionID, mid, finish)
+        if (buffered) {
+          forwardStepText(sessionID, mid, finish, buffered)
+        } else if (!stepForwarder.isForwarded(sessionID, mid)) {
+          // text.ended 没来或还没落库：读消息详情兜底
+          scheduleStepFetch(sessionID, mid, finish)
+        }
       }
     }
     if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed") {
-      earlyTextBuf.delete(sessionID)
-      earlyTextSent.delete(sessionID)
+      // 成功时让在途 fetch 自己收尾；失败时立即把已缓冲的文本发出去
+      flushBufferedSteps(sessionID, { skipInFlight: ev.type === "session.execution.succeeded" })
     }
     if (ev.type === "session.tool.called" || ev.type === "session.tool.success") {
       const cmd = typeof d.input === "string" ? d.input : d.input?.command
@@ -392,6 +498,10 @@ export function createBridge(
           settleInflight(tid, undefined, "answered")
           mirror.scheduleUnlock(sessionId)
           void drainQueue(ctx.userId)
+          if (await wasFinalForwardedWithGrace(sessionId, extractSendFileMarkers(turn.text).text)) {
+            console.log(`[bridge] 接管前抢救：结果已实时转发，跳过重复投递 session=${sessionId}`)
+            return
+          }
           // 投递失败不得上抛：账已结清，补投失败由 deliver 层自己的重试/降级负责
           await safeDeliver(ctx, `你发新消息前，上一个任务已经做完了，结果如下：\n\n${turn.text}`).catch(() => {})
           console.log(`[bridge] 接管前抢救：后台回合已完成且未投递，结果已补投 session=${sessionId}`)
@@ -451,6 +561,14 @@ export function createBridge(
       try {
         const listJson = await client.session.messages({ path: { id: sessionId } })
         const { text } = classifyNow(listJson)
+        if (text && await wasFinalForwardedWithGrace(sessionId, extractSendFileMarkers(text).text)) {
+          console.log(`[feedback] 后台最终答复已实时转发，跳过重复投递 session=${sessionId}`)
+          return
+        }
+        if (!text && stepForwarder.hasForwarded(sessionId)) {
+          console.log(`[feedback] 后台回合过程文本已实时转发，跳过空结果通知 session=${sessionId}`)
+          return
+        }
         await safeDeliver(
           ctx,
           text
@@ -1409,22 +1527,27 @@ export function createBridge(
         }
 
         if (replyText.trim()) {
-          // 缺口 4：AI 主动发文件——QQ_SEND_FILE 标记行拦截发送文件，剩余文本照送
           const extracted = extractSendFileMarkers(replyText)
-          for (const p of extracted.paths) {
-            try {
-              const done = await sendLocalFile(ctx, p, {
-                getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
-              })
-              await safeDeliver(ctx, `${done}`)
-            } catch (error) {
-              await safeDeliver(ctx, `警告：发送文件失败（${p}）：${error instanceof Error ? error.message : error}`)
+          if (await wasFinalForwardedWithGrace(sessionId, extracted.text)) {
+            // 2026-11-12：最终 step 已在 step.ended 时实时发给用户，收尾不再重发
+            console.log(`[feedback] 最终答复已实时转发，跳过重复投递 session=${sessionId}`)
+          } else {
+            // 缺口 4：AI 主动发文件——QQ_SEND_FILE 标记行拦截发送文件，剩余文本照送
+            for (const p of extracted.paths) {
+              try {
+                const done = await sendLocalFile(ctx, p, {
+                  getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
+                })
+                await safeDeliver(ctx, `${done}`)
+              } catch (error) {
+                await safeDeliver(ctx, `警告：发送文件失败（${p}）：${error instanceof Error ? error.message : error}`)
+              }
             }
+            // 超长回合可能已超被动窗口：deliver 被动失败自动降级主动，答案不丢
+            // 直答出口统一脱敏（DEF-qqbot-20261106-2）：与 history/mirror/form 同一脱敏器，
+            // 防 AI 复述的密钥/令牌经直答气泡明文外泄。
+            if (extracted.text) await safeDeliver(ctx, redactSecrets(extracted.text))
           }
-          // 超长回合可能已超被动窗口：deliver 被动失败自动降级主动，答案不丢
-          // 直答出口统一脱敏（DEF-qqbot-20261106-2）：与 history/mirror/form 同一脱敏器，
-          // 防 AI 复述的密钥/令牌经直答气泡明文外泄。
-          if (extracted.text) await safeDeliver(ctx, redactSecrets(extracted.text))
         }
         settleInflight(trackId, undefined, "answered") // R 项：回合处理到终态（答案已投递尝试），销账
       } catch (error) {
