@@ -19,12 +19,10 @@ import { SessionManager } from "./opencode/sessions.js"
 import {
   buildHelpText,
   handleCommand,
-  handlePendingSelection,
   isCommand,
   type CommandContext,
   type LedgerApi,
   type MirrorApi,
-  type PendingSelection,
   type WatchApi,
 } from "./commands.js"
 import { createMirror } from "./core/mirror.js"
@@ -192,8 +190,6 @@ export function createBridge(
   // Persist greeted users to disk so restarting the bot doesn't re-send the
   // full command list to every user on their next message.
   const greeted = loadGreetedSet()
-  const pendingSelections = new Map<string, PendingSelection>()
-
   // ===== 实时观察 / 回合过程推送 =====
   // 单条 SSE 连接按 sessionID 分流，多订阅者共享（同会话同 userId Set 去重不双发）。
   // 里程碑投递 = /watch 专属（2026-10-14 拍板）；sessionSubs 只管 SSE 活性与去重。
@@ -1231,7 +1227,6 @@ export function createBridge(
     client,
     sessions,
     getAccessToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
-    pendingSelections,
     watch: watchApi,
     mirror: mirrorApi,
     queue: queueApi,
@@ -1332,13 +1327,6 @@ export function createBridge(
       if (isCommand(content)) {
         const reply = await handleCommand(ctx, commandContext)
         await notifyUser(ctx, reply)
-        releaseClaimed("dropped")
-        return
-      }
-
-      const pendingReply = await maybeHandlePendingSelection(ctx, commandContext)
-      if (pendingReply !== null) {
-        await notifyUser(ctx, pendingReply)
         releaseClaimed("dropped")
         return
       }
@@ -1841,28 +1829,6 @@ export async function fetchRecoveryMessages(client: OpencodeClient, sessionId: s
     cursor = next
   }
   return all
-}
-
-async function maybeHandlePendingSelection(
-  ctx: MessageContext,
-  commandContext: CommandContext,
-): Promise<string | null> {
-  const pending = commandContext.pendingSelections.get(ctx.userId)
-  if (!pending) {
-    return null
-  }
-
-  if (pending.expiresAt <= Date.now()) {
-    commandContext.pendingSelections.delete(ctx.userId)
-    return null
-  }
-
-  if (!/^\d+$/.test(ctx.content.trim())) {
-    commandContext.pendingSelections.delete(ctx.userId)
-    return null
-  }
-
-  return handlePendingSelection(ctx.userId, Number(ctx.content.trim()), commandContext)
 }
 
 // R2-P1-1（2026-10-14）：空名单 fail-closed——配置缺失时宁可全拒，不静默

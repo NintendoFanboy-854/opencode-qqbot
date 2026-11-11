@@ -1,5 +1,5 @@
 // @input:  ./config, ./qq/types, ./opencode/* (client, sessions)
-// @output: isCommand, handleCommand, handlePendingSelection, CommandContext, PendingSelection
+// @output: isCommand, handleCommand, CommandContext
 // @pos:    根层 - 命令系统: /new /stop /status /sessions /help /model /agent /rename
 import type { Config } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
@@ -7,7 +7,6 @@ import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
 import { renderHistory } from "./opencode/history.js"
 import { SessionManager } from "./opencode/sessions.js"
 import { sendLocalFile } from "./core/send-media.js"
-const SELECTION_TTL_MS = Number.POSITIVE_INFINITY // 2026-11-10：序号选择不再过期
 
 // 观察模式 API（bridge 实现：SSE 订阅 + 里程碑推送）
 export interface WatchApi {
@@ -53,7 +52,6 @@ export interface CommandContext {
   /** ACP 传输适配（transport=acp 时注入；命令面与会话/模型/agent/取消走 ACP）。 */
   acp?: CommandAcpApi
   getAccessToken: () => Promise<string>
-  pendingSelections: Map<string, PendingSelection>
   watch: WatchApi
   mirror: MirrorApi
   queue: QueueApi
@@ -61,12 +59,6 @@ export interface CommandContext {
   progress: ProgressApi
   /** P1 防线 B：/cancel 彻底复位（清队列+abort+杀后台等待+结清在途账+drain） */
   stopAll: (userId: string) => Promise<{ cleared: number; title: string | undefined }>
-}
-
-export interface PendingSelection {
-  type: "session" | "model"
-  items: Array<{ id: string; label: string; directory?: string }>
-  expiresAt: number
 }
 
 /** ACP 命令适配（与 REST 的 sessions/client 同语义的最小面）。 */
@@ -104,8 +96,6 @@ export function isCommand(content: string): boolean {
 }
 
 export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
-  cmdCtx.pendingSelections.delete(ctx.userId)
-
   const parsed = parseCommand(ctx.content)
   if (!parsed) {
     return "不是有效命令"
@@ -118,7 +108,7 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
     case "cancel": // /cancel 与 /stop 同义（用户自然习惯 + pi-qqbot 同款，UAT S3 实证缺口）
       return handleStop(ctx, cmdCtx)
     case "sessions":
-      return handleSessions(ctx, cmdCtx)
+      return handleSessions(ctx, parsed.args, cmdCtx)
     case "queue":
     case "ledger":
     case "progress":
@@ -143,43 +133,6 @@ export async function handleCommand(ctx: MessageContext, cmdCtx: CommandContext)
     default:
       return `不支持的命令：/${parsed.name}\n发送 /help 查看可用命令`
   }
-}
-
-export async function handlePendingSelection(
-  userId: string,
-  selection: number,
-  cmdCtx: CommandContext,
-): Promise<string | null> {
-  const pending = cmdCtx.pendingSelections.get(userId)
-  if (!pending) {
-    return null
-  }
-
-  if (pending.expiresAt <= Date.now()) {
-    cmdCtx.pendingSelections.delete(userId)
-    return null
-  }
-
-  const item = pending.items[selection - 1]
-  if (!item) {
-    return `序号无效，请回复 1-${pending.items.length}`
-  }
-
-  cmdCtx.pendingSelections.delete(userId)
-
-  if (pending.type === "session") {
-    cmdCtx.sessions.switchSession(userId, item.id, item.label, item.directory)
-    return `已切换到会话：${item.label}`
-  }
-
-  const model = splitModelId(item.id)
-  if (!model) {
-    return `模型项无效：${item.label}`
-  }
-
-  await ensureSession(userId, cmdCtx)
-  await cmdCtx.sessions.setModel(userId, model.providerId, model.modelId, model.variant)
-  return `已切换模型：${model.providerId}/${model.modelId}${model.variant ? `#${model.variant}` : ""}`
 }
 
 function parseCommand(content: string): ParsedCommand | null {
@@ -280,54 +233,72 @@ async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promis
   return lines.join("\n")
 }
 
-async function handleSessions(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
+async function handleSessions(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
   const sessions = await listSessions(cmdCtx.client)
   if (sessions.length === 0) {
     return "当前没有可切换的历史会话"
   }
 
   const currentSessionId = cmdCtx.sessions.getSession(ctx.userId)?.sessionId
-  cmdCtx.pendingSelections.set(ctx.userId, {
-    type: "session",
-    items: sessions.map((session) => ({ id: session.id, label: session.title, directory: session.directory })),
-    expiresAt: Date.now() + SELECTION_TTL_MS,
-  })
+  const arg = args.trim()
+
+  // 2026-11-12：无状态切换——每次 /sessions <序号> 都重新拉列表，不依赖上一轮的待选择状态。
+  if (arg) {
+    if (!/^\d+$/.test(arg)) {
+      return "用法：/sessions（列会话）或 /sessions <序号>（直接切换）"
+    }
+    const target = sessions[Number(arg) - 1]
+    if (!target) {
+      return `序号无效，请发 1-${sessions.length}`
+    }
+    if (target.id === currentSessionId) {
+      return `已经是当前会话：${target.title}`
+    }
+    cmdCtx.sessions.switchSession(ctx.userId, target.id, target.title, target.directory)
+    return `已切换到会话：${target.title}`
+  }
 
   const lines = sessions.map((session, index) => {
     const prefix = session.id === currentSessionId ? "[当前] " : ""
     return `${index + 1}. ${prefix}${session.title}`
   })
 
-  return ["会话列表：", ...lines, "回复序号切换会话"].join("\n")
+  return ["会话列表：", ...lines, "发 /sessions <序号> 直接切换"].join("\n")
 }
 
 async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
-  const query = args.trim().toLowerCase()
-  if (!query || query === "all") {
+  const query = args.trim()
+  const listOnly = !query || query.toLowerCase() === "all"
+
+  // 2026-11-12：无状态选择——/model <序号> 每次重新拉列表，不依赖上一轮命令。
+  if (listOnly || /^\d+$/.test(query)) {
     const models = await listModels(cmdCtx.client)
     if (models.length === 0) {
       return "当前没有可用模型"
     }
 
-    const current = cmdCtx.sessions.getModel(ctx.userId)
+    if (listOnly) {
+      const current = cmdCtx.sessions.getModel(ctx.userId)
+      const lines = models.map((model, index) => {
+        const isCurrent =
+          current.providerId && current.modelId && `${current.providerId}/${current.modelId}` === model.id
+        return `${index + 1}. ${isCurrent ? "[当前] " : ""}${model.label}`
+      })
+      return ["可用模型：", ...lines, "发 /model <序号> 切换，或 /model <provider/model>#max 直接指定档位"].join("\n")
+    }
 
-    cmdCtx.pendingSelections.set(ctx.userId, {
-      type: "model",
-      items: models.map((model) => ({ id: model.id, label: model.label })),
-      expiresAt: Date.now() + SELECTION_TTL_MS,
-    })
-
-    const lines = models.map((model, index) => {
-      const isCurrent = current.providerId && current.modelId && `${current.providerId}/${current.modelId}` === model.id
-      return `${index + 1}. ${isCurrent ? "[当前] " : ""}${model.label}`
-    })
-
-    return ["可用模型：", ...lines, "回复序号切换，或 /model <provider/model>#max 直接指定档位"].join("\n")
-  }
-
-  if (/^\d+$/.test(query)) {
-    const result = await handlePendingSelection(ctx.userId, Number(query), cmdCtx)
-    return result ?? "没有待选择的模型列表，请先发送 /model"
+    const item = models[Number(query) - 1]
+    if (!item) {
+      return `序号无效，请发 1-${models.length}`
+    }
+    const selected = splitModelId(item.id)
+    if (!selected) {
+      return `模型项无效：${item.label}`
+    }
+    await ensureSession(ctx.userId, cmdCtx)
+    if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, selected.providerId, selected.modelId, selected.variant)
+    else await cmdCtx.sessions.setModel(ctx.userId, selected.providerId, selected.modelId, selected.variant)
+    return `已切换模型：${selected.providerId}/${selected.modelId}${selected.variant ? `#${selected.variant}` : ""}`
   }
 
   const model = splitModelId(args)
@@ -343,24 +314,27 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
 
 async function handleAgent(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
   const agents = await listAgents(cmdCtx.client)
-  if (!args) {
-    if (agents.length === 0) {
-      return "当前没有可用 Agent"
-    }
+  if (agents.length === 0) {
+    return "当前没有可用 Agent"
+  }
 
+  const arg = args.trim()
+  if (!arg) {
     const currentAgent = cmdCtx.sessions.getAgent(ctx.userId)
     const lines = agents.map((agent, index) => {
       const isCurrent = currentAgent === agent.id
       return `${index + 1}. ${isCurrent ? "[当前] " : ""}${agent.label}`
     })
 
-    return ["可用 Agent：", ...lines, "回复 /agent <name> 切换"].join("\n")
+    return ["可用 Agent：", ...lines, "发 /agent <序号> 或 /agent <name> 切换"].join("\n")
   }
 
-  const normalized = args.trim().toLowerCase()
-  const matched = agents.find((agent) => agent.id.toLowerCase() === normalized)
+  // 2026-11-12：无状态选择——数字按当前列表取，名字按 id 精确匹配。
+  const matched = /^\d+$/.test(arg)
+    ? agents[Number(arg) - 1]
+    : agents.find((agent) => agent.id.toLowerCase() === arg.toLowerCase())
   if (!matched) {
-    return `未找到 Agent：${args}`
+    return /^\d+$/.test(arg) ? `序号无效，请发 1-${agents.length}` : `未找到 Agent：${args}`
   }
 
   await ensureSession(ctx.userId, cmdCtx)
@@ -549,10 +523,10 @@ export function buildHelpText(): string {
     "/new - 开新会话",
     "/stop - 停下当前任务",
     "/status - 现在在干什么",
-    "/model - 换模型（支持 provider/model#max）",
-    "/agent - 换 Agent",
+    "/model [序号|provider/model#max] - 换模型",
+    "/agent [序号|名字] - 换 Agent",
     "/history [N] - 最近几轮对话",
-    "/sessions - 列出会话并回复序号切换",
+    "/sessions [序号] - 列出会话；带序号直接切换",
     "/send <路径> - 把文件发到 QQ",
     "/rename <名字> - 重命名当前会话",
     "需要审批时回复：允许 / 总是 / 拒绝",

@@ -30,7 +30,7 @@
 - 孤儿巡检（原来每分钟扫一遍，给你发"消息卡住了"）
 - 诊断命令 `/queue` `/ledger` `/progress` `/watch` `/mirror`
 - agent 配置里"读 .env 要审批"的规则
-- 序号选择 60 秒过期（现在不过期）
+- 裸数字选择（现在用 `/model 2`、`/sessions 2`、`/agent 2` 直接切换）
 
 **保留的**
 
@@ -82,10 +82,10 @@ bun run C:\Users\HuanChen\.config\opencode\plugins\opencode-qqbot\dist\openqq-bo
 /new     开新会话
 /stop    停下当前任务
 /status  现在在干什么（两行）
-/model   换模型，支持 provider/model#max
-/agent   换 Agent
+/model [序号|provider/model#max] 换模型
+/agent [序号|名字] 换 Agent
 /history 最近几轮对话
-/sessions 列出会话并回复序号切换
+/sessions [序号] 列出会话；带序号直接切换
 /send    把本地文件发到 QQ
 /rename  重命名当前会话
 ```
