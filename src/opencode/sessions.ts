@@ -21,6 +21,12 @@ interface UserSession {
 const STORE_DIR = join(homedir(), ".openqq")
 const STORE_FILE = join(STORE_DIR, "sessions.json")
 
+/** 服务端明确返回会话不存在（404）。其他错误（网络/鉴权/5xx）不算，避免误清新映射。 */
+export function isSessionNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b404\b|not found|不存在/i.test(message)
+}
+
 export class SessionManager {
   private sessions = new Map<string, UserSession>()
   private client: OpencodeClient
@@ -61,8 +67,17 @@ export class SessionManager {
   async getOrCreate(userId: string): Promise<UserSession> {
     const existing = this.sessions.get(userId)
     if (existing) {
-      await this.ensureDefaultAgent(userId)
-      return existing
+      // 2026-11-12：映射可能指向已被删除的会话（桌面端删除/外部清理）。先查一次；
+      // 只有服务端明确 404 才丢弃映射并自动新建，网络/鉴权错误保守保留。
+      if (await this.sessionExists(existing.sessionId)) {
+        await this.ensureDefaultAgent(userId)
+        return existing
+      }
+      console.log(
+        `[sessions] 会话已不存在，自动新建：user=${userId.slice(0, 8)}… old=${existing.sessionId}`,
+      )
+      this.sessions.delete(userId)
+      this.saveSessions()
     }
 
     const directory = this.peekInheritDirectory(userId)
@@ -282,6 +297,21 @@ export class SessionManager {
   // 已显式选择过 agent 的会话不覆盖（尊重 /agent 与目标会话自身设置）。
   private defaultAgent(): string {
     return process.env.QQ_AGENT?.trim() ?? ""
+  }
+
+  /** 服务端是否仍有这个会话；只有明确 404 才返回 false。 */
+  private async sessionExists(sessionId: string): Promise<boolean> {
+    try {
+      await this.client.session.get({ path: { id: sessionId } })
+      return true
+    } catch (error) {
+      if (isSessionNotFoundError(error)) return false
+      console.warn(
+        "[sessions] 会话存在性检查失败（保留映射）:",
+        error instanceof Error ? error.message : String(error),
+      )
+      return true
+    }
   }
 
   private async ensureDefaultAgent(userId: string): Promise<void> {
