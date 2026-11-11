@@ -201,105 +201,135 @@ export function createBridge(
   const sessionSubs = new Map<string, Set<string>>()   // sessionID -> userIds
   const sessionUnsubs = new Map<string, () => void>()  // sessionID -> SSE 退订
   // 2026-11-12：模型一轮里可以任意交错「文本 → 工具 → 文本 → 工具 → 最终输出」。
-  // 按 assistantMessageID 收集每个 step 的完整可见文本，在 step.ended 时逐段转发；
-  // 最终答复若已经实时转发，收尾时不再重发。reasoning（CoT）不转发，只发 text。
+  // session.text.ended 的语义就是「这一段文本已完整」，且早于工具执行结束；
+  // 因此收到一段就发一段，不合并、不等 step.ended。step.ended 只记录 finish 与兜底。
   const stepForwarder = new StepForwarder()
   const stepFetchInFlight = new Set<string>() // `${sessionID}:${messageID}`
-  const lateStepFlushQueued = new Set<string>()
-  const pendingStepFlush = new Map<string, Promise<void>>()
+  const pendingStepFlush = new Map<string, Set<Promise<void>>>()
+  const turnGeneration = new Map<string, number>() // 防止上一轮的异步 fetch 污染新一轮
+  const partSendChains = new Map<string, Promise<void>>() // 用户级串行链：一段一条，保序不合并
 
   const stepKey = (sessionID: string, messageID: string): string => `${sessionID}:${messageID}`
 
-  function forwardStepText(sessionID: string, messageID: string, finish: string, text: string): void {
-    if (!messageID || stepForwarder.isForwarded(sessionID, messageID)) return
+  function sendPartToUser(userId: string, text: string): void {
+    if (!text.trim()) return
+    const prev = partSendChains.get(userId) ?? Promise.resolve()
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        try {
+          await safeDeliver(ctxForUser(userId), text)
+        } catch (error) {
+          console.error("[feedback] part 发送失败:", toErrorMessage(error))
+        }
+      })
+    partSendChains.set(userId, next)
+    void next.finally(() => {
+      if (partSendChains.get(userId) === next) partSendChains.delete(userId)
+    })
+  }
+
+  function forwardPartText(
+    sessionID: string,
+    messageID: string,
+    ordinal: number,
+    finish: string,
+    text: string,
+  ): void {
+    if (!messageID) return
+    if (stepForwarder.isPartForwarded(sessionID, messageID, ordinal)) return
+    if (stepForwarder.isMessageFetched(sessionID, messageID)) return
     const users = [...(sessionSubs.get(sessionID) ?? [])]
     if (users.length === 0) return
     const extracted = extractSendFileMarkers(text)
     if (!extracted.text && extracted.paths.length === 0) return
     if (extracted.text) {
       const body = redactSecrets(extracted.text)
-      if (body) for (const userId of users) enqueuePush(userId, body)
+      if (body) for (const userId of users) sendPartToUser(userId, body)
     }
     for (const path of extracted.paths) {
       for (const userId of users) {
         void sendLocalFile(ctxForUser(userId), path, {
           getToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
         })
-          .then((done) => enqueuePush(userId, done))
+          .then((done) => sendPartToUser(userId, done))
           .catch((error) => {
-            enqueuePush(userId, `发送文件失败：${error instanceof Error ? error.message : String(error)}`)
+            sendPartToUser(userId, `发送文件失败：${error instanceof Error ? error.message : String(error)}`)
           })
       }
     }
-    stepForwarder.markForwarded(sessionID, messageID, finish, extracted.text)
-    console.log(`[feedback] step 已转发 mid=${messageID.slice(0, 12)}… finish=${finish || "?"}`)
+    stepForwarder.markPartForwarded(sessionID, messageID, ordinal, extracted.text)
+    console.log(
+      `[feedback] part 已转发 mid=${messageID.slice(0, 12)}… ordinal=${ordinal} finish=${finish || "?"}`,
+    )
   }
 
   function scheduleStepFetch(sessionID: string, messageID: string, finish: string): void {
     const key = stepKey(sessionID, messageID)
-    if (stepFetchInFlight.has(key)) return
+    if (stepFetchInFlight.has(key) || stepForwarder.isMessageFetched(sessionID, messageID)) return
+    const generation = turnGeneration.get(sessionID) ?? 0
+    const current = (): boolean => (turnGeneration.get(sessionID) ?? 0) === generation
     stepFetchInFlight.add(key)
     const p = (async () => {
       try {
         const res = await client.session.message({ path: { id: sessionID, messageID } })
+        if (!current()) return
         const content = Array.isArray(res?.data?.content) ? res.data.content : []
-        const said = content
-          .filter((part) => part?.type === "text")
-          .map((part) => String(part.text ?? ""))
-          .join("\n")
-          .trim()
-        if (said) {
-          forwardStepText(sessionID, messageID, finish, said)
-          return
+        const texts: string[] = []
+        let ordinal = 0
+        for (const part of content) {
+          if (part?.type !== "text") continue
+          const said = String(part.text ?? "")
+          texts.push(said)
+          if (said.trim()) forwardPartText(sessionID, messageID, ordinal, finish, said)
+          ordinal++
         }
-        const buffered = stepForwarder.collect(sessionID, messageID)
-        if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
+        // fetch 已覆盖整条消息：抑制随后到达的 text.ended，避免重复
+        if (texts.some((text) => text.trim())) {
+          stepForwarder.markFetched(sessionID, messageID, texts.join("\n").trim())
+        }
       } catch (error) {
+        if (!current()) return
         console.log("[feedback] 读取本步文本失败:", toErrorMessage(error))
-        const buffered = stepForwarder.collect(sessionID, messageID)
-        if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
+        for (const part of stepForwarder.pendingParts(sessionID)) {
+          if (part.messageID !== messageID) continue
+          forwardPartText(sessionID, messageID, part.ordinal, finish, part.text)
+        }
       } finally {
         stepFetchInFlight.delete(key)
-        // text.ended 恰好在 fetch 返回空之后到达：补一次缓冲兜底
-        if (!stepForwarder.isForwarded(sessionID, messageID)) {
-          const buffered = stepForwarder.collect(sessionID, messageID)
-          if (buffered) forwardStepText(sessionID, messageID, finish, buffered)
-        }
       }
     })().catch((error) => console.log("[feedback] 本步文本转发失败:", toErrorMessage(error)))
-    pendingStepFlush.set(sessionID, p)
+    let set = pendingStepFlush.get(sessionID)
+    if (!set) {
+      set = new Set()
+      pendingStepFlush.set(sessionID, set)
+    }
+    set.add(p)
     void p.finally(() => {
-      if (pendingStepFlush.get(sessionID) === p) pendingStepFlush.delete(sessionID)
+      set!.delete(p)
+      if (set!.size === 0 && pendingStepFlush.get(sessionID) === set) pendingStepFlush.delete(sessionID)
     })
   }
 
-  function scheduleLateStepFlush(sessionID: string, messageID: string, finish: string): void {
-    const key = stepKey(sessionID, messageID)
-    if (lateStepFlushQueued.has(key)) return
-    lateStepFlushQueued.add(key)
-    setTimeout(() => {
-      lateStepFlushQueued.delete(key)
-      if (stepForwarder.isForwarded(sessionID, messageID)) return
-      if (stepFetchInFlight.has(key)) return
-      const text = stepForwarder.collect(sessionID, messageID)
-      if (text) forwardStepText(sessionID, messageID, finish, text)
-    }, 0)
-  }
-
-  function flushBufferedSteps(sessionID: string, opts?: { skipInFlight?: boolean }): void {
-    for (const messageID of stepForwarder.pending(sessionID)) {
-      if (opts?.skipInFlight && stepFetchInFlight.has(stepKey(sessionID, messageID))) continue
-      const text = stepForwarder.collect(sessionID, messageID)
-      if (text) forwardStepText(sessionID, messageID, stepForwarder.finishOf(sessionID, messageID), text)
+  function flushPendingParts(sessionID: string): void {
+    for (const part of stepForwarder.pendingParts(sessionID)) {
+      if (stepForwarder.isMessageFetched(sessionID, part.messageID)) continue
+      forwardPartText(
+        sessionID,
+        part.messageID,
+        part.ordinal,
+        stepForwarder.finishOf(sessionID, part.messageID),
+        part.text,
+      )
     }
   }
 
   async function awaitStepFlush(sessionID: string): Promise<void> {
-    const p = pendingStepFlush.get(sessionID)
-    if (!p) return
+    const set = pendingStepFlush.get(sessionID)
+    if (!set || set.size === 0) return
     let timer: NodeJS.Timeout | undefined
     await Promise.race([
-      p.catch(() => {}),
+      Promise.allSettled([...set]),
       new Promise<void>((resolve) => {
         timer = setTimeout(resolve, 5000)
         timer.unref?.()
@@ -377,11 +407,11 @@ export function createBridge(
     sessionLastActivity.set(sessionID, Date.now())
     // Q2：本地工具统计（/progress 查询数据源，动作类才计——文件类不算进度）
     const d = (ev.data ?? {}) as Record<string, any>
-    // 2026-11-12：每个 step 的可见文本都转发；不再只发第一段。
+    // 2026-11-12：每个 text.ended 就是一段完整回复，收到即发；不合并、不等工具结束。
     if (ev.type === "session.execution.started") {
       stepForwarder.startTurn(sessionID)
+      turnGeneration.set(sessionID, (turnGeneration.get(sessionID) ?? 0) + 1)
       for (const key of [...stepFetchInFlight]) if (key.startsWith(`${sessionID}:`)) stepFetchInFlight.delete(key)
-      for (const key of [...lateStepFlushQueued]) if (key.startsWith(`${sessionID}:`)) lateStepFlushQueued.delete(key)
       pendingStepFlush.delete(sessionID)
     }
     if (ev.type === "session.text.ended") {
@@ -390,28 +420,22 @@ export function createBridge(
       const said = typeof d.text === "string" ? d.text : ""
       if (mid && said.trim()) {
         stepForwarder.addText(sessionID, mid, ordinal, said)
-        // text.ended 晚于 step.ended：等同一 tick 的 text 段收齐后补发
-        if (stepForwarder.isEnded(sessionID, mid) && !stepForwarder.isForwarded(sessionID, mid)) {
-          scheduleLateStepFlush(sessionID, mid, stepForwarder.finishOf(sessionID, mid))
-        }
+        forwardPartText(sessionID, mid, ordinal, "", said)
       }
     }
     if (ev.type === "session.step.ended") {
       const mid = typeof d.assistantMessageID === "string" ? d.assistantMessageID : ""
       const finish = typeof d.finish === "string" ? d.finish : ""
       if (mid) {
-        const buffered = stepForwarder.markEnded(sessionID, mid, finish)
-        if (buffered) {
-          forwardStepText(sessionID, mid, finish, buffered)
-        } else if (!stepForwarder.isForwarded(sessionID, mid)) {
-          // text.ended 没来或还没落库：读消息详情兜底
+        stepForwarder.markEnded(sessionID, mid, finish)
+        // 只有 text.ended 缺失时才读消息详情兜底
+        if (!stepForwarder.hasTextEvents(sessionID, mid) && !stepForwarder.isMessageFetched(sessionID, mid)) {
           scheduleStepFetch(sessionID, mid, finish)
         }
       }
     }
     if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed") {
-      // 成功时让在途 fetch 自己收尾；失败时立即把已缓冲的文本发出去
-      flushBufferedSteps(sessionID, { skipInFlight: ev.type === "session.execution.succeeded" })
+      flushPendingParts(sessionID)
     }
     if (ev.type === "session.tool.called" || ev.type === "session.tool.success") {
       const cmd = typeof d.input === "string" ? d.input : d.input?.command
