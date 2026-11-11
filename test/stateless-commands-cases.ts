@@ -48,8 +48,8 @@ const client = {
   model: {
     list: async () => ({
       data: [
-        { providerID: "p", id: "m1" },
-        { providerID: "p", id: "m2" },
+        { providerID: "p", id: "m1", variants: [{ id: "low" }, { id: "max" }] },
+        { providerID: "p", id: "m2", variants: [{ id: "high" }] },
       ],
     }),
   },
@@ -87,9 +87,37 @@ const ctx = (content: string): MessageContext => ({
 const r1 = await handleCommand(ctx("/sessions 2"), cmdCtx)
 check("直接 /sessions 2 生效", r1.includes("已切换到会话") && switched?.[0] === "u1" && switched?.[1] === "s2", r1)
 
-// 2. 不先发 /model，直接带序号切换
-const r2 = await handleCommand(ctx("/model 2"), cmdCtx)
-check("直接 /model 2 生效", r2.includes("已切换模型") && setModel?.[1] === "p" && setModel?.[2] === "m2", r2)
+// 2. 不先发 /model list，直接 select 切换
+setModel = null
+const r2 = await handleCommand(ctx("/model select 2"), cmdCtx)
+check("直接 /model select 2 生效", r2.includes("已切换模型") && setModel?.[1] === "p" && setModel?.[2] === "m2", r2)
+
+// 2b. /model 默认只显示当前模型，不展开全部；子命令只在回复里
+const r2a = await handleCommand(ctx("/model"), cmdCtx)
+check("model 默认只显示当前", r2a.includes("当前模型：p/m1") && !r2a.includes("p/m2"), r2a)
+check("model 面板显示 list/select", r2a.includes("/model list") && r2a.includes("/model select"), r2a)
+
+const r2b = await handleCommand(ctx("/model list"), cmdCtx)
+check("model list 显示全部和强度", r2b.includes("p/m1 [low|max]") && r2b.includes("p/m2 [high]"), r2b)
+
+setModel = null
+const r2c = await handleCommand(ctx("/model select 2 high"), cmdCtx)
+check(
+  "model select 带强度",
+  r2c.includes("#high") && setModel?.[2] === "m2" && setModel?.[3] === "high",
+  r2c,
+)
+
+const r2d = await handleCommand(ctx("/model select 2 low"), cmdCtx)
+check("model 强度无效", r2d.includes("强度无效"), r2d)
+
+setModel = null
+const r2e = await handleCommand(ctx("/model select 1#max"), cmdCtx)
+check(
+  "model select 序号#强度",
+  r2e.includes("#max") && setModel?.[2] === "m1" && setModel?.[3] === "max",
+  r2e,
+)
 
 // 3. 不先发 /agent，直接带序号切换
 const r3 = await handleCommand(ctx("/agent 2"), cmdCtx)
@@ -101,9 +129,10 @@ check("列表提示命令带序号", r4.includes("/sessions <序号>"), r4)
 check("sessions 回复里有删除子命令", r4.includes("/sessions del <序号>"), r4)
 const help = await handleCommand(ctx("/help"), cmdCtx)
 check("help 不展开 sessions 子命令", !help.includes("/sessions del"), help)
+check("help 不展开 model 子命令", !help.includes("/model list") && !help.includes("/model select"), help)
 
 // 5. 序号越界有明确错误
-const r5 = await handleCommand(ctx("/model 99"), cmdCtx)
+const r5 = await handleCommand(ctx("/model select 99"), cmdCtx)
 check("模型序号越界", r5.includes("序号无效"), r5)
 const r6 = await handleCommand(ctx("/agent 99"), cmdCtx)
 check("Agent 序号越界", r6.includes("序号无效"), r6)
@@ -124,6 +153,10 @@ const r9 = await handleCommand(ctx("/sessions del 99"), cmdCtx)
 check("删除序号越界", r9.includes("序号无效"), r9)
 const r10 = await handleCommand(ctx("/sessions del"), cmdCtx)
 check("删除缺少序号", r10.includes("用法"), r10)
+
+// 10. /model select 缺少参数
+const r11 = await handleCommand(ctx("/model select"), cmdCtx)
+check("model select 缺少参数", r11.includes("用法"), r11)
 
 for (const [name, ok, detail] of results) {
   console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : ` — ${detail}`}`)

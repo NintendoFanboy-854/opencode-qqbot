@@ -82,7 +82,7 @@ bun run C:\Users\HuanChen\.config\opencode\plugins\opencode-qqbot\dist\openqq-bo
 /new     开新会话
 /stop    停下当前任务
 /status  现在在干什么（两行）
-/model [序号|provider/model#max] 换模型
+/model 查看/切换模型
 /agent [序号|名字] 换 Agent
 /history 最近几轮对话
 /sessions 列出/切换会话
@@ -90,7 +90,7 @@ bun run C:\Users\HuanChen\.config\opencode\plugins\opencode-qqbot\dist\openqq-bo
 /rename  重命名当前会话
 ```
 
-`/sessions` 的回复里会显示切换和删除的具体用法。
+`/sessions` 的回复里会显示切换和删除的具体用法；`/model` 的回复里会显示 `list` / `select` 和强度用法。
 
 审批时回复：`允许` / `总是` / `拒绝`。
 
@@ -111,7 +111,12 @@ bun run C:\Users\HuanChen\.config\opencode\plugins\opencode-qqbot\dist\openqq-bo
 curl.exe -X POST http://127.0.0.1:28894/api/location/reload -u "opencode:<口令>" -H "Content-Type: application/json" -d "{}"
 ```
 
-只想换当前会话：直接发 `/model opencode/deepseek-v4.1-flash-free#max`。
+只换当前会话：
+
+- 只看当前模型：`/model`
+- 看全部模型和强度：`/model list`
+- 按序号切换：`/model select <序号> [强度]`
+- 直接指定：`/model select opencode/deepseek-v4.1-flash-free#max`
 
 ---
 

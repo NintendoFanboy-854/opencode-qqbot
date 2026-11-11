@@ -84,6 +84,8 @@ interface ListedSession {
 interface ListedModel {
   id: string
   label: string
+  /** 模型强度档位（low/high/max…）；空数组=该模型没有档位 */
+  variants: string[]
 }
 
 interface ListedAgent {
@@ -295,49 +297,91 @@ async function handleSessions(ctx: MessageContext, args: string, cmdCtx: Command
 }
 
 async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
-  const query = args.trim()
-  const listOnly = !query || query.toLowerCase() === "all"
+  const arg = args.trim()
+  const lower = arg.toLowerCase()
+  const parts = arg.split(/\s+/).filter(Boolean)
+  const sub = parts[0]?.toLowerCase() ?? ""
 
-  // 2026-11-12：无状态选择——/model <序号> 每次重新拉列表，不依赖上一轮命令。
-  if (listOnly || /^\d+$/.test(query)) {
-    const models = await listModels(cmdCtx.client)
-    if (models.length === 0) {
-      return "当前没有可用模型"
-    }
+  const currentLabel = (): string => {
+    const current = cmdCtx.sessions.getModel(ctx.userId)
+    return current.providerId && current.modelId
+      ? `${current.providerId}/${current.modelId}${current.variant ? `#${current.variant}` : ""}`
+      : "默认"
+  }
 
-    if (listOnly) {
-      const current = cmdCtx.sessions.getModel(ctx.userId)
-      const lines = models.map((model, index) => {
-        const isCurrent =
-          current.providerId && current.modelId && `${current.providerId}/${current.modelId}` === model.id
-        return `${index + 1}. ${isCurrent ? "[当前] " : ""}${model.label}`
-      })
-      return ["可用模型：", ...lines, "发 /model <序号> 切换，或 /model <provider/model>#max 直接指定档位"].join("\n")
-    }
-
-    const item = models[Number(query) - 1]
-    if (!item) {
-      return `序号无效，请发 1-${models.length}`
-    }
-    const selected = splitModelId(item.id)
-    if (!selected) {
-      return `模型项无效：${item.label}`
-    }
+  const applyModel = async (selected: { providerId: string; modelId: string; variant?: string }): Promise<string> => {
     await ensureSession(ctx.userId, cmdCtx)
     if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, selected.providerId, selected.modelId, selected.variant)
     else await cmdCtx.sessions.setModel(ctx.userId, selected.providerId, selected.modelId, selected.variant)
     return `已切换模型：${selected.providerId}/${selected.modelId}${selected.variant ? `#${selected.variant}` : ""}`
   }
 
-  const model = splitModelId(args)
-  if (!model) {
-    return "模型格式不对，请使用 /model <provider/model>，档位用 #max"
+  // 2026-11-12：无状态选择——每次 select 重新拉列表，不依赖上一轮命令。
+  const applyByIndex = async (index: number, strength?: string): Promise<string> => {
+    const models = await listModels(cmdCtx.client)
+    if (models.length === 0) return "当前没有可用模型"
+    const item = models[index - 1]
+    if (!item) return `序号无效，请发 1-${models.length}`
+    const selected = splitModelId(item.id)
+    if (!selected) return `模型项无效：${item.label}`
+    if (strength) {
+      if (item.variants.length === 0) return `该模型没有强度档位：${item.label}`
+      if (!item.variants.includes(strength)) return `强度无效，可选：${item.variants.join(" / ")}`
+      selected.variant = strength
+    }
+    return applyModel(selected)
   }
 
-  await ensureSession(ctx.userId, cmdCtx)
-  if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, model.providerId, model.modelId, model.variant)
-  else await cmdCtx.sessions.setModel(ctx.userId, model.providerId, model.modelId, model.variant)
-  return `已切换模型：${model.providerId}/${model.modelId}${model.variant ? `#${model.variant}` : ""}`
+  if (!arg) {
+    return [
+      `当前模型：${currentLabel()}`,
+      "发 /model list 查看全部模型",
+      "发 /model select <序号> [强度] 切换",
+    ].join("\n")
+  }
+
+  if (sub === "list" || lower === "all") {
+    const models = await listModels(cmdCtx.client)
+    if (models.length === 0) return "当前没有可用模型"
+    const current = cmdCtx.sessions.getModel(ctx.userId)
+    const lines = models.map((model, index) => {
+      const isCurrent =
+        current.providerId && current.modelId && `${current.providerId}/${current.modelId}` === model.id
+      return `${index + 1}. ${isCurrent ? "[当前] " : ""}${model.label}`
+    })
+    const hasVariants = models.some((model) => model.variants.length > 0)
+    return [
+      "可用模型：",
+      ...lines,
+      hasVariants ? "发 /model select <序号> [强度] 切换（强度见方括号）" : "发 /model select <序号> 切换",
+    ].join("\n")
+  }
+
+  if (sub === "select") {
+    const target = parts.slice(1).join(" ").trim()
+    if (!target) return "用法：/model select <序号> [强度] 或 /model select <provider/model#max>"
+    const tokens = target.split(/\s+/).filter(Boolean)
+    const first = tokens[0] ?? ""
+    const attached = /^(\d+)#(.+)$/.exec(first)
+    if (attached) {
+      if (tokens.length > 1) return "用法：/model select <序号> [强度]"
+      return applyByIndex(Number(attached[1]), attached[2])
+    }
+    if (/^\d+$/.test(first)) {
+      if (tokens.length > 2) return "用法：/model select <序号> [强度]"
+      return applyByIndex(Number(first), tokens[1])
+    }
+    const selected = splitModelId(target)
+    if (!selected) return "模型格式不对，请使用 /model select <序号> [强度] 或 /model select <provider/model#max>"
+    return applyModel(selected)
+  }
+
+  // 兼容旧写法：/model <provider/model#max>
+  const legacy = splitModelId(arg)
+  if (!legacy) {
+    return "用法：/model、/model list、/model select <序号> [强度]"
+  }
+  return applyModel(legacy)
 }
 
 async function handleAgent(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
@@ -473,7 +517,7 @@ async function listModels(client: OpencodeClient): Promise<ListedModel[]> {
         ? rawVariants.map((v) => (isRecord(v) ? getString(v, "id") : undefined)).filter((v): v is string => !!v)
         : []
       const suffix = variants.length > 0 ? ` [${variants.join("|")}]` : ""
-      models.push({ id: `${providerId}/${modelId}`, label: `${providerId}/${modelId}${suffix}` })
+      models.push({ id: `${providerId}/${modelId}`, label: `${providerId}/${modelId}${suffix}`, variants })
     }
     if (models.length > 0) return models
   }
@@ -497,6 +541,7 @@ async function listModels(client: OpencodeClient): Promise<ListedModel[]> {
       models.push({
         id: `${providerId}/${modelId}`,
         label: `${providerId}/${modelId}`,
+        variants: [],
       })
     }
   }
@@ -551,7 +596,7 @@ export function buildHelpText(): string {
     "/new - 开新会话",
     "/stop - 停下当前任务",
     "/status - 现在在干什么",
-    "/model [序号|provider/model#max] - 换模型",
+    "/model - 查看/切换模型",
     "/agent [序号|名字] - 换 Agent",
     "/history [N] - 最近几轮对话",
     "/sessions - 列出/切换会话",
