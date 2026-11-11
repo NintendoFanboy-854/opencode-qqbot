@@ -128,6 +128,8 @@ export interface OpencodeClient {
     setAgent(opts: { path: { id: string }; body: { agent: string } }): Promise<unknown>
     /** 会话改名（PATCH /session/{id}）；服务端才是权威标题 */
     update(opts: { path: { id: string }; body: { title?: string } }): Promise<unknown>
+    /** 删除会话（DELETE /session/{id}） */
+    delete(opts: { path: { id: string } }): Promise<unknown>
   }
   permission: {
     list(): Promise<{ data?: PermissionRequest[] }>
@@ -395,6 +397,9 @@ export function createClient(baseUrl: string): OpencodeClient {
       },
       async update(opts) {
         return json(await req(`/session/${opts.path.id}`, { method: "PATCH", body: JSON.stringify(opts.body) }))
+      },
+      async delete(opts) {
+        return json(await req(`/session/${opts.path.id}`, { method: "DELETE" }))
       },
     },
 

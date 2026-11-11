@@ -240,14 +240,37 @@ async function handleSessions(ctx: MessageContext, args: string, cmdCtx: Command
   }
 
   const currentSessionId = cmdCtx.sessions.getSession(ctx.userId)?.sessionId
-  const arg = args.trim()
+  const parts = args.trim().split(/\s+/).filter(Boolean)
+  const head = parts[0]?.toLowerCase() ?? ""
+
+  // 2026-11-12：删除也是无状态——/sessions del <序号> 直接重新拉列表并删除。
+  if (head === "del" || head === "delete" || head === "rm") {
+    const raw = parts[1] ?? ""
+    if (!/^\d+$/.test(raw)) {
+      return "用法：/sessions del <序号>"
+    }
+    const target = sessions[Number(raw) - 1]
+    if (!target) {
+      return `序号无效，请发 1-${sessions.length}`
+    }
+    if (target.id === currentSessionId) {
+      return "不能删除当前会话；先发 /sessions <序号> 切到别的会话再删"
+    }
+    try {
+      await cmdCtx.client.session.delete({ path: { id: target.id } })
+    } catch (error) {
+      return `删除会话失败：${toErrorMessage(error)}`
+    }
+    const cleared = cmdCtx.sessions.forgetBySessionId(target.id)
+    return `已删除会话：${target.title}${cleared > 0 ? `（已清理 ${cleared} 个绑定）` : ""}`
+  }
 
   // 2026-11-12：无状态切换——每次 /sessions <序号> 都重新拉列表，不依赖上一轮的待选择状态。
-  if (arg) {
-    if (!/^\d+$/.test(arg)) {
-      return "用法：/sessions（列会话）或 /sessions <序号>（直接切换）"
+  if (head) {
+    if (!/^\d+$/.test(head)) {
+      return "用法：/sessions、/sessions <序号>、/sessions del <序号>"
     }
-    const target = sessions[Number(arg) - 1]
+    const target = sessions[Number(head) - 1]
     if (!target) {
       return `序号无效，请发 1-${sessions.length}`
     }
@@ -263,7 +286,12 @@ async function handleSessions(ctx: MessageContext, args: string, cmdCtx: Command
     return `${index + 1}. ${prefix}${session.title}`
   })
 
-  return ["会话列表：", ...lines, "发 /sessions <序号> 直接切换"].join("\n")
+  return [
+    "会话列表：",
+    ...lines,
+    "发 /sessions <序号> 切换",
+    "发 /sessions del <序号> 删除",
+  ].join("\n")
 }
 
 async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandContext): Promise<string> {
@@ -526,7 +554,7 @@ export function buildHelpText(): string {
     "/model [序号|provider/model#max] - 换模型",
     "/agent [序号|名字] - 换 Agent",
     "/history [N] - 最近几轮对话",
-    "/sessions [序号] - 列出会话；带序号直接切换",
+    "/sessions - 列出/切换会话",
     "/send <路径> - 把文件发到 QQ",
     "/rename <名字> - 重命名当前会话",
     "需要审批时回复：允许 / 总是 / 拒绝",

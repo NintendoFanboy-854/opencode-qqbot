@@ -175,6 +175,18 @@ export class SessionManager {
     return this.sessions.get(userId)
   }
 
+  /** 服务端会话已删除：清掉所有指向它的用户映射，避免下一条消息打到死会话。 */
+  forgetBySessionId(sessionId: string): number {
+    let removed = 0
+    for (const [userId, session] of this.sessions) {
+      if (session.sessionId !== sessionId) continue
+      this.sessions.delete(userId)
+      removed++
+    }
+    if (removed > 0) this.saveSessions()
+    return removed
+  }
+
   // ===== 项目归属继承链（2026-11-09 缺陷修复：孤儿会话 desktop 不可见）=====
   // 根因：此前 session.create({}) 空体创建 → location.directory 为空 → desktop 端
   // 会话不归任何项目（location 是 desktop 会话列表与配置链、服务加载的单位）。

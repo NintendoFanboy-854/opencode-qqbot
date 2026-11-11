@@ -85,10 +85,12 @@ bun run C:\Users\HuanChen\.config\opencode\plugins\opencode-qqbot\dist\openqq-bo
 /model [序号|provider/model#max] 换模型
 /agent [序号|名字] 换 Agent
 /history 最近几轮对话
-/sessions [序号] 列出会话；带序号直接切换
+/sessions 列出/切换会话
 /send    把本地文件发到 QQ
 /rename  重命名当前会话
 ```
+
+`/sessions` 的回复里会显示切换和删除的具体用法。
 
 审批时回复：`允许` / `总是` / `拒绝`。
 
