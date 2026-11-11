@@ -15,7 +15,7 @@ import { createEventStream, type V2Event } from "./opencode/eventstream.js"
 import { createAcpSessionRunner, isAcpPromptBusy, isAcpPromptTimeout } from "./opencode/acp-session.js"
 import { readTransportSetting } from "./core/transport-setting.js"
 import { summarizeInput, redactSecrets } from "./opencode/history.js"
-import { SessionManager } from "./opencode/sessions.js"
+import { SessionManager, type SessionRecoveryInfo } from "./opencode/sessions.js"
 import {
   buildHelpText,
   handleCommand,
@@ -704,6 +704,17 @@ export function createBridge(
     }
   }
 
+  // 2026-11-12：会话丢失后自动新建——显式提醒用户，但只走 QQ 通知通道，
+  // 不拼进 prompt、不写入模型上下文，避免模型把这条系统提示当成用户输入。
+  const notifySessionRecovered = (info: SessionRecoveryInfo): void => {
+    const ctx = ctxForUser(info.userId)
+    const old = info.oldTitle ? `「${info.oldTitle}」` : info.oldSessionId.slice(0, 12)
+    void safeDeliver(
+      ctx,
+      `提示：原会话 ${old} 已不存在，已自动新建会话。旧对话上下文不会带入新会话。`,
+    ).catch((error) => console.warn("[sessions] 恢复通知发送失败:", toErrorMessage(error)))
+  }
+
   // O7b：审批域门面（挂起槽/等待/裁决/跨重启恢复全在 core/permission.ts）
   const perm = createPermissionGate({
     client,
@@ -1227,6 +1238,7 @@ export function createBridge(
     client,
     sessions,
     getAccessToken: () => getAccessToken(config.qq.appId, config.qq.clientSecret),
+    onSessionRecovered: notifySessionRecovered,
     watch: watchApi,
     mirror: mirrorApi,
     queue: queueApi,
@@ -1445,7 +1457,7 @@ export function createBridge(
         const session =
           TRANSPORT === "acp" && acpRunner
             ? { sessionId: await acpRunner.getOrCreate(ctx.userId) }
-            : await sessions.getOrCreate(ctx.userId)
+            : await sessions.getOrCreate(ctx.userId, { onRecovered: notifySessionRecovered })
         sessionId = session.sessionId
         sessionLastActivity.set(sessionId, Date.now())
 

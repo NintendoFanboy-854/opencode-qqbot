@@ -11,6 +11,8 @@ let setModel: unknown[] | null = null
 let setAgent: unknown[] | null = null
 let deleted: string | null = null
 let forgotten: string | null = null
+let recoveredInfo: { oldSessionId?: string; newSessionId?: string } | null = null
+let simulateRecovery = false
 
 const sessions = {
   getSession: () => ({ sessionId: "s1", title: "One", directory: "C:\\a" }),
@@ -29,7 +31,20 @@ const sessions = {
   setAgent: async (...args: unknown[]) => {
     setAgent = args
   },
-  getOrCreate: async () => ({ sessionId: "s1", title: "One" }),
+  getOrCreate: async (
+    userId: string,
+    opts?: { onRecovered?: (info: { userId: string; oldSessionId: string; oldTitle?: string; newSessionId: string }) => void },
+  ) => {
+    if (simulateRecovery) {
+      opts?.onRecovered?.({
+        userId,
+        oldSessionId: "old-session",
+        oldTitle: "Old",
+        newSessionId: "s1",
+      })
+    }
+    return { sessionId: "s1", title: "One" }
+  },
 }
 
 const client = {
@@ -44,6 +59,18 @@ const client = {
       deleted = opts.path.id
       return null
     },
+    get: async () => ({ data: { id: "s1", title: "One", agent: "qqbot" } }),
+  },
+  config: {
+    get: async () => [
+      {
+        type: "document",
+        path: "C:\\Users\\HuanChen\\.config\\opencode\\opencode.json",
+        info: {
+          model: { providerID: "opencode", model: "deepseek-v4.1-flash-free", variant: "max" },
+        },
+      },
+    ],
   },
   model: {
     list: async () => ({
@@ -67,6 +94,9 @@ const cmdCtx = {
   client,
   sessions,
   getAccessToken: async () => "token",
+  onSessionRecovered: (info: { oldSessionId?: string; newSessionId?: string }) => {
+    recoveredInfo = info
+  },
   watch: {},
   mirror: {},
   queue: {},
@@ -83,6 +113,12 @@ const ctx = (content: string): MessageContext => ({
   timestamp: String(Date.now()),
 })
 
+// 本地映射没有 model 时，/model 和 /status 要能解析出真实生效的全局模型
+const cmdCtxNoModel = {
+  ...cmdCtx,
+  sessions: { ...sessions, getModel: () => ({}) },
+} as unknown as CommandContext
+
 // 1. 不先发 /sessions，直接带序号切换
 const r1 = await handleCommand(ctx("/sessions 2"), cmdCtx)
 check("直接 /sessions 2 生效", r1.includes("已切换到会话") && switched?.[0] === "u1" && switched?.[1] === "s2", r1)
@@ -96,6 +132,19 @@ check("直接 /model select 2 生效", r2.includes("已切换模型") && setMode
 const r2a = await handleCommand(ctx("/model"), cmdCtx)
 check("model 默认只显示当前", r2a.includes("当前模型：p/m1") && !r2a.includes("p/m2"), r2a)
 check("model 面板显示 list/select", r2a.includes("/model list") && r2a.includes("/model select"), r2a)
+
+const r2aFallback = await handleCommand(ctx("/model"), cmdCtxNoModel)
+check(
+  "model 映射无 model 时解析全局模型",
+  r2aFallback.includes("当前模型：opencode/deepseek-v4.1-flash-free#max"),
+  r2aFallback,
+)
+const statusFallback = await handleCommand(ctx("/status"), cmdCtxNoModel)
+check(
+  "status 映射无 model 时解析全局模型",
+  statusFallback.includes("opencode/deepseek-v4.1-flash-free#max"),
+  statusFallback,
+)
 
 const r2b = await handleCommand(ctx("/model list"), cmdCtx)
 check("model list 显示全部和强度", r2b.includes("p/m1 [low|max]") && r2b.includes("p/m2 [high]"), r2b)
@@ -157,6 +206,16 @@ check("删除缺少序号", r10.includes("用法"), r10)
 // 10. /model select 缺少参数
 const r11 = await handleCommand(ctx("/model select"), cmdCtx)
 check("model select 缺少参数", r11.includes("用法"), r11)
+
+// 11. 命令路径触发会话恢复时，必须回调通知 hook（bridge 再发独立 QQ 消息）
+simulateRecovery = true
+recoveredInfo = null
+await handleCommand(ctx("/model select 2"), cmdCtx)
+check(
+  "命令触发的会话恢复通知",
+  recoveredInfo?.oldSessionId === "old-session" && recoveredInfo?.newSessionId === "s1",
+  JSON.stringify(recoveredInfo),
+)
 
 for (const [name, ok, detail] of results) {
   console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : ` — ${detail}`}`)

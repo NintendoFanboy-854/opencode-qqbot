@@ -149,6 +149,8 @@ export interface OpencodeClient {
     list(): Promise<{ data?: unknown[] }>
   }
   config: {
+    /** 配置文档（含全局默认 model / agents 配置） */
+    get(): Promise<unknown>
     providers(): Promise<{ data?: unknown[] }>
   }
   // Send a prompt and poll until the assistant reply for THIS prompt is done.
@@ -447,6 +449,9 @@ export function createClient(baseUrl: string): OpencodeClient {
     },
 
     config: {
+      async get() {
+        return json(await req("/config"))
+      },
       async providers() {
         // V2 exposes a flat model list at GET /model. Group by provider to match
         // the shape the /model command expects: { data: [ { id, models: [ { id } ] } ] }.

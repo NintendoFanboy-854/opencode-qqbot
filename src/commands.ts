@@ -5,7 +5,7 @@ import type { Config } from "./config.js"
 import type { MessageContext } from "./qq/types.js"
 import type { OpencodeClient, SessionMessage } from "./opencode/client.js"
 import { renderHistory } from "./opencode/history.js"
-import { SessionManager } from "./opencode/sessions.js"
+import { SessionManager, type SessionRecoveryInfo } from "./opencode/sessions.js"
 import { sendLocalFile } from "./core/send-media.js"
 
 // 观察模式 API（bridge 实现：SSE 订阅 + 里程碑推送）
@@ -52,6 +52,8 @@ export interface CommandContext {
   /** ACP 传输适配（transport=acp 时注入；命令面与会话/模型/agent/取消走 ACP）。 */
   acp?: CommandAcpApi
   getAccessToken: () => Promise<string>
+  /** 会话丢失后自动新建时，由 bridge 发独立 QQ 通知（不进模型上下文）。 */
+  onSessionRecovered?: (info: SessionRecoveryInfo) => void
   watch: WatchApi
   mirror: MirrorApi
   queue: QueueApi
@@ -86,6 +88,13 @@ interface ListedModel {
   label: string
   /** 模型强度档位（low/high/max…）；空数组=该模型没有档位 */
   variants: string[]
+}
+
+interface ResolvedModel {
+  providerId?: string
+  modelId?: string
+  variant?: string
+  label: string
 }
 
 interface ListedAgent {
@@ -217,15 +226,91 @@ export async function resolveStatusSessionTitle(
   return { title: session.title, sessionId: session.sessionId }
 }
 
+/** 从任意 model 形状解析出统一展示（session 用 id，config 用 model，agent 用 id）。 */
+function modelInfoFrom(value: unknown): ResolvedModel | null {
+  if (typeof value === "string") {
+    const parsed = splitModelId(value)
+    if (!parsed) return null
+    return {
+      ...parsed,
+      label: `${parsed.providerId}/${parsed.modelId}${parsed.variant ? `#${parsed.variant}` : ""}`,
+    }
+  }
+  if (!isRecord(value)) return null
+  const providerId = getString(value, "providerID") ?? getString(value, "providerId")
+  const modelId = getString(value, "model") ?? getString(value, "modelID") ?? getString(value, "id")
+  if (!providerId || !modelId) return null
+  const variant = getString(value, "variant")
+  return {
+    providerId,
+    modelId,
+    ...(variant ? { variant } : {}),
+    label: `${providerId}/${modelId}${variant ? `#${variant}` : ""}`,
+  }
+}
+
+/**
+ * 当前实际生效的模型：本地映射 → 会话级 model → 会话 agent 的 model → 全局配置。
+ * 2026-11-12：之前只读本地映射，映射没有 model 就显示“默认”，用户看不到真实模型。
+ */
+async function resolveCurrentModel(ctx: MessageContext, cmdCtx: CommandContext): Promise<ResolvedModel> {
+  const local = cmdCtx.sessions.getModel(ctx.userId)
+  if (local.providerId && local.modelId) {
+    return {
+      ...local,
+      label: `${local.providerId}/${local.modelId}${local.variant ? `#${local.variant}` : ""}`,
+    }
+  }
+
+  const session = cmdCtx.sessions.getSession(ctx.userId)
+  if (session?.sessionId) {
+    try {
+      const detail = await cmdCtx.client.session.get({ path: { id: session.sessionId } })
+      const fromSession = modelInfoFrom(detail?.data?.model)
+      if (fromSession) return fromSession
+      const agentId = detail?.data?.agent
+      if (agentId) {
+        try {
+          const agents = await cmdCtx.client.app.agents()
+          const list =
+            extractArray(agents).length > 0 ? extractArray(agents) : extractArray(extractProperty(agents, "data"))
+          const agent = list.find((item) => getString(item, "id") === agentId)
+          const fromAgent = modelInfoFrom(extractProperty(agent, "model"))
+          if (fromAgent) return fromAgent
+        } catch {
+          /* agent 查询失败继续回落全局配置 */
+        }
+      }
+    } catch {
+      /* 会话详情失败继续回落全局配置 */
+    }
+  }
+
+  try {
+    const config = await cmdCtx.client.config.get()
+    const docs =
+      extractArray(config).length > 0 ? extractArray(config) : extractArray(extractProperty(config, "data"))
+    for (const doc of docs) {
+      if (getString(doc, "type") !== "document") continue
+      const info = extractProperty(doc, "info")
+      const fromConfig = modelInfoFrom(extractProperty(info, "model"))
+      if (fromConfig) return fromConfig
+    }
+  } catch {
+    /* 配置读取失败：只能显示默认 */
+  }
+
+  return { label: "默认" }
+}
+
 async function handleStatus(ctx: MessageContext, cmdCtx: CommandContext): Promise<string> {
   const sessionInfo = await resolveStatusSessionTitle(cmdCtx.sessions, cmdCtx.client, ctx.userId)
-  const { providerId, modelId, variant } = cmdCtx.sessions.getModel(ctx.userId)
+  const model = (await resolveCurrentModel(ctx, cmdCtx)).label
   const agentId = cmdCtx.sessions.getAgent(ctx.userId)
 
   const openCodeStatus = await getOpenCodeStatus(cmdCtx.client)
   const qqStatus = await getQQStatus(cmdCtx)
 
-  const model = providerId && modelId ? `${providerId}/${modelId}${variant ? `#${variant}` : ""}` : "默认"
   const lines = [
     `模型：${model}`,
     `会话：${sessionInfo.sessionId ? (sessionInfo.title ?? "未命名") : "未创建"}（Agent：${agentId ?? "默认"}）`,
@@ -302,13 +387,6 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
   const parts = arg.split(/\s+/).filter(Boolean)
   const sub = parts[0]?.toLowerCase() ?? ""
 
-  const currentLabel = (): string => {
-    const current = cmdCtx.sessions.getModel(ctx.userId)
-    return current.providerId && current.modelId
-      ? `${current.providerId}/${current.modelId}${current.variant ? `#${current.variant}` : ""}`
-      : "默认"
-  }
-
   const applyModel = async (selected: { providerId: string; modelId: string; variant?: string }): Promise<string> => {
     await ensureSession(ctx.userId, cmdCtx)
     if (cmdCtx.acp) await cmdCtx.acp.setModel(ctx.userId, selected.providerId, selected.modelId, selected.variant)
@@ -333,8 +411,9 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
   }
 
   if (!arg) {
+    const current = await resolveCurrentModel(ctx, cmdCtx)
     return [
-      `当前模型：${currentLabel()}`,
+      `当前模型：${current.label}`,
       "发 /model list 查看全部模型",
       "发 /model select <序号> [强度] 切换",
     ].join("\n")
@@ -343,7 +422,7 @@ async function handleModel(ctx: MessageContext, args: string, cmdCtx: CommandCon
   if (sub === "list" || lower === "all") {
     const models = await listModels(cmdCtx.client)
     if (models.length === 0) return "当前没有可用模型"
-    const current = cmdCtx.sessions.getModel(ctx.userId)
+    const current = await resolveCurrentModel(ctx, cmdCtx)
     const lines = models.map((model, index) => {
       const isCurrent =
         current.providerId && current.modelId && `${current.providerId}/${current.modelId}` === model.id
@@ -456,7 +535,10 @@ async function handleHistory(ctx: MessageContext, args: string, cmdCtx: CommandC
 
 async function ensureSession(userId: string, cmdCtx: CommandContext): Promise<void> {
   if (cmdCtx.acp) return // ACP 适配内部会 getOrCreate
-  await cmdCtx.sessions.getOrCreate(userId)
+  await cmdCtx.sessions.getOrCreate(
+    userId,
+    cmdCtx.onSessionRecovered ? { onRecovered: cmdCtx.onSessionRecovered } : undefined,
+  )
 }
 
 async function getOpenCodeStatus(client: OpencodeClient): Promise<string> {

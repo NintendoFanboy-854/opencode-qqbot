@@ -27,6 +27,18 @@ export function isSessionNotFoundError(error: unknown): boolean {
   return /\b404\b|not found|不存在/i.test(message)
 }
 
+export interface SessionRecoveryInfo {
+  userId: string
+  oldSessionId: string
+  oldTitle?: string
+  newSessionId: string
+}
+
+export interface GetOrCreateOptions {
+  /** 仅在「映射存在但服务端会话已丢失、已自动新建」时触发。 */
+  onRecovered?: (info: SessionRecoveryInfo) => void
+}
+
 export class SessionManager {
   private sessions = new Map<string, UserSession>()
   private client: OpencodeClient
@@ -64,7 +76,8 @@ export class SessionManager {
     }
   }
 
-  async getOrCreate(userId: string): Promise<UserSession> {
+  async getOrCreate(userId: string, opts?: GetOrCreateOptions): Promise<UserSession> {
+    let recovered: { oldSessionId: string; oldTitle?: string } | null = null
     const existing = this.sessions.get(userId)
     if (existing) {
       // 2026-11-12：映射可能指向已被删除的会话（桌面端删除/外部清理）。先查一次；
@@ -76,6 +89,10 @@ export class SessionManager {
       console.log(
         `[sessions] 会话已不存在，自动新建：user=${userId.slice(0, 8)}… old=${existing.sessionId}`,
       )
+      recovered = {
+        oldSessionId: existing.sessionId,
+        ...(existing.title ? { oldTitle: existing.title } : {}),
+      }
       this.sessions.delete(userId)
       this.saveSessions()
     }
@@ -94,6 +111,16 @@ export class SessionManager {
     this.sessions.set(userId, session)
     this.saveSessions()
     await this.enforceLocation(userId, session.sessionId, directory)
+    if (recovered) {
+      try {
+        opts?.onRecovered?.({ userId, ...recovered, newSessionId: session.sessionId })
+      } catch (error) {
+        console.error(
+          "[sessions] 会话恢复回调失败:",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
     return session
   }
 
